@@ -6,17 +6,22 @@
 
 pub mod aseprite_writer;
 mod error;
+pub mod layer_names;
 pub mod logical_layers;
 mod model;
 pub mod photoshop_animation;
 
 pub use aseprite_writer::{DEFAULT_FRAME_DURATION_MS, EncodedAseprite, WriterError};
 pub use error::{ConversionError, InspectionError};
+pub use layer_names::{
+    COPY_SUFFIX_CATALOG_VERSION, CopySuffixCatalog, CopySuffixKind, CopySuffixMatch,
+    CopySuffixRule, MAX_COPY_SUFFIX_DEPTH, ParsedLayerName,
+};
 pub use logical_layers::{
-    AssociationDecision, AssociationDecisionStatus, AssociationReport, LayerAssociationMode,
-    LayerWritePlan, LayerZOrderMode, LogicalLayerTrack, PlannedCel, PlannedNode, StableOrderMode,
-    build_layer_write_plan, build_layer_write_plan_with_order_modes,
-    build_layer_write_plan_with_z_order,
+    AssociationDecision, AssociationDecisionStatus, AssociationExclusionKind, AssociationPhase,
+    AssociationReport, LayerAssociationMode, LayerWritePlan, LayerZOrderMode, LogicalLayerTrack,
+    PlannedCel, PlannedNode, StableOrderMode, build_layer_write_plan,
+    build_layer_write_plan_with_order_modes, build_layer_write_plan_with_z_order,
 };
 pub use model::{
     DocumentInspection, NormalizedBounds, NormalizedDocument, NormalizedFrame, NormalizedLayer,

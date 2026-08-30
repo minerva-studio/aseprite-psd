@@ -25,6 +25,10 @@ included in the release binary.
 - Stable ordering defaults to cross-frame overlap consensus. Use
   `--stable-order anchor` for the legacy anchor-frame order, or
   `--stable-order strict` to fail when overlapping order evidence is unresolved.
+- Auto association uses a versioned multilingual copy-suffix catalog for names
+  such as `Copy`, `拷贝`, `副本`, `コピー`, and `복사`. Copy suffixes are weak
+  evidence only; same-frame duplicates are never forced together, and ambiguous
+  associations remain separate with their source-name evidence in the report.
 - No PSD or PSB fixtures are committed to this repository.
 
 ## Build

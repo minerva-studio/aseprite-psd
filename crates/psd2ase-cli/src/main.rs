@@ -85,6 +85,10 @@ fn run_convert(arguments: &[String]) -> Result<(), CliError> {
             "layer-association stable-order: {:?}",
             association.stable_order_mode
         );
+        println!(
+            "layer-association name catalog: v{}",
+            association.name_catalog_version
+        );
         if !association.omitted_source_layer_ids.is_empty() {
             println!(
                 "layer-association omitted source pixel layers: {}",
@@ -100,19 +104,42 @@ fn run_convert(arguments: &[String]) -> Result<(), CliError> {
         for diagnostic in association.stable_order_diagnostics {
             println!("layer-association stable-order diagnostic: {diagnostic}");
         }
+        for diagnostic in association.exclusion_diagnostics {
+            println!("layer-association exclusion diagnostic: {diagnostic}");
+        }
+        for diagnostic in association.family_diagnostics {
+            println!("layer-association family diagnostic: {diagnostic}");
+        }
+        for diagnostic in association.name_diagnostics {
+            println!("layer-association name diagnostic: {diagnostic}");
+        }
         for decision in association.decisions {
             if matches!(
                 decision.status,
                 AssociationDecisionStatus::Ambiguous | AssociationDecisionStatus::NewTrack
             ) {
                 println!(
-                    "layer-association {:?}: frame {} source {} ({}) -> track {}",
+                    "layer-association {:?}: frame {} source {} ({}) name {:?} base {:?} copy {:?} phase={:?} score={} margin={} same-frame={} tie={} -> track {}",
                     decision.status,
                     decision.frame_index,
                     decision.source_layer_id,
                     decision.source_path,
+                    decision.original_name,
+                    decision.normalized_base_name,
+                    decision.copy_suffixes,
+                    decision.association_phase,
+                    decision.score,
+                    decision.margin,
+                    decision.same_frame_instance_count,
+                    decision.matching_tie,
                     decision.track_id
                 );
+                if !decision.rejection_reasons.is_empty() {
+                    println!(
+                        "layer-association rejection reasons: {:?}",
+                        decision.rejection_reasons
+                    );
+                }
             }
         }
     }
