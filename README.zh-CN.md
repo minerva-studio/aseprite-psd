@@ -1,7 +1,7 @@
 # psd2ase
 
 `psd2ase` 计划提供一个独立的 Photoshop PSD → Aseprite 转换器。当前处于
-**阶段一**：建立 Rust workspace、core 边界和只读 PSD 元数据探针。
+**阶段三**：建立 Rust workspace、只读 PSD 元数据探针和 Photoshop 帧动画兼容层。
 
 最终版本采用原生 Rust，目标是向用户提供不依赖额外运行时的单一可执行文件。
 TypeScript `ag-psd` 只作为开发期差分 oracle，不会进入发布 binary。
@@ -13,6 +13,8 @@ TypeScript `ag-psd` 只作为开发期差分 oracle，不会进入发布 binary�
 - `psd2ase convert INPUT.psd` 在 parser 兼容性探针和 Aseprite writer 验证通过前
   有意保持关闭。
 - 仓库不提交 PSD 或 PSB 样本。
+- 阶段三已将图层树、帧顺序、时长、循环策略、逐层状态和有效可见像素层
+  标准化到 psd2ase-core 的中间模型；Aseprite writer 仍未启用。
 
 ## 构建
 
@@ -28,4 +30,5 @@ cargo run -p psd2ase -- --version
 ## 阶段门槛
 
 启用转换写入前，必须使用提供的真实 PSD 做差分探针，比较画布元数据、完整图层树、
-图层属性和每个图层的像素哈希。没有通过这一步，不会声称已经完成转换器。
+图层属性、每个图层的像素哈希以及 Photoshop 动画元数据。没有通过这一步，
+不会声称已经完成转换器。

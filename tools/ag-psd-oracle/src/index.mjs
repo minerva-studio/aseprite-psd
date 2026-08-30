@@ -3,9 +3,11 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 import { initializeCanvas, readPsd } from "ag-psd";
+import { createReader } from "ag-psd/dist/psdReader.js";
+import { resourceHandlersMap } from "ag-psd/dist/imageResources.js";
 
 const DEFAULT_INPUT = "path/to/fixture.psd";
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 /**
  * Provides the raw RGBA image-data factory required by ag-psd in Node.js.
@@ -65,21 +67,7 @@ function buildSnapshot(bytes, psd) {
   const layers = [];
   const rootLayers = psd.children ?? [];
   rootLayers.forEach((layer, index) => collectLayer(layer, [String(index)], layers));
-  const animations = psd.imageResources?.animations
-    ? {
-        frames: (psd.imageResources.animations.frames ?? []).map((frame) => ({
-          id: frame.id,
-          delay: frame.delay,
-          dispose: frame.dispose ?? null,
-        })),
-        animation_sets: (psd.imageResources.animations.animations ?? []).map((animation) => ({
-          id: animation.id,
-          frames: animation.frames ?? [],
-          repeats: animation.repeats ?? null,
-          active_frame: animation.activeFrame ?? null,
-        })),
-      }
-    : null;
+  const animation = buildAnimationSnapshot(bytes, rootLayers);
 
   return {
     schema_version: SCHEMA_VERSION,
@@ -98,12 +86,185 @@ function buildSnapshot(bytes, psd) {
       pixel_layer_count: layers.filter((layer) => layer.kind === "pixel").length,
     },
     layers,
-    animation: {
-      resource_4000_exposed: animations !== null,
-      animations,
-      timeline_information_exposed: psd.imageResources?.timelineInformation != null,
+    animation,
+  };
+}
+
+/** Builds the normalized Photoshop animation snapshot used by the stage gate. */
+function buildAnimationSnapshot(bytes, rootLayers) {
+  const resource = readAnimationResource(bytes);
+  const layers = [];
+  rootLayers.forEach((layer, index) => flattenLayer(layer, [String(index)], [], layers));
+  const hasLayerAnimation = layers.some((layer) => Array.isArray(layer.animationFrames));
+  if (resource == null && !hasLayerAnimation) {
+    return emptyAnimationSnapshot();
+  }
+  if (resource == null) {
+    throw new Error("layer animation metadata exists without a 4000/4003 frame catalog");
+  }
+
+  const frames = resource.frames.map((frame) => ({
+    id: frame.id,
+    duration_ms: Math.round(frame.delay * 1000),
+    dispose: null,
+  }));
+  if (resource.animation_sets.length > 1) {
+    throw new Error("multiple animation sets are ambiguous");
+  }
+  const animationSet = resource.animation_sets[0] ?? null;
+  const loopMode = animationSet == null
+    ? null
+    : animationSet.repeats == null
+      ? null
+      : animationSet.repeats === 0
+        ? "infinite"
+        : "finite:" + animationSet.repeats;
+  const activeFrame = animationSet?.active_frame ?? animationSet?.activeFrame ?? null;
+  if (animationSet != null &&
+      JSON.stringify(animationSet.frames) !== JSON.stringify(frames.map((frame) => frame.id))) {
+    throw new Error("animation set frame order differs from FrIn");
+  }
+
+  const layerStates = layers.map((layer) => {
+    let previousEnabled = !layer.hidden;
+    return {
+      layer_id: layer.id ?? 0,
+      path: layer.path,
+      frames: frames.map((frame) => {
+        const record = layer.animationFrames?.find((item) => item.frames?.includes(frame.id));
+        const explicitEnable = record?.enable !== undefined;
+        if (explicitEnable) {
+          previousEnabled = record.enable;
+        }
+        return {
+          frame_id: frame.id,
+          enabled: previousEnabled,
+          explicit_enable: explicitEnable,
+          offset: record?.offset ?? null,
+          reference_point: record?.referencePoint ?? null,
+          opacity: record?.opacity ?? null,
+        };
+      }),
+    };
+  });
+  const statesById = new Map(layerStates.map((state) => [state.layer_id, state]));
+  const visiblePixelLayers = frames.map((frame) => ({
+    frame_id: frame.id,
+    layer_ids: layers
+      .filter((layer) => !layer.isGroup)
+      .filter((layer) => {
+        const state = statesById.get(layer.id);
+        return state.frames.find((item) => item.frame_id === frame.id)?.enabled &&
+          layer.ancestorIds.every((ancestorId) =>
+            statesById.get(ancestorId)?.frames.find((item) => item.frame_id === frame.id)?.enabled,
+          );
+      })
+      .map((layer) => layer.id),
+  }));
+  const flag = layers.find((layer) => layer.animationFrameFlags)?.animationFrameFlags;
+  return {
+    resource_ids: resource.resource_ids,
+    frames,
+    loop_mode: loopMode,
+    active_frame: activeFrame,
+    layer_states: layerStates,
+    visible_pixel_layers: visiblePixelLayers,
+    frame_flags: flag == null ? null : {
+      propagate_frame_one: flag.propagateFrameOne ?? false,
+      unify_layer_position: flag.unifyLayerPosition ?? false,
+      unify_layer_style: flag.unifyLayerStyle ?? false,
+      unify_layer_visibility: flag.unifyLayerVisibility ?? false,
     },
   };
+}
+
+/** Returns the empty normalized animation result for a PSD without animation. */
+function emptyAnimationSnapshot() {
+  return {
+    resource_ids: [],
+    frames: [],
+    loop_mode: null,
+    active_frame: null,
+    layer_states: [],
+    visible_pixel_layers: [],
+    frame_flags: null,
+  };
+}
+
+/** Flattens the ag-psd tree while retaining group ancestry for visibility. */
+function flattenLayer(layer, path, ancestorIds, output) {
+  output.push({
+    path: path.join("/"),
+    id: layer.id ?? 0,
+    hidden: layer.hidden ?? false,
+    isGroup: Array.isArray(layer.children),
+    ancestorIds,
+    animationFrames: layer.animationFrames,
+    animationFrameFlags: layer.animationFrameFlags,
+  });
+  const nextAncestors = Array.isArray(layer.children) && layer.id != null
+    ? [...ancestorIds, layer.id]
+    : ancestorIds;
+  (layer.children ?? []).forEach((child, index) =>
+    flattenLayer(child, [...path, String(index)], nextAncestors, output),
+  );
+}
+
+/** Reads the animation descriptor from both Photoshop resource IDs 4000 and 4003. */
+function readAnimationResource(bytes) {
+  let offset = 26;
+  const colorLength = readUint32(bytes, offset);
+  offset += 4 + colorLength;
+  const resourceLength = readUint32(bytes, offset);
+  offset += 4;
+  const end = offset + resourceLength;
+  let result = null;
+  const resourceIds = [];
+  while (offset < end) {
+    const signature = ascii(bytes, offset, 4);
+    offset += 4;
+    if (signature !== "8BIM") throw new Error("invalid image resource signature at " + (offset - 4));
+    const id = readUint16(bytes, offset);
+    offset += 2;
+    const nameLength = bytes[offset];
+    offset += 1 + nameLength + ((1 + nameLength) % 2);
+    const length = readUint32(bytes, offset);
+    offset += 4;
+    const data = bytes.subarray(offset, offset + length);
+    offset += length + (length % 2);
+    if ((id === 4000 || id === 4003) && ascii(data, 0, 4) === "mani") {
+      const reader = createReader(data.buffer, data.byteOffset, data.byteLength);
+      const target = {};
+      resourceHandlersMap[4000].read(reader, target, () => data.byteLength - reader.offset);
+      if (result != null) throw new Error("multiple animation resources are ambiguous");
+      result = {
+        resource_ids: [id],
+        frames: target.animations?.frames ?? [],
+        animation_sets: target.animations?.animations ?? [],
+      };
+      resourceIds.push(id);
+    }
+  }
+  return result == null ? null : { ...result, resource_ids: resourceIds };
+}
+
+/** Reads a checked big-endian uint16 from the PSD byte buffer. */
+function readUint16(bytes, offset) {
+  if (offset + 2 > bytes.length) throw new Error("truncated uint16 at " + offset);
+  return bytes[offset] * 256 + bytes[offset + 1];
+}
+
+/** Reads a checked big-endian uint32 from the PSD byte buffer. */
+function readUint32(bytes, offset) {
+  if (offset + 4 > bytes.length) throw new Error("truncated uint32 at " + offset);
+  return bytes[offset] * 0x1000000 + bytes[offset + 1] * 0x10000 +
+    bytes[offset + 2] * 0x100 + bytes[offset + 3];
+}
+
+/** Converts a byte range to its ASCII representation. */
+function ascii(bytes, offset, length) {
+  if (offset + length > bytes.length) throw new Error("truncated ASCII field at " + offset);
+  return String.fromCharCode(...bytes.subarray(offset, offset + length));
 }
 
 /** Recursively converts one ag-psd layer into a normalized layer snapshot. */

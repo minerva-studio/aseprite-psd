@@ -7,9 +7,15 @@
 
 mod error;
 mod model;
+pub mod photoshop_animation;
 
 pub use error::{ConversionError, InspectionError};
 pub use model::{DocumentInspection, NormalizedDocument, NormalizedFrame, NormalizedLayer};
+pub use photoshop_animation::{
+    AnimationFlags, AnimationLayerInput, AnimationParseError, AnimationPoint, LayerAnimationState,
+    LayerFrameState, LoopMode, PhotoshopAnimation, PhotoshopFrame, VisibleFrameLayers,
+    parse_photoshop_animation,
+};
 
 use std::fs;
 use std::path::{Path, PathBuf};

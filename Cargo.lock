@@ -157,6 +157,7 @@ name = "psd2ase-rust-probe"
 version = "0.1.0"
 dependencies = [
  "ag-psd",
+ "psd2ase-core",
  "serde",
  "serde_json",
  "sha2",

@@ -23,14 +23,15 @@ async function main() {
   }
 
   if (animationMismatches.length === 0) {
-    console.log("animation exposure: MATCH");
+    console.log("animation compatibility: PASS");
   } else {
     reportMismatches(
-      "animation exposure: DIFFERENT",
-      "informational mismatches; excluded from the base compatibility gate",
+      "animation compatibility: FAIL",
+      "animation mismatches",
       animationMismatches,
-      console.warn,
+      console.error,
     );
+    process.exitCode = 1;
   }
 }
 
@@ -49,7 +50,7 @@ function stripAnimationFields(value) {
   return value;
 }
 
-/** Extracts animation-only fields for a separate informational comparison. */
+/** Extracts animation-only fields for the animation compatibility gate. */
 function extractAnimationFields(snapshot) {
   return {
     animation: snapshot.animation,

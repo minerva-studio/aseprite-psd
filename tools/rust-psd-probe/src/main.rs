@@ -3,12 +3,16 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use ag_psd::psd::{AnimationDispose, BlendMode, ColorMode, Layer};
+use ag_psd::psd::{BlendMode, ColorMode, Layer};
+use psd2ase_core::{
+    AnimationFlags, AnimationLayerInput, AnimationParseError, AnimationPoint, LayerAnimationState,
+    LayerFrameState, LoopMode, PhotoshopAnimation, parse_photoshop_animation,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 const DEFAULT_INPUT: &str = r"path\to\fixture.psd";
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 /// Runs the Rust PSD probe and writes its normalized snapshot.
 fn main() -> ExitCode {
@@ -65,36 +69,23 @@ fn build_snapshot(bytes: &[u8]) -> Result<ProbeSnapshot, String> {
     let psd = ag_psd::read_psd(bytes, &options).map_err(|error| error.to_string())?;
 
     let mut layers = Vec::new();
+    let mut animation_inputs = Vec::new();
     let root_layers = psd.children.as_deref().unwrap_or_default();
     for (index, layer) in root_layers.iter().enumerate() {
         collect_layer(layer, &[index.to_string()], &mut layers)?;
+        collect_animation_input(layer, &[index.to_string()], &[], &mut animation_inputs)?;
     }
 
-    let animations = psd
-        .image_resources
-        .as_ref()
-        .and_then(|resources| resources.animations.as_ref())
-        .map(|value| AnimationSnapshot {
-            frames: value
-                .frames
+    let animation = parse_photoshop_animation(bytes, &animation_inputs).map_err(animation_error)?;
+    for layer in &mut layers {
+        layer.animation_frame_count = animation.as_ref().map(|value| {
+            value
+                .layer_states
                 .iter()
-                .map(|frame| AnimationFrameSnapshot {
-                    id: frame.id,
-                    delay: frame.delay,
-                    dispose: frame.dispose.map(animation_dispose_name),
-                })
-                .collect(),
-            animation_sets: value
-                .animations
-                .iter()
-                .map(|animation| AnimationSetSnapshot {
-                    id: animation.id,
-                    frames: animation.frames.clone(),
-                    repeats: animation.repeats,
-                    active_frame: animation.active_frame,
-                })
-                .collect(),
+                .find(|state| state.path == layer.path)
+                .map_or(0, |state| state.frames.len())
         });
+    }
 
     Ok(ProbeSnapshot {
         schema_version: SCHEMA_VERSION,
@@ -113,16 +104,58 @@ fn build_snapshot(bytes: &[u8]) -> Result<ProbeSnapshot, String> {
             pixel_layer_count: layers.iter().filter(|layer| layer.kind == "pixel").count(),
         },
         layers,
-        animation: AnimationSummary {
-            resource_4000_exposed: animations.is_some(),
-            animations,
-            timeline_information_exposed: psd
-                .image_resources
-                .as_ref()
-                .and_then(|resources| resources.timeline_information.as_ref())
-                .is_some(),
-        },
+        animation: animation
+            .as_ref()
+            .map(animation_snapshot)
+            .unwrap_or_default(),
     })
+}
+
+/// Converts a normalized parser error to the probe's string error boundary.
+fn animation_error(error: AnimationParseError) -> String {
+    format!("Photoshop animation metadata: {error}")
+}
+
+/// Recursively builds the format-independent layer input for animation parsing.
+fn collect_animation_input(
+    layer: &Layer,
+    path: &[String],
+    ancestors: &[u32],
+    inputs: &mut Vec<AnimationLayerInput>,
+) -> Result<(), String> {
+    let id = layer
+        .additional_info
+        .id
+        .map(number_to_layer_id)
+        .unwrap_or(0);
+    inputs.push(AnimationLayerInput {
+        id,
+        path: path.join("/"),
+        is_group: layer.children.is_some(),
+        hidden: layer.hidden.unwrap_or(false),
+        ancestor_ids: ancestors.to_vec(),
+    });
+    let mut child_ancestors = ancestors.to_vec();
+    if id != 0 && layer.children.is_some() {
+        child_ancestors.push(id);
+    }
+    if let Some(children) = &layer.children {
+        for (index, child) in children.iter().enumerate() {
+            let mut child_path = path.to_vec();
+            child_path.push(index.to_string());
+            collect_animation_input(child, &child_path, &child_ancestors, inputs)?;
+        }
+    }
+    Ok(())
+}
+
+/// Converts ag-psd's numeric layer ID into the strict normalized ID type.
+fn number_to_layer_id(value: f64) -> u32 {
+    if value.is_finite() && value >= 1.0 && value.fract() == 0.0 && value <= u32::MAX as f64 {
+        value as u32
+    } else {
+        0
+    }
 }
 
 /// Recursively converts one parser layer into a normalized layer snapshot.
@@ -158,11 +191,7 @@ fn collect_layer(
         blend_mode: layer.blend_mode.map(blend_mode_name),
         hidden: layer.hidden,
         pixel,
-        animation_frame_count: layer
-            .additional_info
-            .animation_frames
-            .as_ref()
-            .map(Vec::len),
+        animation_frame_count: None,
     });
 
     if let Some(children) = &layer.children {
@@ -224,11 +253,6 @@ fn blend_mode_name(value: BlendMode) -> String {
     normalize_name(&format!("{value:?}"))
 }
 
-/// Normalizes a Photoshop animation disposal enum.
-fn animation_dispose_name(value: AnimationDispose) -> String {
-    normalize_name(&format!("{value:?}"))
-}
-
 #[derive(Debug, Serialize)]
 struct ProbeSnapshot {
     schema_version: u32,
@@ -283,28 +307,164 @@ struct PixelSnapshot {
 
 #[derive(Debug, Serialize)]
 struct AnimationSummary {
-    resource_4000_exposed: bool,
-    animations: Option<AnimationSnapshot>,
-    timeline_information_exposed: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct AnimationSnapshot {
+    #[serde(default)]
+    resource_ids: Vec<u16>,
+    #[serde(default)]
     frames: Vec<AnimationFrameSnapshot>,
-    animation_sets: Vec<AnimationSetSnapshot>,
+    #[serde(default)]
+    loop_mode: Option<String>,
+    #[serde(default)]
+    active_frame: Option<u32>,
+    #[serde(default)]
+    layer_states: Vec<LayerAnimationSnapshot>,
+    #[serde(default)]
+    visible_pixel_layers: Vec<VisibleFrameLayersSnapshot>,
+    #[serde(default)]
+    frame_flags: Option<AnimationFlagsSnapshot>,
 }
 
 #[derive(Debug, Serialize)]
 struct AnimationFrameSnapshot {
-    id: f64,
-    delay: f64,
+    id: u32,
+    duration_ms: u32,
     dispose: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
-struct AnimationSetSnapshot {
-    id: f64,
-    frames: Vec<f64>,
-    repeats: Option<f64>,
-    active_frame: Option<f64>,
+struct LayerAnimationSnapshot {
+    layer_id: u32,
+    path: String,
+    frames: Vec<LayerFrameSnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+struct LayerFrameSnapshot {
+    frame_id: u32,
+    enabled: bool,
+    explicit_enable: bool,
+    offset: Option<PointSnapshot>,
+    reference_point: Option<PointSnapshot>,
+    opacity: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct PointSnapshot {
+    x: f64,
+    y: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct VisibleFrameLayersSnapshot {
+    frame_id: u32,
+    layer_ids: Vec<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct AnimationFlagsSnapshot {
+    propagate_frame_one: bool,
+    unify_layer_position: bool,
+    unify_layer_style: bool,
+    unify_layer_visibility: bool,
+}
+
+impl Default for AnimationSummary {
+    fn default() -> Self {
+        Self {
+            resource_ids: Vec::new(),
+            frames: Vec::new(),
+            loop_mode: None,
+            active_frame: None,
+            layer_states: Vec::new(),
+            visible_pixel_layers: Vec::new(),
+            frame_flags: None,
+        }
+    }
+}
+
+/// Converts the core animation model into the stable probe JSON shape.
+fn animation_snapshot(animation: &PhotoshopAnimation) -> AnimationSummary {
+    AnimationSummary {
+        resource_ids: animation.resource_ids.clone(),
+        frames: animation
+            .frames
+            .iter()
+            .map(|frame| AnimationFrameSnapshot {
+                id: frame.id,
+                duration_ms: frame.duration_ms,
+                dispose: frame.dispose.as_deref().map(dispose_name),
+            })
+            .collect(),
+        loop_mode: animation.loop_mode.as_ref().map(loop_mode_name),
+        active_frame: animation.active_frame_index,
+        layer_states: animation
+            .layer_states
+            .iter()
+            .map(layer_animation_snapshot)
+            .collect(),
+        visible_pixel_layers: animation
+            .visible_pixel_layers
+            .iter()
+            .map(|frame| VisibleFrameLayersSnapshot {
+                frame_id: frame.frame_id,
+                layer_ids: frame.layer_ids.clone(),
+            })
+            .collect(),
+        frame_flags: animation.frame_flags.as_ref().map(animation_flags_snapshot),
+    }
+}
+
+/// Converts one normalized layer animation state into probe JSON.
+fn layer_animation_snapshot(state: &LayerAnimationState) -> LayerAnimationSnapshot {
+    LayerAnimationSnapshot {
+        layer_id: state.layer_id,
+        path: state.path.clone(),
+        frames: state.frames.iter().map(layer_frame_snapshot).collect(),
+    }
+}
+
+/// Converts one normalized frame state into probe JSON.
+fn layer_frame_snapshot(state: &LayerFrameState) -> LayerFrameSnapshot {
+    LayerFrameSnapshot {
+        frame_id: state.frame_id,
+        enabled: state.enabled,
+        explicit_enable: state.explicit_enable,
+        offset: state.offset.map(point_snapshot),
+        reference_point: state.reference_point.map(point_snapshot),
+        opacity: state.opacity,
+    }
+}
+
+/// Converts a normalized animation point into probe JSON.
+fn point_snapshot(point: AnimationPoint) -> PointSnapshot {
+    PointSnapshot {
+        x: point.x,
+        y: point.y,
+    }
+}
+
+/// Converts a normalized loop policy into its stable string name.
+fn loop_mode_name(value: &LoopMode) -> String {
+    match value {
+        LoopMode::Infinite => "infinite".to_string(),
+        LoopMode::Finite(count) => format!("finite:{count}"),
+    }
+}
+
+/// Converts the descriptor's enum spelling into the oracle's disposal name.
+fn dispose_name(value: &str) -> String {
+    value
+        .rsplit('.')
+        .next()
+        .unwrap_or(value)
+        .to_ascii_lowercase()
+}
+
+/// Converts normalized mdyn flags into probe JSON.
+fn animation_flags_snapshot(value: &AnimationFlags) -> AnimationFlagsSnapshot {
+    AnimationFlagsSnapshot {
+        propagate_frame_one: value.propagate_frame_one,
+        unify_layer_position: value.unify_layer_position,
+        unify_layer_style: value.unify_layer_style,
+        unify_layer_visibility: value.unify_layer_visibility,
+    }
 }
