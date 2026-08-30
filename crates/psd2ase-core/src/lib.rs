@@ -1,14 +1,15 @@
 //! Format-independent conversion boundaries for PSD to Aseprite.
 //!
-//! The first implementation slice only establishes the public API and a
-//! metadata inspection path. Conversion writing remains deliberately gated on
-//! the PSD parser compatibility probe and is not represented as successful
-//! output until that gate passes.
+//! The current implementation exposes a normalized reader and an experimental
+//! Aseprite writer. Coordinate mapping remains provisional until visual review
+//! of a generated file is complete.
 
+pub mod aseprite_writer;
 mod error;
 mod model;
 pub mod photoshop_animation;
 
+pub use aseprite_writer::{DEFAULT_FRAME_DURATION_MS, EncodedAseprite, WriterError};
 pub use error::{ConversionError, InspectionError};
 pub use model::{
     DocumentInspection, NormalizedBounds, NormalizedDocument, NormalizedFrame, NormalizedLayer,
@@ -21,8 +22,10 @@ pub use photoshop_animation::{
 };
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The package version exposed to the CLI and reports.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -565,15 +568,237 @@ mod tests {
 pub fn convert(
     input: &Path,
     output: &Path,
-    _options: &ConvertOptions,
+    options: &ConvertOptions,
 ) -> Result<ConversionReport, ConversionError> {
     if !input.is_file() {
         return Err(ConversionError::InputMissing(input.to_path_buf()));
     }
 
-    if output.exists() && !_options.overwrite {
+    if output.exists() && !options.overwrite {
         return Err(ConversionError::OutputExists(output.to_path_buf()));
     }
 
-    Err(ConversionError::ConversionNotReady)
+    let document =
+        normalize(input).map_err(|error| ConversionError::InputInspection(error.to_string()))?;
+    let mut encoded = aseprite_writer::encode(&document)
+        .map_err(|error| ConversionError::Writer(error.to_string()))?;
+    encoded.warnings.insert(
+        0,
+        "coordinate policy: provisional pixels.left/top cel origin".to_string(),
+    );
+    validate_aseprite_output(&encoded.bytes, &document)?;
+    commit_output(output, &encoded.bytes, options.overwrite)?;
+
+    Ok(ConversionReport {
+        input: input.to_path_buf(),
+        output: output.to_path_buf(),
+        warnings: encoded.warnings,
+    })
+}
+
+/// Validates the encoded Aseprite structure against the normalized source model.
+fn validate_aseprite_output(
+    bytes: &[u8],
+    document: &NormalizedDocument,
+) -> Result<(), ConversionError> {
+    let file = aseprite::AsepriteFile::from_reader(Cursor::new(bytes))
+        .map_err(|error| ConversionError::OutputValidation(error.to_string()))?;
+    if file.width() != u16::try_from(document.canvas.0).unwrap_or(u16::MAX)
+        || file.height() != u16::try_from(document.canvas.1).unwrap_or(u16::MAX)
+    {
+        return Err(ConversionError::OutputValidation(
+            "canvas dimensions differ from normalized document".to_string(),
+        ));
+    }
+    if file.frames().len() != document.frames.len() {
+        return Err(ConversionError::OutputValidation(format!(
+            "frame count differs: expected {}, got {}",
+            document.frames.len(),
+            file.frames().len()
+        )));
+    }
+    for (index, frame) in document.frames.iter().enumerate() {
+        let expected = frame
+            .duration_ms
+            .unwrap_or(u32::from(DEFAULT_FRAME_DURATION_MS));
+        if u32::from(file.frames()[index].duration_ms) != expected {
+            return Err(ConversionError::OutputValidation(format!(
+                "frame {index} duration differs: expected {expected}, got {}",
+                file.frames()[index].duration_ms
+            )));
+        }
+    }
+
+    let mut layers = Vec::new();
+    flatten_layers(&document.root_layers, None, &mut layers);
+    if file.layers().len() != layers.len() {
+        return Err(ConversionError::OutputValidation(format!(
+            "layer count differs: expected {}, got {}",
+            layers.len(),
+            file.layers().len()
+        )));
+    }
+    for (layer_index, (source, expected_parent)) in layers.iter().enumerate() {
+        let output_layer = &file.layers()[layer_index];
+        if output_layer.name != source.name
+            || output_layer.opacity
+                != aseprite_writer::opacity_to_u8(source.opacity, &format!("layer {}", source.id))
+                    .map_err(|error| ConversionError::OutputValidation(error.to_string()))?
+            || output_layer.parent != *expected_parent
+            || output_layer.visible != source.frame_states.iter().any(|state| state.enabled)
+        {
+            return Err(ConversionError::OutputValidation(format!(
+                "layer {layer_index} attributes differ for {}",
+                source.id
+            )));
+        }
+        match source.kind {
+            NormalizedLayerKind::Group => {
+                if output_layer.kind != aseprite::LayerKind::Group {
+                    return Err(ConversionError::OutputValidation(format!(
+                        "layer {layer_index} should be a group"
+                    )));
+                }
+            }
+            NormalizedLayerKind::Pixel => {
+                let output_handle = file.layer_ref(layer_index).ok_or_else(|| {
+                    ConversionError::OutputValidation(format!(
+                        "pixel layer {layer_index} cannot be addressed"
+                    ))
+                })?;
+                if output_layer.kind != aseprite::LayerKind::Normal {
+                    return Err(ConversionError::OutputValidation(format!(
+                        "layer {layer_index} should be a pixel layer"
+                    )));
+                }
+                for frame_index in 0..document.frames.len() {
+                    let visible = is_visible_pixel(document, source.id, frame_index);
+                    let cel = file.cel(output_handle, frame_index);
+                    if visible != cel.is_some() {
+                        return Err(ConversionError::OutputValidation(format!(
+                            "layer {} frame {frame_index} cel visibility differs",
+                            source.id
+                        )));
+                    }
+                    if let Some(cel) = cel {
+                        validate_cel(cel, source, frame_index)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Flattens the normalized tree in the same order used by the writer.
+fn flatten_layers<'a>(
+    layers: &'a [NormalizedLayer],
+    parent: Option<usize>,
+    output: &mut Vec<(&'a NormalizedLayer, Option<usize>)>,
+) {
+    for layer in layers {
+        let index = output.len();
+        output.push((layer, parent));
+        flatten_layers(&layer.children, Some(index), output);
+    }
+}
+
+/// Checks whether a normalized pixel layer is effectively visible in a frame.
+fn is_visible_pixel(document: &NormalizedDocument, layer_id: u32, frame_index: usize) -> bool {
+    let mut visible = Vec::new();
+    for layer in &document.root_layers {
+        layer.collect_visible_pixel_layer_ids(frame_index, true, &mut visible);
+    }
+    visible.contains(&layer_id)
+}
+
+/// Validates one read-back cel's dimensions, position, opacity, and bytes.
+fn validate_cel(
+    cel: &aseprite::Cel,
+    source: &NormalizedLayer,
+    frame_index: usize,
+) -> Result<(), ConversionError> {
+    let expected_state = source.frame_states.get(frame_index).ok_or_else(|| {
+        ConversionError::OutputValidation(format!("missing source frame state {frame_index}"))
+    })?;
+    let pixels = source.pixels.as_ref().ok_or_else(|| {
+        ConversionError::OutputValidation(format!("pixel layer {} has no source pixels", source.id))
+    })?;
+    let expected_opacity = aseprite_writer::opacity_to_u8(
+        expected_state.opacity.or(source.opacity),
+        &format!("layer {} frame {frame_index}", source.id),
+    )
+    .map_err(|error| ConversionError::OutputValidation(error.to_string()))?;
+    if cel.opacity != expected_opacity {
+        return Err(ConversionError::OutputValidation(format!(
+            "layer {} frame {frame_index} opacity differs",
+            source.id
+        )));
+    }
+    let (output_pixels, x, y) = match &cel.kind {
+        aseprite::CelKind::Raw { pixels, x, y }
+        | aseprite::CelKind::Compressed { pixels, x, y, .. } => (pixels, *x, *y),
+        _ => {
+            return Err(ConversionError::OutputValidation(format!(
+                "layer {} frame {frame_index} is not a pixel cel",
+                source.id
+            )));
+        }
+    };
+    if output_pixels.width != u16::try_from(pixels.width).unwrap_or(u16::MAX)
+        || output_pixels.height != u16::try_from(pixels.height).unwrap_or(u16::MAX)
+        || x != i16::try_from(pixels.left).unwrap_or(i16::MAX)
+        || y != i16::try_from(pixels.top).unwrap_or(i16::MAX)
+        || output_pixels.data != pixels.data
+    {
+        return Err(ConversionError::OutputValidation(format!(
+            "layer {} frame {frame_index} pixel data or position differs",
+            source.id
+        )));
+    }
+    Ok(())
+}
+
+/// Writes validated bytes through a same-directory temporary transaction.
+fn commit_output(output: &Path, bytes: &[u8], overwrite: bool) -> Result<(), ConversionError> {
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(ConversionError::OutputIo)?;
+    let file_name = output
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("output.aseprite");
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| ConversionError::OutputIo(std::io::Error::other(error)))?
+        .as_nanos();
+    let temporary = parent.join(format!(".{file_name}.{stamp}.tmp"));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(ConversionError::OutputIo)?;
+    let result = (|| {
+        file.write_all(bytes).map_err(ConversionError::OutputIo)?;
+        file.sync_all().map_err(ConversionError::OutputIo)?;
+        if !overwrite || !output.exists() {
+            fs::rename(&temporary, output).map_err(ConversionError::OutputIo)?;
+            return Ok(());
+        }
+        let backup = parent.join(format!(".{file_name}.{stamp}.bak"));
+        fs::rename(output, &backup).map_err(ConversionError::OutputIo)?;
+        match fs::rename(&temporary, output) {
+            Ok(()) => {
+                fs::remove_file(backup).map_err(ConversionError::OutputIo)?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = fs::rename(&backup, output);
+                Err(ConversionError::OutputIo(error))
+            }
+        }
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }

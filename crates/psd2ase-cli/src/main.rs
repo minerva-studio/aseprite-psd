@@ -43,13 +43,58 @@ fn run_inspect(arguments: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Executes the conversion command while preserving the phase-one safety gate.
+/// Executes the conversion command with an optional output path and overwrite flag.
 fn run_convert(arguments: &[String]) -> Result<(), CliError> {
-    let input = one_path_argument(arguments, "convert")?;
-    let output = input.with_extension("aseprite");
-    convert(&input, &output, &ConvertOptions::default())
-        .map(|_| ())
-        .map_err(|error| CliError::Conversion(error.to_string()))
+    let (input, output, overwrite) = convert_arguments(arguments)?;
+    let report = convert(&input, &output, &ConvertOptions { overwrite })
+        .map_err(|error| CliError::Conversion(error.to_string()))?;
+    println!("wrote {}", report.output.display());
+    for warning in report.warnings {
+        println!("warning: {warning}");
+    }
+    Ok(())
+}
+
+/// Parses the conversion input, output, and overwrite options.
+fn convert_arguments(arguments: &[String]) -> Result<(PathBuf, PathBuf, bool), CliError> {
+    if arguments.is_empty() {
+        return Err(CliError::Usage(
+            "usage: psd2ase convert INPUT [-o OUTPUT] [--overwrite]".to_string(),
+        ));
+    }
+    let mut input = None;
+    let mut output = None;
+    let mut overwrite = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--overwrite" => overwrite = true,
+            "-o" | "--output" => {
+                index += 1;
+                let value = arguments.get(index).ok_or_else(|| {
+                    CliError::Usage(
+                        "usage: psd2ase convert INPUT [-o OUTPUT] [--overwrite]".to_string(),
+                    )
+                })?;
+                output = Some(PathBuf::from(value));
+            }
+            value if value.starts_with('-') => {
+                return Err(CliError::Usage(format!("unknown convert option: {value}")));
+            }
+            value if input.is_none() => input = Some(PathBuf::from(value)),
+            value => {
+                return Err(CliError::Usage(format!(
+                    "unexpected convert argument: {value}"
+                )));
+            }
+        }
+        index += 1;
+    }
+    let input = input.ok_or_else(|| {
+        CliError::Usage("usage: psd2ase convert INPUT [-o OUTPUT] [--overwrite]".to_string())
+    })?;
+    let output = output.unwrap_or_else(|| input.with_extension("aseprite"));
+    Ok((input, output, overwrite))
 }
 
 /// Extracts the single positional path accepted by a phase-one command.
@@ -64,7 +109,7 @@ fn one_path_argument(arguments: &[String], command: &str) -> Result<PathBuf, Cli
 fn print_help() {
     println!(
         "psd2ase {VERSION}\n\n\
-         Usage:\n  psd2ase inspect INPUT\n  psd2ase convert INPUT\n  psd2ase --version"
+         Usage:\n  psd2ase inspect INPUT\n  psd2ase convert INPUT [-o OUTPUT] [--overwrite]\n  psd2ase --version"
     );
 }
 

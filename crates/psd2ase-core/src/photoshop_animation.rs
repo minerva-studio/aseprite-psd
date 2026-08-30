@@ -89,7 +89,7 @@ pub struct LayerFrameState {
     pub offset: Option<AnimationPoint>,
     /// Optional authored reference point.
     pub reference_point: Option<AnimationPoint>,
-    /// Optional authored opacity override.
+    /// Optional authored opacity override in the normalized 0.0..=1.0 range.
     pub opacity: Option<f64>,
 }
 

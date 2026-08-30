@@ -33,8 +33,16 @@ pub enum ConversionError {
     InputMissing(PathBuf),
     /// The output exists and overwrite was not authorized.
     OutputExists(PathBuf),
-    /// The conversion writer has not passed its compatibility gate yet.
+    /// A future conversion path is deliberately not enabled.
     ConversionNotReady,
+    /// Reading and normalizing the input failed before writing started.
+    InputInspection(String),
+    /// Mapping the normalized document to Aseprite failed.
+    Writer(String),
+    /// The encoded file failed post-write structural validation.
+    OutputValidation(String),
+    /// An output transaction could not complete.
+    OutputIo(io::Error),
 }
 
 impl Display for ConversionError {
@@ -49,8 +57,14 @@ impl Display for ConversionError {
             }
             Self::ConversionNotReady => write!(
                 formatter,
-                "conversion is not enabled until the PSD compatibility probe passes"
+                "conversion is not enabled for this conversion path"
             ),
+            Self::InputInspection(error) => write!(formatter, "could not inspect input: {error}"),
+            Self::Writer(error) => write!(formatter, "could not write Aseprite output: {error}"),
+            Self::OutputValidation(error) => {
+                write!(formatter, "Aseprite output validation failed: {error}")
+            }
+            Self::OutputIo(error) => write!(formatter, "could not commit output: {error}"),
         }
     }
 }

@@ -43,8 +43,15 @@ recursive layer tree, validated document bounds, copied RGBA8 pixels, and
 frame-local layer state. A static PSD becomes one normalized frame with no
 duration; a future Aseprite serializer may choose its own 100 ms default at
 serialization time. The probe compares both the authored animation view and
-the complete normalized-document view. No writer or `.aseprite` output is
-enabled in this stage.
+the complete normalized-document view. This was the last stage before writer
+activation.
+
+Stage 5 enables the minimal experimental writer. It preserves the normalized
+tree and RGBA8 cels, creates one Aseprite frame per normalized frame, and
+validates the serialized file by reading it back before committing output. The
+first output is `target/first-result/鹦鹉走路.aseprite`; its cel-origin policy is
+explicitly provisional (`pixels.left/top`) and all unsupported mappings are
+reported as warnings.
 
 ## Ownership rules
 
@@ -56,5 +63,8 @@ enabled in this stage.
 - A conversion transaction owns temporary output until read-back validation and
   atomic commit complete.
 
-The current `convert` entry point returns an explicit not-ready error. This is a
-deliberate safety boundary, not a successful conversion path.
+The current writer is deliberately experimental. `convert` writes to a
+same-directory temporary file, reads it back through `aseprite-io`, and only
+then commits it. The first coordinate policy uses `pixels.left/top` as cel
+origins and is reported as provisional; Photoshop coordinate equivalence is
+not claimed until visual review supplies evidence.

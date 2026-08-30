@@ -11,12 +11,13 @@ TypeScript `ag-psd` 只作为开发期差分 oracle，不会进入发布 binary�
 
 - `psd2ase --version` 和 `psd2ase --help` 已可用。
 - `psd2ase inspect INPUT.psd` 只读取 PSD，不写输出文件。
-- `psd2ase convert INPUT.psd` 在 parser 兼容性探针和 Aseprite writer 验证通过前
-  有意保持关闭。
+- `psd2ase convert INPUT.psd [-o OUTPUT] [--overwrite]` 已可生成经过回读验证的
+  实验性 `.aseprite` 输出。
 - 仓库不提交 PSD 或 PSB 样本。
 - 阶段四已将递归图层树、图层属性、独立 RGBA8 像素所有权、帧顺序、时长、
   循环策略和逐层状态统一到 `psd2ase-core::normalize` 的中间模型；静态 PSD
-  表示为无时长的单帧；Aseprite writer 仍未启用。
+  表示为无时长的单帧；阶段五 writer 使用 100ms 序列化默认值，并把
+  `pixels.left/top` 作为 provisional cel 原点。
 
 ## 构建
 

@@ -49,7 +49,7 @@ pub struct NormalizedLayer {
     pub kind: NormalizedLayerKind,
     /// Layer bounds in document coordinates.
     pub bounds: NormalizedBounds,
-    /// Base layer opacity, when declared by the source.
+    /// Base layer opacity in the normalized 0.0..=1.0 range, when declared by the source.
     pub opacity: Option<f64>,
     /// Base layer blend mode, when declared by the source.
     pub blend_mode: Option<String>,
@@ -135,7 +135,7 @@ pub struct NormalizedLayerFrameState {
     pub offset: Option<crate::AnimationPoint>,
     /// Optional authored reference point.
     pub reference_point: Option<crate::AnimationPoint>,
-    /// Optional authored opacity override.
+    /// Optional authored opacity override in the normalized 0.0..=1.0 range.
     pub opacity: Option<f64>,
 }
 

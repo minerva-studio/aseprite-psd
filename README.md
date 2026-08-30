@@ -1,8 +1,8 @@
 # psd2ase
 
-`psd2ase` is a planned standalone converter from Photoshop PSD documents to
-Aseprite documents. The project is currently in phase one: the Rust workspace,
-public core boundary, and metadata inspection probe are being established.
+`psd2ase` is a standalone converter from Photoshop PSD documents to Aseprite
+documents. The project is currently in phase five: the normalized reader and a
+minimal, reviewable Aseprite writer are being validated.
 
 The release implementation is intended to be native Rust so the final artifact
 is one executable with no user-side runtime dependency. TypeScript `ag-psd`
@@ -13,8 +13,8 @@ included in the release binary.
 
 - `psd2ase --version` and `psd2ase --help` are available.
 - `psd2ase inspect INPUT.psd` exercises the PSD parser without writing output.
-- `psd2ase convert INPUT.psd` is intentionally gated until the parser
-  compatibility probe and Aseprite writer validation pass.
+- `psd2ase convert INPUT.psd [-o OUTPUT] [--overwrite]` writes a validated
+  experimental Aseprite output through the normalized model.
 - No PSD or PSB fixtures are committed to this repository.
 
 ## Build
@@ -32,6 +32,7 @@ Their upstream repositories and license details are tracked in
 
 ## Scope gate
 
-The first real implementation gate is a differential probe against a supplied
-PSD fixture. It must compare canvas metadata, the complete layer tree, layer
-properties, and per-layer pixel hashes before conversion writing is enabled.
+The first writer output is experimental: it preserves the normalized layer
+tree, RGBA8 cels, and animation frames, while reporting unsupported mappings
+and using `pixels.left/top` as a provisional cel-origin policy. It must be
+reviewed in Aseprite before coordinate semantics are considered final.
