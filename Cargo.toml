@@ -2,6 +2,11 @@
 members = [
     "crates/psd2ase-core",
     "crates/psd2ase-cli",
+    "tools/rust-psd-probe",
+]
+default-members = [
+    "crates/psd2ase-core",
+    "crates/psd2ase-cli",
 ]
 resolver = "2"
 

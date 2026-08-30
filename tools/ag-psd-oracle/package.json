@@ -1,0 +1,11 @@
+{
+  "name": "psd2ase-ag-psd-oracle",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "oracle": "node src/index.mjs"
+  },
+  "dependencies": {
+    "ag-psd": "31.0.2"
+  }
+}

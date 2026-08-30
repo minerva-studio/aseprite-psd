@@ -4,3 +4,6 @@
 *.ase
 *.aseprite
 /.cargo/
+/.probe/
+tools/ag-psd-oracle/node_modules/
+tools/ag-psd-oracle/.npm-cache/

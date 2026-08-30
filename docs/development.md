@@ -17,13 +17,20 @@
 
 ```text
 cargo fmt --all -- --check
-cargo test --workspace
+cargo test --workspace --locked
 cargo run -p psd2ase -- --version
 cargo run -p psd2ase -- --help
+npm --prefix tools/ag-psd-oracle install --ignore-scripts --cache tools/ag-psd-oracle/.npm-cache
+pwsh -File tools/probe.ps1
 ```
 
 Use a real PSD supplied outside the repository for compatibility testing. Do
 not add customer artwork or private fixtures to Git.
+
+The probe runner reads `path\to\fixture.psd` by default. Set
+`PSD2ASE_FIXTURE` or pass `-InputPath` to select another local fixture. It
+writes only ignored JSON snapshots under `.probe/`, verifies the source file's
+size and SHA-256 before and after the run, and never creates an Aseprite file.
 
 ## Ownership rules
 
