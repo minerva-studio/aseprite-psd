@@ -1296,6 +1296,59 @@ mod tests {
     }
 
     #[test]
+    fn container_group_record_without_enable_inherits_state() {
+        let layer = AnimationLayerInput {
+            id: 7,
+            path: "0".to_string(),
+            is_group: true,
+            is_container_group: true,
+            hidden: false,
+            ancestor_ids: Vec::new(),
+        };
+        let raw = RawLayer {
+            id: Some(7),
+            shmd: Some(LayerMetadata {
+                frames: vec![
+                    RawFrameState {
+                        frame_id: 1,
+                        enable: Some(true),
+                        offset: None,
+                        reference_point: None,
+                        opacity: None,
+                    },
+                    RawFrameState {
+                        frame_id: 2,
+                        enable: None,
+                        offset: None,
+                        reference_point: None,
+                        opacity: None,
+                    },
+                ],
+                flags: None,
+            }),
+            flags: None,
+            is_bounding_divider: false,
+        };
+        let frames = vec![
+            PhotoshopFrame {
+                id: 1,
+                duration_ms: 100,
+                dispose: None,
+            },
+            PhotoshopFrame {
+                id: 2,
+                duration_ms: 100,
+                dispose: None,
+            },
+        ];
+        let states = resolve_layer_states(&layer, &raw, &frames).expect("states should resolve");
+        assert!(states.frames[0].enabled);
+        assert!(states.frames[1].enabled);
+        assert!(states.frames[1].record_present);
+        assert!(!states.frames[1].explicit_enable);
+    }
+
+    #[test]
     fn no_animation_psd_has_explicit_empty_result() {
         let mut bytes = vec![0; 38];
         bytes[0..4].copy_from_slice(b"8BPS");
