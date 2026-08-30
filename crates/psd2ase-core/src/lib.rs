@@ -10,13 +10,17 @@ mod model;
 pub mod photoshop_animation;
 
 pub use error::{ConversionError, InspectionError};
-pub use model::{DocumentInspection, NormalizedDocument, NormalizedFrame, NormalizedLayer};
+pub use model::{
+    DocumentInspection, NormalizedBounds, NormalizedDocument, NormalizedFrame, NormalizedLayer,
+    NormalizedLayerFrameState, NormalizedLayerKind, NormalizedLoopMode, NormalizedPixels,
+};
 pub use photoshop_animation::{
     AnimationFlags, AnimationLayerInput, AnimationParseError, AnimationPoint, LayerAnimationState,
     LayerFrameState, LoopMode, PhotoshopAnimation, PhotoshopFrame, VisibleFrameLayers,
     parse_photoshop_animation,
 };
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -60,6 +64,501 @@ pub fn inspect(input: &Path) -> Result<DocumentInspection, InspectionError> {
         color_mode: psd.color_mode.map(|value| format!("{value:?}")),
         root_layer_count: psd.children.as_ref().map_or(0, Vec::len),
     })
+}
+
+/// Reads a PSD and converts it into the format-neutral intermediate model.
+pub fn normalize(input: &Path) -> Result<NormalizedDocument, InspectionError> {
+    let bytes = fs::read(input).map_err(InspectionError::InputIo)?;
+    normalize_bytes(&bytes)
+}
+
+/// Converts one parser buffer without exposing ag-psd types to callers.
+fn normalize_bytes(bytes: &[u8]) -> Result<NormalizedDocument, InspectionError> {
+    let options = ag_psd::psd::ReadOptions {
+        use_image_data: Some(true),
+        skip_thumbnail: Some(true),
+        ..Default::default()
+    };
+    let psd = ag_psd::read_psd(bytes, &options)
+        .map_err(|error| InspectionError::PsdRead(error.to_string()))?;
+    let canvas = (
+        integral_u32(psd.width, "document width")?,
+        integral_u32(psd.height, "document height")?,
+    );
+    let channels = psd
+        .channels
+        .map(|value| integral_u32(value, "document channel count"))
+        .transpose()?;
+    let bits_per_channel = psd
+        .bits_per_channel
+        .map(|value| integral_u32(value, "document bit depth"))
+        .transpose()?;
+    let root_layers = psd.children.as_deref().unwrap_or_default();
+
+    let mut animation_inputs = Vec::new();
+    let mut seen_ids = HashSet::new();
+    for (index, layer) in root_layers.iter().enumerate() {
+        collect_animation_inputs(
+            layer,
+            &[index.to_string()],
+            &[],
+            &mut animation_inputs,
+            &mut seen_ids,
+        )?;
+    }
+    let animation = parse_photoshop_animation(bytes, &animation_inputs)
+        .map_err(|error| InspectionError::Normalization(format!("Photoshop animation: {error}")))?;
+
+    let mut layers = Vec::with_capacity(root_layers.len());
+    for (index, layer) in root_layers.iter().enumerate() {
+        layers.push(build_layer(layer, &[index.to_string()])?);
+    }
+
+    let (frames, loop_mode, active_frame_index, resource_ids, frame_flags) =
+        if let Some(animation) = &animation {
+            let frames = animation
+                .frames
+                .iter()
+                .enumerate()
+                .map(|(index, frame)| NormalizedFrame {
+                    index: index as u32,
+                    source_id: Some(frame.id),
+                    duration_ms: Some(frame.duration_ms),
+                    dispose: frame.dispose.clone(),
+                })
+                .collect::<Vec<_>>();
+            if frames.is_empty() {
+                return Err(InspectionError::Normalization(
+                    "animation metadata declared no frames".to_string(),
+                ));
+            }
+            let mut states = HashMap::with_capacity(animation.layer_states.len());
+            for state in &animation.layer_states {
+                if states.insert(state.layer_id, state).is_some() {
+                    return Err(InspectionError::Normalization(format!(
+                        "duplicate animation state for layer {}",
+                        state.layer_id
+                    )));
+                }
+            }
+            apply_animation_states(&mut layers, &states, &animation.frames)?;
+            (
+                frames,
+                animation.loop_mode.as_ref().map(normalized_loop_mode),
+                animation.active_frame_index,
+                animation.resource_ids.clone(),
+                animation.frame_flags.clone(),
+            )
+        } else {
+            apply_static_states(&mut layers);
+            (
+                vec![NormalizedFrame {
+                    index: 0,
+                    source_id: None,
+                    duration_ms: None,
+                    dispose: None,
+                }],
+                None,
+                None,
+                Vec::new(),
+                None,
+            )
+        };
+
+    Ok(NormalizedDocument {
+        canvas,
+        channels,
+        bits_per_channel,
+        color_mode: psd
+            .color_mode
+            .map(|value| normalize_enum_name(&format!("{value:?}"))),
+        root_layers: layers,
+        frames,
+        loop_mode,
+        active_frame_index,
+        animation_resource_ids: resource_ids,
+        animation_frame_flags: frame_flags,
+    })
+}
+
+/// Collects strict layer IDs and ancestry for the Photoshop metadata scanner.
+fn collect_animation_inputs(
+    layer: &ag_psd::psd::Layer,
+    path: &[String],
+    ancestors: &[u32],
+    inputs: &mut Vec<AnimationLayerInput>,
+    seen_ids: &mut HashSet<u32>,
+) -> Result<(), InspectionError> {
+    let path_string = path.join("/");
+    let id = layer_id(layer.additional_info.id, &path_string)?;
+    if !seen_ids.insert(id) {
+        return Err(InspectionError::Normalization(format!(
+            "duplicate layer id {id} at {path_string}"
+        )));
+    }
+    inputs.push(AnimationLayerInput {
+        id,
+        path: path_string,
+        is_group: layer.children.is_some(),
+        hidden: layer.hidden.unwrap_or(false),
+        ancestor_ids: ancestors.to_vec(),
+    });
+    let mut child_ancestors = ancestors.to_vec();
+    if layer.children.is_some() {
+        child_ancestors.push(id);
+    }
+    if let Some(children) = &layer.children {
+        for (index, child) in children.iter().enumerate() {
+            let mut child_path = path.to_vec();
+            child_path.push(index.to_string());
+            collect_animation_inputs(child, &child_path, &child_ancestors, inputs, seen_ids)?;
+        }
+    }
+    Ok(())
+}
+
+/// Converts one ag-psd layer into an owned normalized layer tree.
+fn build_layer(
+    layer: &ag_psd::psd::Layer,
+    path: &[String],
+) -> Result<NormalizedLayer, InspectionError> {
+    let path_string = path.join("/");
+    let bounds = normalized_bounds(layer, &path_string)?;
+    let is_group = layer.children.is_some();
+    let pixels = if is_group {
+        None
+    } else {
+        let pixel = layer
+            .image_data
+            .as_ref()
+            .or(layer.canvas.as_ref())
+            .ok_or_else(|| {
+                InspectionError::Normalization(format!(
+                    "pixel layer has no RGBA8 data at {path_string}"
+                ))
+            })?;
+        Some(copy_rgba8_pixels(pixel, bounds, &path_string)?)
+    };
+    let mut children = Vec::new();
+    if let Some(source_children) = &layer.children {
+        children.reserve(source_children.len());
+        for (index, child) in source_children.iter().enumerate() {
+            let mut child_path = path.to_vec();
+            child_path.push(index.to_string());
+            children.push(build_layer(child, &child_path)?);
+        }
+    }
+    Ok(NormalizedLayer {
+        id: layer_id(layer.additional_info.id, &path_string)?,
+        name: layer.additional_info.name.clone().unwrap_or_default(),
+        kind: if is_group {
+            NormalizedLayerKind::Group
+        } else {
+            NormalizedLayerKind::Pixel
+        },
+        bounds,
+        opacity: layer.opacity,
+        blend_mode: layer
+            .blend_mode
+            .map(|value| normalize_enum_name(&format!("{value:?}"))),
+        hidden: layer.hidden,
+        pixels,
+        children,
+        frame_states: Vec::new(),
+    })
+}
+
+/// Applies source animation states recursively to the normalized tree.
+fn apply_animation_states(
+    layers: &mut [NormalizedLayer],
+    states: &HashMap<u32, &LayerAnimationState>,
+    frames: &[PhotoshopFrame],
+) -> Result<(), InspectionError> {
+    for layer in layers {
+        let source = states.get(&layer.id).ok_or_else(|| {
+            InspectionError::Normalization(format!(
+                "animation state missing for normalized layer {}",
+                layer.id
+            ))
+        })?;
+        if source.frames.len() != frames.len() {
+            return Err(InspectionError::Normalization(format!(
+                "animation state length mismatch for layer {}: expected {}, got {}",
+                layer.id,
+                frames.len(),
+                source.frames.len()
+            )));
+        }
+        layer.frame_states = source
+            .frames
+            .iter()
+            .enumerate()
+            .map(|(frame_index, state)| NormalizedLayerFrameState {
+                frame_index: frame_index as u32,
+                enabled: state.enabled,
+                explicit_enable: state.explicit_enable,
+                offset: state.offset,
+                reference_point: state.reference_point,
+                opacity: state.opacity,
+            })
+            .collect();
+        apply_animation_states(&mut layer.children, states, frames)?;
+    }
+    Ok(())
+}
+
+/// Adds one base state to every layer of a static document.
+fn apply_static_states(layers: &mut [NormalizedLayer]) {
+    for layer in layers {
+        layer.frame_states = vec![NormalizedLayerFrameState {
+            frame_index: 0,
+            enabled: !layer.hidden.unwrap_or(false),
+            explicit_enable: false,
+            offset: None,
+            reference_point: None,
+            opacity: None,
+        }];
+        apply_static_states(&mut layer.children);
+    }
+}
+
+/// Converts an animation loop policy without retaining parser types in the model.
+fn normalized_loop_mode(value: &LoopMode) -> NormalizedLoopMode {
+    match value {
+        LoopMode::Infinite => NormalizedLoopMode::Infinite,
+        LoopMode::Finite(count) => NormalizedLoopMode::Finite(*count),
+    }
+}
+
+/// Validates a Photoshop layer ID before it enters the normalized model.
+fn layer_id(value: Option<f64>, path: &str) -> Result<u32, InspectionError> {
+    value
+        .filter(|value| {
+            value.is_finite() && *value >= 1.0 && value.fract() == 0.0 && *value <= u32::MAX as f64
+        })
+        .map(|value| value as u32)
+        .ok_or_else(|| InspectionError::Normalization(format!("layer at {path} has an invalid ID")))
+}
+
+/// Converts an integral finite PSD number to a u32 model field.
+fn integral_u32(value: f64, field: &str) -> Result<u32, InspectionError> {
+    if value.is_finite() && value >= 0.0 && value.fract() == 0.0 && value <= u32::MAX as f64 {
+        Ok(value as u32)
+    } else {
+        Err(InspectionError::Normalization(format!(
+            "{field} must be a finite integer in the u32 range"
+        )))
+    }
+}
+
+/// Converts an integral finite PSD coordinate to an i32 model field.
+fn integral_i32(value: Option<f64>, field: &str) -> Result<i32, InspectionError> {
+    let value =
+        value.ok_or_else(|| InspectionError::Normalization(format!("{field} is missing")))?;
+    if value.is_finite()
+        && value.fract() == 0.0
+        && value >= i32::MIN as f64
+        && value <= i32::MAX as f64
+    {
+        Ok(value as i32)
+    } else {
+        Err(InspectionError::Normalization(format!(
+            "{field} must be a finite integer in the i32 range"
+        )))
+    }
+}
+
+/// Validates and converts a parser layer rectangle.
+fn normalized_bounds(
+    layer: &ag_psd::psd::Layer,
+    path: &str,
+) -> Result<NormalizedBounds, InspectionError> {
+    let bounds = NormalizedBounds {
+        left: integral_i32(layer.left, &format!("layer {path} left"))?,
+        top: integral_i32(layer.top, &format!("layer {path} top"))?,
+        right: integral_i32(layer.right, &format!("layer {path} right"))?,
+        bottom: integral_i32(layer.bottom, &format!("layer {path} bottom"))?,
+    };
+    if bounds.right < bounds.left || bounds.bottom < bounds.top {
+        return Err(InspectionError::Normalization(format!(
+            "layer {path} bounds are inverted"
+        )));
+    }
+    Ok(bounds)
+}
+
+/// Copies and validates one parser pixel buffer as owned RGBA8 data.
+fn copy_rgba8_pixels(
+    pixel: &ag_psd::psd::PixelData,
+    bounds: NormalizedBounds,
+    path: &str,
+) -> Result<NormalizedPixels, InspectionError> {
+    let expected = usize::try_from(
+        u64::from(pixel.width)
+            .checked_mul(u64::from(pixel.height))
+            .and_then(|value| value.checked_mul(4))
+            .ok_or_else(|| {
+                InspectionError::Normalization(format!(
+                    "pixel dimensions overflow RGBA8 size at {path}"
+                ))
+            })?,
+    )
+    .map_err(|_| {
+        InspectionError::Normalization(format!(
+            "pixel dimensions exceed addressable memory at {path}"
+        ))
+    })?;
+    if pixel.data.len() != expected {
+        return Err(InspectionError::Normalization(format!(
+            "pixel buffer length mismatch at {path}: expected {expected}, got {}",
+            pixel.data.len()
+        )));
+    }
+    Ok(NormalizedPixels {
+        width: pixel.width,
+        height: pixel.height,
+        left: bounds.left,
+        top: bounds.top,
+        data: pixel.data.clone(),
+    })
+}
+
+/// Normalizes parser enum debug names to a stable lowercase string.
+fn normalize_enum_name(value: &str) -> String {
+    let mut spaced = String::with_capacity(value.len() + 4);
+    for (index, character) in value.chars().enumerate() {
+        if index > 0 && character.is_ascii_uppercase() {
+            spaced.push(' ');
+        }
+        spaced.push(character);
+    }
+    spaced.replace('_', " ").to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(frame_index: u32, enabled: bool) -> NormalizedLayerFrameState {
+        NormalizedLayerFrameState {
+            frame_index,
+            enabled,
+            explicit_enable: false,
+            offset: None,
+            reference_point: None,
+            opacity: None,
+        }
+    }
+
+    fn layer(
+        id: u32,
+        kind: NormalizedLayerKind,
+        hidden: Option<bool>,
+        children: Vec<NormalizedLayer>,
+        frame_states: Vec<NormalizedLayerFrameState>,
+    ) -> NormalizedLayer {
+        NormalizedLayer {
+            id,
+            name: String::new(),
+            kind,
+            bounds: NormalizedBounds {
+                left: 0,
+                top: 0,
+                right: 1,
+                bottom: 1,
+            },
+            opacity: None,
+            blend_mode: None,
+            hidden,
+            pixels: None,
+            children,
+            frame_states,
+        }
+    }
+
+    #[test]
+    fn recursive_visibility_applies_ancestor_state_without_storing_a_list() {
+        let child = layer(
+            2,
+            NormalizedLayerKind::Pixel,
+            None,
+            Vec::new(),
+            vec![state(0, true)],
+        );
+        let group = layer(
+            1,
+            NormalizedLayerKind::Group,
+            Some(true),
+            vec![child],
+            vec![state(0, false)],
+        );
+        let mut visible = Vec::new();
+        group.collect_visible_pixel_layer_ids(0, true, &mut visible);
+        assert!(visible.is_empty());
+        assert!(!group.is_effectively_visible(0, true));
+    }
+
+    #[test]
+    fn static_frame_has_no_serialization_duration() {
+        let frame = NormalizedFrame {
+            index: 0,
+            source_id: None,
+            duration_ms: None,
+            dispose: None,
+        };
+        assert_eq!(frame.source_id, None);
+        assert_eq!(frame.duration_ms, None);
+    }
+
+    #[test]
+    fn pixel_data_is_owned_and_keeps_origin() {
+        let source = ag_psd::psd::PixelData {
+            width: 1,
+            height: 1,
+            data: vec![1, 2, 3, 4],
+        };
+        let normalized = copy_rgba8_pixels(
+            &source,
+            NormalizedBounds {
+                left: -4,
+                top: 7,
+                right: -3,
+                bottom: 8,
+            },
+            "test",
+        )
+        .expect("valid RGBA8 data");
+        assert_eq!(normalized.data, vec![1, 2, 3, 4]);
+        assert_eq!((normalized.left, normalized.top), (-4, 7));
+    }
+
+    #[test]
+    fn malformed_pixel_length_is_rejected() {
+        let source = ag_psd::psd::PixelData {
+            width: 1,
+            height: 1,
+            data: vec![1, 2, 3],
+        };
+        let error = copy_rgba8_pixels(
+            &source,
+            NormalizedBounds {
+                left: 0,
+                top: 0,
+                right: 1,
+                bottom: 1,
+            },
+            "test",
+        )
+        .expect_err("short pixel data must fail");
+        assert!(error.to_string().contains("pixel buffer length mismatch"));
+    }
+
+    #[test]
+    fn non_integral_and_out_of_range_bounds_are_rejected() {
+        assert!(integral_i32(Some(1.5), "left").is_err());
+        assert!(integral_i32(Some(i32::MAX as f64 + 1.0), "right").is_err());
+        assert!(integral_i32(Some(i32::MIN as f64 - 1.0), "top").is_err());
+    }
 }
 
 /// Converts a PSD into an Aseprite file after validation and mapping.

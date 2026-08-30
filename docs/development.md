@@ -38,9 +38,19 @@ Rust scanner reads bounded image-resource and layer additional-info sections
 animation model in psd2ase-core. The published ag-psd 0.2.0 remains unchanged;
 TypeScript ag-psd is still only the development oracle.
 
+Stage 4 exposes `psd2ase_core::normalize` as the reader boundary. It owns the
+recursive layer tree, validated document bounds, copied RGBA8 pixels, and
+frame-local layer state. A static PSD becomes one normalized frame with no
+duration; a future Aseprite serializer may choose its own 100 ms default at
+serialization time. The probe compares both the authored animation view and
+the complete normalized-document view. No writer or `.aseprite` output is
+enabled in this stage.
+
 ## Ownership rules
 
-- `psd2ase-core` owns normalized document semantics and conversion invariants.
+- `psd2ase-core` owns normalized document semantics, pixel ownership, and
+  conversion invariants. Future PSD and Aseprite writers must use this model as
+  their conversion boundary.
 - `psd2ase` owns argument parsing, output policy, exit codes, and presentation.
 - The parser owns PSD decoding; the writer must not reinterpret PSD descriptors.
 - A conversion transaction owns temporary output until read-back validation and

@@ -14,6 +14,13 @@ async function main() {
     "$.animation",
     animationMismatches,
   );
+  const normalizedMismatches = [];
+  compareValues(
+    rust.normalized_document,
+    oracle.normalized_document,
+    "$.normalized_document",
+    normalizedMismatches,
+  );
 
   if (mismatches.length === 0) {
     console.log("probe comparison: PASS (zero base metadata/layer/pixel mismatches)");
@@ -33,6 +40,18 @@ async function main() {
     );
     process.exitCode = 1;
   }
+
+  if (normalizedMismatches.length === 0) {
+    console.log("normalized document compatibility: PASS");
+  } else {
+    reportMismatches(
+      "normalized document compatibility: FAIL",
+      "normalized document mismatches",
+      normalizedMismatches,
+      console.error,
+    );
+    process.exitCode = 1;
+  }
 }
 
 /** Removes animation-only fields before evaluating the base compatibility gate. */
@@ -43,10 +62,15 @@ function stripAnimationFields(value) {
   if (value !== null && typeof value === "object") {
     return Object.fromEntries(
       Object.entries(value)
-        .filter(([key]) => key !== "animation" && key !== "animation_frame_count")
+        .filter(([key]) =>
+          key !== "animation" &&
+          key !== "animation_frame_count" &&
+          key !== "normalized_document",
+        )
         .map(([key, nested]) => [key, stripAnimationFields(nested)]),
     );
   }
+
   return value;
 }
 

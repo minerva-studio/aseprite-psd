@@ -7,7 +7,7 @@ import { createReader } from "ag-psd/dist/psdReader.js";
 import { resourceHandlersMap } from "ag-psd/dist/imageResources.js";
 
 const DEFAULT_INPUT = "path/to/fixture.psd";
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 /**
  * Provides the raw RGBA image-data factory required by ag-psd in Node.js.
@@ -68,6 +68,7 @@ function buildSnapshot(bytes, psd) {
   const rootLayers = psd.children ?? [];
   rootLayers.forEach((layer, index) => collectLayer(layer, [String(index)], layers));
   const animation = buildAnimationSnapshot(bytes, rootLayers);
+  const normalizedDocument = buildNormalizedDocumentSnapshot(animation, rootLayers);
 
   return {
     schema_version: SCHEMA_VERSION,
@@ -87,6 +88,56 @@ function buildSnapshot(bytes, psd) {
     },
     layers,
     animation,
+    normalized_document: normalizedDocument,
+  };
+}
+
+/** Builds the complete normalized-model animation view, including static fallback frames. */
+function buildNormalizedDocumentSnapshot(animation, rootLayers) {
+  const layers = [];
+  rootLayers.forEach((layer, index) => flattenLayer(layer, [String(index)], [], layers));
+  if (animation.frames.length === 0) {
+    return {
+      frames: [{ index: 0, source_id: null, duration_ms: null, dispose: null }],
+      loop_mode: null,
+      active_frame: null,
+      resource_ids: [],
+      layer_states: layers.map((layer) => ({
+        layer_id: layer.id,
+        path: layer.path,
+        frames: [{
+          frame_index: 0,
+          enabled: !(layer.hidden ?? false),
+          explicit_enable: false,
+          offset: null,
+          reference_point: null,
+          opacity: null,
+        }],
+      })),
+    };
+  }
+  return {
+    frames: animation.frames.map((frame, index) => ({
+      index,
+      source_id: frame.id,
+      duration_ms: frame.duration_ms,
+      dispose: frame.dispose,
+    })),
+    loop_mode: animation.loop_mode,
+    active_frame: animation.active_frame,
+    resource_ids: animation.resource_ids,
+    layer_states: animation.layer_states.map((layer) => ({
+      layer_id: layer.layer_id,
+      path: layer.path,
+      frames: layer.frames.map((frame, frameIndex) => ({
+        frame_index: frameIndex,
+        enabled: frame.enabled,
+        explicit_enable: frame.explicit_enable,
+        offset: frame.offset,
+        reference_point: frame.reference_point,
+        opacity: frame.opacity,
+      })),
+    })),
   };
 }
 
@@ -312,6 +363,8 @@ function pixelSnapshot(layer, path) {
   return {
     width,
     height,
+    left: layer.left ?? 0,
+    top: layer.top ?? 0,
     byte_length: bytes.byteLength,
     sha256: sha256Hex(bytes),
   };

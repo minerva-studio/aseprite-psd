@@ -9,6 +9,8 @@ pub enum InspectionError {
     InputIo(io::Error),
     /// The PSD parser rejected the input.
     PsdRead(String),
+    /// The PSD was readable but could not be represented safely in the model.
+    Normalization(String),
 }
 
 impl Display for InspectionError {
@@ -17,6 +19,7 @@ impl Display for InspectionError {
         match self {
             Self::InputIo(error) => write!(formatter, "could not read input: {error}"),
             Self::PsdRead(error) => write!(formatter, "could not parse PSD: {error}"),
+            Self::Normalization(error) => write!(formatter, "could not normalize PSD: {error}"),
         }
     }
 }
