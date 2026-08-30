@@ -2,7 +2,10 @@ use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use psd2ase_core::{ConvertOptions, VERSION, convert, inspect};
+use psd2ase_core::{
+    AssociationDecisionStatus, ConvertOptions, LayerAssociationMode, LayerZOrderMode,
+    StableOrderMode, VERSION, convert, inspect,
+};
 
 /// Runs the command-line entry point and returns its stable process result.
 fn main() -> ExitCode {
@@ -45,35 +48,166 @@ fn run_inspect(arguments: &[String]) -> Result<(), CliError> {
 
 /// Executes the conversion command with an optional output path and overwrite flag.
 fn run_convert(arguments: &[String]) -> Result<(), CliError> {
-    let (input, output, overwrite) = convert_arguments(arguments)?;
-    let report = convert(&input, &output, &ConvertOptions { overwrite })
-        .map_err(|error| CliError::Conversion(error.to_string()))?;
+    let (input, output, overwrite, layer_association, z_order, stable_order, stable_order_explicit) =
+        convert_arguments(arguments)?;
+    if layer_association == LayerAssociationMode::Preserve && z_order == LayerZOrderMode::Auto {
+        return Err(CliError::Usage(
+            "--z-order auto requires --layer-association auto".to_string(),
+        ));
+    }
+    if layer_association == LayerAssociationMode::Preserve && stable_order_explicit {
+        return Err(CliError::Usage(
+            "--stable-order requires --layer-association auto".to_string(),
+        ));
+    }
+    let report = convert(
+        &input,
+        &output,
+        &ConvertOptions {
+            overwrite,
+            layer_association,
+            z_order,
+            stable_order,
+        },
+    )
+    .map_err(|error| CliError::Conversion(error.to_string()))?;
     println!("wrote {}", report.output.display());
     for warning in report.warnings {
         println!("warning: {warning}");
+    }
+    if let Some(association) = report.association {
+        println!(
+            "layer association: {} observations -> {} logical tracks",
+            association.observation_count, association.track_count
+        );
+        println!("layer-association z-order: {:?}", association.z_order_mode);
+        println!(
+            "layer-association stable-order: {:?}",
+            association.stable_order_mode
+        );
+        if !association.omitted_source_layer_ids.is_empty() {
+            println!(
+                "layer-association omitted source pixel layers: {}",
+                association.omitted_source_layer_ids.len()
+            );
+        }
+        for warning in association.warnings {
+            println!("layer-association warning: {warning}");
+        }
+        for diagnostic in association.z_order_diagnostics {
+            println!("layer-association z-order diagnostic: {diagnostic}");
+        }
+        for diagnostic in association.stable_order_diagnostics {
+            println!("layer-association stable-order diagnostic: {diagnostic}");
+        }
+        for decision in association.decisions {
+            if matches!(
+                decision.status,
+                AssociationDecisionStatus::Ambiguous | AssociationDecisionStatus::NewTrack
+            ) {
+                println!(
+                    "layer-association {:?}: frame {} source {} ({}) -> track {}",
+                    decision.status,
+                    decision.frame_index,
+                    decision.source_layer_id,
+                    decision.source_path,
+                    decision.track_id
+                );
+            }
+        }
     }
     Ok(())
 }
 
 /// Parses the conversion input, output, and overwrite options.
-fn convert_arguments(arguments: &[String]) -> Result<(PathBuf, PathBuf, bool), CliError> {
+fn convert_arguments(
+    arguments: &[String],
+) -> Result<
+    (
+        PathBuf,
+        PathBuf,
+        bool,
+        LayerAssociationMode,
+        LayerZOrderMode,
+        StableOrderMode,
+        bool,
+    ),
+    CliError,
+> {
     if arguments.is_empty() {
         return Err(CliError::Usage(
-            "usage: psd2ase convert INPUT [-o OUTPUT] [--overwrite]".to_string(),
+            "usage: psd2ase convert INPUT [-o OUTPUT] [--overwrite] [--layer-association preserve|auto] [--z-order stable|auto] [--stable-order consensus|anchor|strict]".to_string(),
         ));
     }
     let mut input = None;
     let mut output = None;
     let mut overwrite = false;
+    let mut layer_association = LayerAssociationMode::Preserve;
+    let mut z_order = LayerZOrderMode::Stable;
+    let mut stable_order = StableOrderMode::Consensus;
+    let mut stable_order_explicit = false;
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
             "--overwrite" => overwrite = true,
+            "--layer-association" => {
+                index += 1;
+                let value = arguments.get(index).ok_or_else(|| {
+                    CliError::Usage(
+                        "usage: psd2ase convert INPUT [-o OUTPUT] [--overwrite] [--layer-association preserve|auto] [--z-order stable|auto] [--stable-order consensus|anchor|strict]".to_string(),
+                    )
+                })?;
+                layer_association = match value.as_str() {
+                    "preserve" => LayerAssociationMode::Preserve,
+                    "auto" => LayerAssociationMode::Auto,
+                    _ => {
+                        return Err(CliError::Usage(format!(
+                            "invalid --layer-association value: {value:?}"
+                        )));
+                    }
+                };
+            }
+            "--z-order" => {
+                index += 1;
+                let value = arguments.get(index).ok_or_else(|| {
+                    CliError::Usage(
+                        "usage: psd2ase convert INPUT [-o OUTPUT] [--overwrite] [--layer-association preserve|auto] [--z-order stable|auto] [--stable-order consensus|anchor|strict]".to_string(),
+                    )
+                })?;
+                z_order = match value.as_str() {
+                    "stable" => LayerZOrderMode::Stable,
+                    "auto" => LayerZOrderMode::Auto,
+                    _ => {
+                        return Err(CliError::Usage(format!(
+                            "invalid --z-order value: {value:?}"
+                        )));
+                    }
+                };
+            }
+            "--stable-order" => {
+                index += 1;
+                let value = arguments.get(index).ok_or_else(|| {
+                    CliError::Usage(
+                        "usage: psd2ase convert INPUT [-o OUTPUT] [--overwrite] [--layer-association preserve|auto] [--z-order stable|auto] [--stable-order consensus|anchor|strict]".to_string(),
+                    )
+                })?;
+                stable_order = match value.as_str() {
+                    "consensus" => StableOrderMode::Consensus,
+                    "anchor" => StableOrderMode::Anchor,
+                    "strict" => StableOrderMode::Strict,
+                    _ => {
+                        return Err(CliError::Usage(format!(
+                            "invalid --stable-order value: {value:?}"
+                        )));
+                    }
+                };
+                stable_order_explicit = true;
+            }
             "-o" | "--output" => {
                 index += 1;
                 let value = arguments.get(index).ok_or_else(|| {
                     CliError::Usage(
-                        "usage: psd2ase convert INPUT [-o OUTPUT] [--overwrite]".to_string(),
+                        "usage: psd2ase convert INPUT [-o OUTPUT] [--overwrite] [--layer-association preserve|auto] [--z-order stable|auto] [--stable-order consensus|anchor|strict]".to_string(),
                     )
                 })?;
                 output = Some(PathBuf::from(value));
@@ -91,10 +225,18 @@ fn convert_arguments(arguments: &[String]) -> Result<(PathBuf, PathBuf, bool), C
         index += 1;
     }
     let input = input.ok_or_else(|| {
-        CliError::Usage("usage: psd2ase convert INPUT [-o OUTPUT] [--overwrite]".to_string())
+        CliError::Usage("usage: psd2ase convert INPUT [-o OUTPUT] [--overwrite] [--layer-association preserve|auto] [--z-order stable|auto] [--stable-order consensus|anchor|strict]".to_string())
     })?;
     let output = output.unwrap_or_else(|| input.with_extension("aseprite"));
-    Ok((input, output, overwrite))
+    Ok((
+        input,
+        output,
+        overwrite,
+        layer_association,
+        z_order,
+        stable_order,
+        stable_order_explicit,
+    ))
 }
 
 /// Extracts the single positional path accepted by a phase-one command.
@@ -109,7 +251,7 @@ fn one_path_argument(arguments: &[String], command: &str) -> Result<PathBuf, Cli
 fn print_help() {
     println!(
         "psd2ase {VERSION}\n\n\
-         Usage:\n  psd2ase inspect INPUT\n  psd2ase convert INPUT [-o OUTPUT] [--overwrite]\n  psd2ase --version"
+         Usage:\n  psd2ase inspect INPUT\n  psd2ase convert INPUT [-o OUTPUT] [--overwrite] [--layer-association preserve|auto] [--z-order stable|auto] [--stable-order consensus|anchor|strict]\n  psd2ase --version"
     );
 }
 

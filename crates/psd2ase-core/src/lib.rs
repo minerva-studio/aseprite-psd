@@ -6,11 +6,18 @@
 
 pub mod aseprite_writer;
 mod error;
+pub mod logical_layers;
 mod model;
 pub mod photoshop_animation;
 
 pub use aseprite_writer::{DEFAULT_FRAME_DURATION_MS, EncodedAseprite, WriterError};
 pub use error::{ConversionError, InspectionError};
+pub use logical_layers::{
+    AssociationDecision, AssociationDecisionStatus, AssociationReport, LayerAssociationMode,
+    LayerWritePlan, LayerZOrderMode, LogicalLayerTrack, PlannedCel, PlannedNode, StableOrderMode,
+    build_layer_write_plan, build_layer_write_plan_with_order_modes,
+    build_layer_write_plan_with_z_order,
+};
 pub use model::{
     DocumentInspection, NormalizedBounds, NormalizedDocument, NormalizedFrame, NormalizedLayer,
     NormalizedLayerFrameState, NormalizedLayerKind, NormalizedLoopMode, NormalizedPixels,
@@ -35,6 +42,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct ConvertOptions {
     /// Allow replacing an existing output path after successful validation.
     pub overwrite: bool,
+    /// Selects the source-preserving or experimental logical-layer output plan.
+    pub layer_association: LayerAssociationMode,
+    /// Selects stable track order or experimental per-cel Z-Index adjustments.
+    pub z_order: LayerZOrderMode,
+    /// Selects the stable logical-track ordering strategy.
+    pub stable_order: StableOrderMode,
 }
 
 /// Summary produced after a conversion has committed its output.
@@ -46,6 +59,8 @@ pub struct ConversionReport {
     pub output: PathBuf,
     /// Warnings produced while mapping or validating the document.
     pub warnings: Vec<String>,
+    /// Automatic layer-association diagnostics, when auto mode was selected.
+    pub association: Option<AssociationReport>,
 }
 
 /// Reads PSD structure metadata without creating an output file.
@@ -586,20 +601,177 @@ pub fn convert(
 
     let document =
         normalize(input).map_err(|error| ConversionError::InputInspection(error.to_string()))?;
-    let mut encoded = aseprite_writer::encode(&document)
-        .map_err(|error| ConversionError::Writer(error.to_string()))?;
+    let plan = match options.layer_association {
+        LayerAssociationMode::Preserve => None,
+        LayerAssociationMode::Auto => Some(
+            build_layer_write_plan_with_order_modes(
+                &document,
+                options.z_order,
+                options.stable_order,
+            )
+            .map_err(|error| ConversionError::Writer(error.to_string()))?,
+        ),
+    };
+    let association = plan.as_ref().map(|plan| plan.report.clone());
+    let mut encoded = match plan.as_ref() {
+        None => aseprite_writer::encode(&document),
+        Some(plan) => aseprite_writer::encode_with_plan(&document, plan),
+    }
+    .map_err(|error| ConversionError::Writer(error.to_string()))?;
     encoded.warnings.insert(
         0,
         "coordinate policy: provisional pixels.left/top plus frame offset cel origin".to_string(),
     );
-    validate_aseprite_output(&encoded.bytes, &document)?;
+    match plan.as_ref() {
+        None => validate_aseprite_output(&encoded.bytes, &document)?,
+        Some(plan) => validate_planned_aseprite_output(&encoded.bytes, &document, plan)?,
+    }
     commit_output(output, &encoded.bytes, options.overwrite)?;
 
     Ok(ConversionReport {
         input: input.to_path_buf(),
         output: output.to_path_buf(),
         warnings: encoded.warnings,
+        association,
     })
+}
+
+/// Validates an Aseprite file produced from the experimental logical plan.
+fn validate_planned_aseprite_output(
+    bytes: &[u8],
+    document: &NormalizedDocument,
+    plan: &LayerWritePlan,
+) -> Result<(), ConversionError> {
+    let file = aseprite::AsepriteFile::from_reader(Cursor::new(bytes))
+        .map_err(|error| ConversionError::OutputValidation(error.to_string()))?;
+    if file.width() != u16::try_from(document.canvas.0).unwrap_or(u16::MAX)
+        || file.height() != u16::try_from(document.canvas.1).unwrap_or(u16::MAX)
+    {
+        return Err(ConversionError::OutputValidation(
+            "canvas dimensions differ from normalized document".to_string(),
+        ));
+    }
+    if file.frames().len() != document.frames.len() {
+        return Err(ConversionError::OutputValidation(format!(
+            "frame count differs: expected {}, got {}",
+            document.frames.len(),
+            file.frames().len()
+        )));
+    }
+    for (index, frame) in document.frames.iter().enumerate() {
+        let expected = frame
+            .duration_ms
+            .unwrap_or(u32::from(DEFAULT_FRAME_DURATION_MS));
+        if u32::from(file.frames()[index].duration_ms) != expected {
+            return Err(ConversionError::OutputValidation(format!(
+                "frame {index} duration differs: expected {expected}, got {}",
+                file.frames()[index].duration_ms
+            )));
+        }
+    }
+
+    let mut layers = Vec::new();
+    flatten_planned_nodes(&plan.root_nodes, None, &mut layers);
+    if file.layers().len() != layers.len() {
+        return Err(ConversionError::OutputValidation(format!(
+            "logical layer count differs: expected {}, got {}",
+            layers.len(),
+            file.layers().len()
+        )));
+    }
+    for (layer_index, (node, expected_parent)) in layers.iter().enumerate() {
+        let output_layer = &file.layers()[layer_index];
+        if output_layer.parent != *expected_parent {
+            return Err(ConversionError::OutputValidation(format!(
+                "logical layer {layer_index} parent differs"
+            )));
+        }
+        match node {
+            PlannedNode::Group { name, .. } => {
+                if output_layer.name != *name || output_layer.kind != aseprite::LayerKind::Group {
+                    return Err(ConversionError::OutputValidation(format!(
+                        "logical group {layer_index} attributes differ"
+                    )));
+                }
+            }
+            PlannedNode::Track { track_id } => {
+                let track = plan.tracks.get(*track_id).ok_or_else(|| {
+                    ConversionError::OutputValidation(format!(
+                        "logical track {track_id} is not present in plan"
+                    ))
+                })?;
+                if output_layer.name != track.name
+                    || output_layer.kind != aseprite::LayerKind::Normal
+                    || output_layer.visible != track.cels.iter().any(Option::is_some)
+                {
+                    return Err(ConversionError::OutputValidation(format!(
+                        "logical track {track_id} attributes differ"
+                    )));
+                }
+                let output_handle = file.layer_ref(layer_index).ok_or_else(|| {
+                    ConversionError::OutputValidation(format!(
+                        "logical track {track_id} cannot be addressed"
+                    ))
+                })?;
+                for frame_index in 0..document.frames.len() {
+                    let expected = track.cels[frame_index];
+                    let actual = file.cel(output_handle, frame_index);
+                    if expected.is_some() != actual.is_some() {
+                        return Err(ConversionError::OutputValidation(format!(
+                            "logical track {track_id} frame {frame_index} cel visibility differs"
+                        )));
+                    }
+                    if let (Some(expected), Some(actual)) = (expected, actual) {
+                        let source = find_normalized_layer(document, expected.source_layer_id)
+                            .ok_or_else(|| {
+                                ConversionError::OutputValidation(format!(
+                                    "source layer {} is missing",
+                                    expected.source_layer_id
+                                ))
+                            })?;
+                        validate_cel(actual, source, frame_index)?;
+                        if actual.z_index != expected.z_index {
+                            return Err(ConversionError::OutputValidation(format!(
+                                "logical track {track_id} frame {frame_index} z-index differs"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Flattens a logical plan in the same order used to create Aseprite layers.
+fn flatten_planned_nodes<'a>(
+    nodes: &'a [PlannedNode],
+    parent: Option<usize>,
+    output: &mut Vec<(&'a PlannedNode, Option<usize>)>,
+) {
+    for node in nodes {
+        let index = output.len();
+        output.push((node, parent));
+        if let PlannedNode::Group { children, .. } = node {
+            flatten_planned_nodes(children, Some(index), output);
+        }
+    }
+}
+
+/// Finds a normalized source layer by its stable ID.
+fn find_normalized_layer(document: &NormalizedDocument, id: u32) -> Option<&NormalizedLayer> {
+    fn find(layers: &[NormalizedLayer], id: u32) -> Option<&NormalizedLayer> {
+        for layer in layers {
+            if layer.id == id {
+                return Some(layer);
+            }
+            if let Some(found) = find(&layer.children, id) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    find(&document.root_layers, id)
 }
 
 /// Validates the encoded Aseprite structure against the normalized source model.

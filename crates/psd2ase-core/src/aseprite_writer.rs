@@ -6,8 +6,9 @@ use aseprite::{
 };
 
 use crate::{
-    NormalizedDocument, NormalizedLayer, NormalizedLayerFrameState, NormalizedLayerKind,
-    NormalizedLoopMode, NormalizedPixels,
+    LayerWritePlan, LogicalLayerTrack, NormalizedDocument, NormalizedLayer,
+    NormalizedLayerFrameState, NormalizedLayerKind, NormalizedLoopMode, NormalizedPixels,
+    PlannedNode,
 };
 
 /// Serialization default used only when a static normalized frame has no source duration.
@@ -172,6 +173,124 @@ pub fn encode(document: &NormalizedDocument) -> Result<EncodedAseprite, WriterEr
     Ok(EncodedAseprite { bytes, warnings })
 }
 
+/// Encodes a normalized document using an experimental logical-layer plan.
+pub fn encode_with_plan(
+    document: &NormalizedDocument,
+    plan: &LayerWritePlan,
+) -> Result<EncodedAseprite, WriterError> {
+    let width = u16_value("canvas width", document.canvas.0)?;
+    let height = u16_value("canvas height", document.canvas.1)?;
+    let mut file = AsepriteFile::new(width, height, ColorMode::Rgba);
+    let mut warnings = Vec::new();
+    collect_unmapped_animation_warnings(document, &mut warnings);
+
+    if document.frames.is_empty() {
+        return Err(WriterError::Aseprite(
+            "normalized document has no frames".to_string(),
+        ));
+    }
+    for (expected_index, frame) in document.frames.iter().enumerate() {
+        if frame.index != expected_index as u32 {
+            return Err(WriterError::InvalidFrameIndex {
+                expected: expected_index,
+                actual: frame.index,
+            });
+        }
+        let duration = frame
+            .duration_ms
+            .unwrap_or(u32::from(DEFAULT_FRAME_DURATION_MS));
+        file.add_frame(u16_value("frame duration", duration)?);
+    }
+    if let Some(loop_mode) = &document.loop_mode {
+        let repeat = match loop_mode {
+            NormalizedLoopMode::Infinite => 0,
+            NormalizedLoopMode::Finite(count) => u16_value("loop repeat count", *count)?,
+        };
+        file.add_tag_with(
+            "PSD Animation",
+            0..=(document.frames.len() - 1),
+            LoopDirection::Forward,
+            repeat,
+        )
+        .map_err(|error| WriterError::Aseprite(error.to_string()))?;
+    }
+
+    let mut bindings = Vec::new();
+    for node in &plan.root_nodes {
+        create_planned_tree(
+            &mut file,
+            node,
+            None,
+            document,
+            plan,
+            &mut bindings,
+            &mut warnings,
+        )?;
+    }
+    for frame_index in 0..document.frames.len() {
+        for binding in &bindings {
+            let Some(planned_cel) = binding.track.cels[frame_index] else {
+                continue;
+            };
+            if planned_cel.source_frame_index as usize != frame_index {
+                return Err(WriterError::InvalidFrameIndex {
+                    expected: frame_index,
+                    actual: planned_cel.source_frame_index,
+                });
+            }
+            let source = find_layer(document, planned_cel.source_layer_id).ok_or_else(|| {
+                WriterError::InvalidPixels {
+                    layer_id: planned_cel.source_layer_id,
+                    message: "planned source layer was not found".to_string(),
+                }
+            })?;
+            let state = frame_state(source, frame_index)?;
+            let pixels = source
+                .pixels
+                .as_ref()
+                .ok_or_else(|| WriterError::InvalidPixels {
+                    layer_id: source.id,
+                    message: "pixel layer has no owned data".to_string(),
+                })?;
+            let position = cel_position(pixels, state)?;
+            let ase_pixels = aseprite_pixels(source.id, pixels)?;
+            let opacity = normalized_opacity(
+                state.opacity.or(source.opacity),
+                format!("layer {} frame {frame_index}", source.id),
+                &mut warnings,
+            )?;
+            if opacity == 255 && planned_cel.z_index == 0 {
+                file.set_raw_cel(
+                    binding.handle,
+                    frame_index,
+                    ase_pixels,
+                    position.0,
+                    position.1,
+                )
+                .map_err(|error| WriterError::Aseprite(error.to_string()))?;
+            } else {
+                file.set_cel_with(
+                    binding.handle,
+                    frame_index,
+                    CelOptions {
+                        pixels: ase_pixels,
+                        x: position.0,
+                        y: position.1,
+                        opacity,
+                        z_index: planned_cel.z_index,
+                    },
+                )
+                .map_err(|error| WriterError::Aseprite(error.to_string()))?;
+            }
+        }
+    }
+
+    let mut bytes = Vec::new();
+    file.write_to(&mut bytes)
+        .map_err(|error| WriterError::Aseprite(error.to_string()))?;
+    Ok(EncodedAseprite { bytes, warnings })
+}
+
 /// Associates every normalized pixel layer with its newly-created Aseprite layer.
 fn create_layer_tree<'a>(
     file: &mut AsepriteFile,
@@ -212,6 +331,81 @@ fn create_layer_tree<'a>(
 struct PixelBinding<'a> {
     layer: &'a NormalizedLayer,
     handle: LayerRef,
+}
+
+/// Associates one planned logical track with its output Aseprite layer.
+struct PlannedBinding<'a> {
+    track: &'a LogicalLayerTrack,
+    handle: LayerRef,
+}
+
+/// Creates the output tree described by a logical-layer plan.
+fn create_planned_tree<'a>(
+    file: &mut AsepriteFile,
+    node: &'a PlannedNode,
+    parent: Option<GroupRef>,
+    document: &NormalizedDocument,
+    plan: &'a LayerWritePlan,
+    bindings: &mut Vec<PlannedBinding<'a>>,
+    warnings: &mut Vec<String>,
+) -> Result<(), WriterError> {
+    match node {
+        PlannedNode::Group {
+            name,
+            source_layer_id,
+            children,
+        } => {
+            let source = source_layer_id.and_then(|id| find_layer(document, id));
+            let mut options = source
+                .map(|layer| layer_options(layer, warnings))
+                .transpose()?
+                .unwrap_or_default();
+            options.visible = true;
+            let group = match parent {
+                Some(parent) => file.add_group_in_with(name, parent, options),
+                None => file.add_group_with(name, options),
+            };
+            for child in children {
+                create_planned_tree(file, child, Some(group), document, plan, bindings, warnings)?;
+            }
+        }
+        PlannedNode::Track { track_id } => {
+            let track = plan.tracks.get(*track_id).ok_or_else(|| {
+                WriterError::Aseprite(format!("logical track {track_id} is not present in plan"))
+            })?;
+            let source =
+                find_layer(document, track.representative_source_layer_id).ok_or_else(|| {
+                    WriterError::InvalidPixels {
+                        layer_id: track.representative_source_layer_id,
+                        message: "logical track representative layer was not found".to_string(),
+                    }
+                })?;
+            let mut options = layer_options(source, warnings)?;
+            options.visible = track.cels.iter().any(Option::is_some);
+            let handle = match parent {
+                Some(parent) => file.add_layer_in_with(&track.name, parent, options),
+                None => file.add_layer_with(&track.name, options),
+            };
+            bindings.push(PlannedBinding { track, handle });
+        }
+    }
+    Ok(())
+}
+
+/// Finds a normalized source layer by its stable source ID.
+fn find_layer(document: &NormalizedDocument, id: u32) -> Option<&NormalizedLayer> {
+    fn find(layers: &[NormalizedLayer], id: u32) -> Option<&NormalizedLayer> {
+        for layer in layers {
+            if layer.id == id {
+                return Some(layer);
+            }
+            if let Some(found) = find(&layer.children, id) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    find(&document.root_layers, id)
 }
 
 /// Maps base layer properties to Aseprite layer options.
