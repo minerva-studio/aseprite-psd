@@ -25,6 +25,8 @@ pub struct EncodedAseprite {
 /// Errors raised while mapping the normalized model to Aseprite.
 #[derive(Debug, PartialEq, Eq)]
 pub enum WriterError {
+    /// A normalized frame index is not the expected contiguous playback index.
+    InvalidFrameIndex { expected: usize, actual: u32 },
     /// A normalized integer cannot be represented by the Aseprite format.
     FormatLimit { field: String, value: i64, max: i64 },
     /// A normalized opacity is outside the supported 0.0..=1.0 range.
@@ -41,6 +43,12 @@ impl std::fmt::Display for WriterError {
     /// Formats a writer error without exposing the third-party error type.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidFrameIndex { expected, actual } => {
+                write!(
+                    formatter,
+                    "invalid normalized frame index: expected {expected}, got {actual}"
+                )
+            }
             Self::FormatLimit { field, value, max } => {
                 write!(formatter, "{field} is out of range: {value} > {max}")
             }
@@ -73,7 +81,13 @@ pub fn encode(document: &NormalizedDocument) -> Result<EncodedAseprite, WriterEr
             "normalized document has no frames".to_string(),
         ));
     }
-    for frame in &document.frames {
+    for (expected_index, frame) in document.frames.iter().enumerate() {
+        if frame.index != expected_index as u32 {
+            return Err(WriterError::InvalidFrameIndex {
+                expected: expected_index,
+                actual: frame.index,
+            });
+        }
         let duration = frame
             .duration_ms
             .unwrap_or(u32::from(DEFAULT_FRAME_DURATION_MS));
@@ -98,7 +112,8 @@ pub fn encode(document: &NormalizedDocument) -> Result<EncodedAseprite, WriterEr
         create_layer_tree(&mut file, layer, None, &mut bindings, &mut warnings)?;
     }
 
-    for (frame_index, _) in document.frames.iter().enumerate() {
+    for frame in &document.frames {
+        let frame_index = frame.index as usize;
         let mut visible_ids = Vec::new();
         for layer in &document.root_layers {
             layer.collect_visible_pixel_layer_ids(frame_index, true, &mut visible_ids);
@@ -426,6 +441,7 @@ mod tests {
                 children: Vec::new(),
                 frame_states: vec![NormalizedLayerFrameState {
                     frame_index: 0,
+                    record_present: false,
                     enabled: true,
                     explicit_enable: false,
                     offset: None,
@@ -458,6 +474,53 @@ mod tests {
         let error = encode(&pixel_document(8, 8, i32::from(i16::MAX) + 1, 0))
             .expect_err("out-of-range cel coordinate must fail");
         assert!(matches!(error, WriterError::FormatLimit { .. }));
+    }
+
+    #[test]
+    fn rejects_non_contiguous_normalized_frame_indices() {
+        let mut document = pixel_document(8, 8, 0, 0);
+        document.frames[0].index = 1;
+        let error = encode(&document).expect_err("frame indices must be contiguous");
+        assert!(matches!(error, WriterError::InvalidFrameIndex { .. }));
+    }
+
+    #[test]
+    fn does_not_reuse_cels_between_frames() {
+        let mut document = pixel_document(8, 8, 0, 0);
+        document.frames.push(NormalizedFrame {
+            index: 1,
+            source_id: Some(2),
+            duration_ms: Some(100),
+            dispose: None,
+        });
+        document.frames[0].source_id = Some(1);
+        document.root_layers[0]
+            .frame_states
+            .push(NormalizedLayerFrameState {
+                frame_index: 1,
+                record_present: true,
+                enabled: false,
+                explicit_enable: true,
+                offset: None,
+                reference_point: None,
+                opacity: None,
+            });
+
+        let mut second = document.root_layers[0].clone();
+        second.id = 2;
+        second.name = "second".to_string();
+        second.frame_states[0].enabled = false;
+        second.frame_states[1].enabled = true;
+        document.root_layers.push(second);
+
+        let encoded = encode(&document).expect("valid normalized document");
+        let file = AsepriteFile::from_reader(&encoded.bytes[..]).expect("valid Aseprite bytes");
+        let first = file.layer_ref(0).expect("first pixel layer");
+        let second = file.layer_ref(1).expect("second pixel layer");
+        assert!(file.cel(first, 0).is_some());
+        assert!(file.cel(first, 1).is_none());
+        assert!(file.cel(second, 0).is_none());
+        assert!(file.cel(second, 1).is_some());
     }
 
     #[test]

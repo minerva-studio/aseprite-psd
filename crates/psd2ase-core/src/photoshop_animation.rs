@@ -20,6 +20,8 @@ pub struct AnimationLayerInput {
     pub path: String,
     /// Whether this node is a Photoshop group.
     pub is_group: bool,
+    /// Whether this group only contains child groups and acts as an animation container.
+    pub is_container_group: bool,
     /// Base hidden state before frame overrides are applied.
     pub hidden: bool,
     /// Ancestor group IDs in root-to-parent order.
@@ -81,6 +83,8 @@ pub struct LayerAnimationState {
 pub struct LayerFrameState {
     /// Frame identifier.
     pub frame_id: u32,
+    /// Whether the source supplied an mlst record for this frame.
+    pub record_present: bool,
     /// Resolved visibility after enable inheritance.
     pub enabled: bool,
     /// Whether this record explicitly supplied enable.
@@ -690,6 +694,10 @@ fn resolve_layer_states(
     raw: &RawLayer,
     frames: &[PhotoshopFrame],
 ) -> Result<LayerAnimationState, AnimationParseError> {
+    let has_animation_records = raw
+        .shmd
+        .as_ref()
+        .is_some_and(|metadata| !metadata.frames.is_empty());
     let mut previous_enabled = !layer.hidden;
     let states = frames
         .iter()
@@ -700,12 +708,20 @@ fn resolve_layer_states(
                     .iter()
                     .find(|item| item.frame_id == frame.id)
             });
+            let record_present = record.is_some();
             let explicit_enable = record.and_then(|item| item.enable).is_some();
-            if let Some(enable) = record.and_then(|item| item.enable) {
-                previous_enabled = enable;
+            if layer.is_group && !layer.is_container_group && has_animation_records {
+                previous_enabled = record.and_then(|item| item.enable).unwrap_or(false);
+            } else if record_present {
+                if let Some(enable) = record.and_then(|item| item.enable) {
+                    previous_enabled = enable;
+                }
+            } else if has_animation_records {
+                previous_enabled = false;
             }
             LayerFrameState {
                 frame_id: frame.id,
+                record_present,
                 enabled: previous_enabled,
                 explicit_enable,
                 offset: record.and_then(|item| item.offset),
@@ -1049,6 +1065,7 @@ mod tests {
                 id: 7,
                 path: "0".to_string(),
                 is_group: false,
+                is_container_group: false,
                 hidden: false,
                 ancestor_ids: Vec::new(),
             },
@@ -1056,6 +1073,7 @@ mod tests {
                 id: 7,
                 path: "1".to_string(),
                 is_group: false,
+                is_container_group: false,
                 hidden: false,
                 ancestor_ids: Vec::new(),
             },
@@ -1072,6 +1090,7 @@ mod tests {
             id: 7,
             path: "0".to_string(),
             is_group: false,
+            is_container_group: false,
             hidden: false,
             ancestor_ids: Vec::new(),
         };
@@ -1114,6 +1133,165 @@ mod tests {
         let states = resolve_layer_states(&layer, &raw, &frames).expect("states should resolve");
         assert!(!states.frames[0].enabled);
         assert!(!states.frames[1].enabled);
+        assert!(states.frames[0].record_present);
+        assert!(states.frames[1].record_present);
+        assert!(!states.frames[1].explicit_enable);
+    }
+
+    #[test]
+    fn missing_animation_record_does_not_inherit_visibility() {
+        let layer = AnimationLayerInput {
+            id: 7,
+            path: "0".to_string(),
+            is_group: false,
+            is_container_group: false,
+            hidden: false,
+            ancestor_ids: Vec::new(),
+        };
+        let raw = RawLayer {
+            id: Some(7),
+            shmd: Some(LayerMetadata {
+                frames: vec![
+                    RawFrameState {
+                        frame_id: 1,
+                        enable: Some(true),
+                        offset: None,
+                        reference_point: None,
+                        opacity: None,
+                    },
+                    RawFrameState {
+                        frame_id: 3,
+                        enable: Some(true),
+                        offset: None,
+                        reference_point: None,
+                        opacity: None,
+                    },
+                ],
+                flags: None,
+            }),
+            flags: None,
+            is_bounding_divider: false,
+        };
+        let frames = vec![
+            PhotoshopFrame {
+                id: 1,
+                duration_ms: 100,
+                dispose: None,
+            },
+            PhotoshopFrame {
+                id: 2,
+                duration_ms: 100,
+                dispose: None,
+            },
+            PhotoshopFrame {
+                id: 3,
+                duration_ms: 100,
+                dispose: None,
+            },
+        ];
+        let states = resolve_layer_states(&layer, &raw, &frames).expect("states should resolve");
+        assert!(states.frames[0].enabled);
+        assert!(states.frames[0].record_present);
+        assert!(!states.frames[1].enabled);
+        assert!(!states.frames[1].record_present);
+        assert!(states.frames[2].enabled);
+        assert!(states.frames[2].record_present);
+    }
+
+    #[test]
+    fn first_missing_animation_record_starts_hidden() {
+        let layer = AnimationLayerInput {
+            id: 7,
+            path: "0".to_string(),
+            is_group: false,
+            is_container_group: false,
+            hidden: false,
+            ancestor_ids: Vec::new(),
+        };
+        let raw = RawLayer {
+            id: Some(7),
+            shmd: Some(LayerMetadata {
+                frames: vec![RawFrameState {
+                    frame_id: 2,
+                    enable: Some(true),
+                    offset: None,
+                    reference_point: None,
+                    opacity: None,
+                }],
+                flags: None,
+            }),
+            flags: None,
+            is_bounding_divider: false,
+        };
+        let frames = vec![
+            PhotoshopFrame {
+                id: 1,
+                duration_ms: 100,
+                dispose: None,
+            },
+            PhotoshopFrame {
+                id: 2,
+                duration_ms: 100,
+                dispose: None,
+            },
+        ];
+        let states = resolve_layer_states(&layer, &raw, &frames).expect("states should resolve");
+        assert!(!states.frames[0].enabled);
+        assert!(!states.frames[0].record_present);
+        assert!(states.frames[1].enabled);
+        assert!(states.frames[1].record_present);
+    }
+
+    #[test]
+    fn group_record_without_enable_is_not_selected() {
+        let layer = AnimationLayerInput {
+            id: 7,
+            path: "0".to_string(),
+            is_group: true,
+            is_container_group: false,
+            hidden: false,
+            ancestor_ids: Vec::new(),
+        };
+        let raw = RawLayer {
+            id: Some(7),
+            shmd: Some(LayerMetadata {
+                frames: vec![
+                    RawFrameState {
+                        frame_id: 1,
+                        enable: Some(true),
+                        offset: None,
+                        reference_point: None,
+                        opacity: None,
+                    },
+                    RawFrameState {
+                        frame_id: 2,
+                        enable: None,
+                        offset: None,
+                        reference_point: None,
+                        opacity: None,
+                    },
+                ],
+                flags: None,
+            }),
+            flags: None,
+            is_bounding_divider: false,
+        };
+        let frames = vec![
+            PhotoshopFrame {
+                id: 1,
+                duration_ms: 100,
+                dispose: None,
+            },
+            PhotoshopFrame {
+                id: 2,
+                duration_ms: 100,
+                dispose: None,
+            },
+        ];
+        let states = resolve_layer_states(&layer, &raw, &frames).expect("states should resolve");
+        assert!(states.frames[0].enabled);
+        assert!(!states.frames[1].enabled);
+        assert!(states.frames[1].record_present);
         assert!(!states.frames[1].explicit_enable);
     }
 
@@ -1135,6 +1313,7 @@ mod tests {
                 id: 1,
                 path: "0".to_string(),
                 is_group: true,
+                is_container_group: false,
                 hidden: true,
                 ancestor_ids: Vec::new(),
             },
@@ -1142,6 +1321,7 @@ mod tests {
                 id: 2,
                 path: "0/0".to_string(),
                 is_group: false,
+                is_container_group: false,
                 hidden: false,
                 ancestor_ids: vec![1],
             },
@@ -1157,6 +1337,7 @@ mod tests {
                 path: "0".to_string(),
                 frames: vec![LayerFrameState {
                     frame_id: 7,
+                    record_present: false,
                     enabled: false,
                     explicit_enable: false,
                     offset: None,
@@ -1169,6 +1350,7 @@ mod tests {
                 path: "0/0".to_string(),
                 frames: vec![LayerFrameState {
                     frame_id: 7,
+                    record_present: false,
                     enabled: true,
                     explicit_enable: false,
                     offset: None,

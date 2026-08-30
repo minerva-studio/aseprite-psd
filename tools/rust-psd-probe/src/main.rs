@@ -11,7 +11,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 const DEFAULT_INPUT: &str = r"path\to\fixture.psd";
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 
 /// Runs the Rust PSD probe and writes its normalized snapshot.
 fn main() -> ExitCode {
@@ -203,6 +203,7 @@ fn animation_snapshot(
                         frame_id: document.frames[frame.frame_index as usize]
                             .source_id
                             .expect("animated frame must have a source ID"),
+                        record_present: frame.record_present,
                         enabled: frame.enabled,
                         explicit_enable: frame.explicit_enable,
                         offset: frame.offset.clone(),
@@ -265,6 +266,7 @@ fn normalized_layer_frame_snapshot(
 ) -> NormalizedLayerFrameSnapshot {
     NormalizedLayerFrameSnapshot {
         frame_index: state.frame_index,
+        record_present: state.record_present,
         enabled: state.enabled,
         explicit_enable: state.explicit_enable,
         offset: state.offset.map(point_snapshot),
@@ -381,6 +383,7 @@ struct NormalizedLayerStateSnapshot {
 #[derive(Debug, Clone, Serialize)]
 struct NormalizedLayerFrameSnapshot {
     frame_index: u32,
+    record_present: bool,
     enabled: bool,
     explicit_enable: bool,
     offset: Option<PointSnapshot>,
@@ -416,6 +419,7 @@ struct LayerAnimationSnapshot {
 #[derive(Debug, Serialize)]
 struct LayerFrameSnapshot {
     frame_id: u32,
+    record_present: bool,
     enabled: bool,
     explicit_enable: bool,
     offset: Option<PointSnapshot>,

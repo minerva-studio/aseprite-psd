@@ -7,7 +7,7 @@ import { createReader } from "ag-psd/dist/psdReader.js";
 import { resourceHandlersMap } from "ag-psd/dist/imageResources.js";
 
 const DEFAULT_INPUT = "path/to/fixture.psd";
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 /**
  * Provides the raw RGBA image-data factory required by ag-psd in Node.js.
@@ -107,6 +107,7 @@ function buildNormalizedDocumentSnapshot(animation, rootLayers) {
         path: layer.path,
         frames: [{
           frame_index: 0,
+          record_present: false,
           enabled: !(layer.hidden ?? false),
           explicit_enable: false,
           offset: null,
@@ -131,6 +132,7 @@ function buildNormalizedDocumentSnapshot(animation, rootLayers) {
       path: layer.path,
       frames: layer.frames.map((frame, frameIndex) => ({
         frame_index: frameIndex,
+        record_present: frame.record_present,
         enabled: frame.enabled,
         explicit_enable: frame.explicit_enable,
         offset: frame.offset,
@@ -177,6 +179,8 @@ function buildAnimationSnapshot(bytes, rootLayers) {
   }
 
   const layerStates = layers.map((layer) => {
+    const hasAnimationRecords = Array.isArray(layer.animationFrames) &&
+      layer.animationFrames.length > 0;
     let previousEnabled = !layer.hidden;
     return {
       layer_id: layer.id ?? 0,
@@ -184,11 +188,16 @@ function buildAnimationSnapshot(bytes, rootLayers) {
       frames: frames.map((frame) => {
         const record = layer.animationFrames?.find((item) => item.frames?.includes(frame.id));
         const explicitEnable = record?.enable !== undefined;
-        if (explicitEnable) {
+        if (layer.isGroup && !layer.isContainerGroup && hasAnimationRecords) {
+          previousEnabled = record?.enable ?? false;
+        } else if (explicitEnable) {
           previousEnabled = record.enable;
+        } else if (record == null && hasAnimationRecords) {
+          previousEnabled = false;
         }
         return {
           frame_id: frame.id,
+          record_present: record != null,
           enabled: previousEnabled,
           explicit_enable: explicitEnable,
           offset: record?.offset ?? null,
@@ -249,6 +258,8 @@ function flattenLayer(layer, path, ancestorIds, output) {
     id: layer.id ?? 0,
     hidden: layer.hidden ?? false,
     isGroup: Array.isArray(layer.children),
+    isContainerGroup: Array.isArray(layer.children) &&
+      layer.children.length > 0 && layer.children.every((child) => Array.isArray(child.children)),
     ancestorIds,
     animationFrames: layer.animationFrames,
     animationFrameFlags: layer.animationFrameFlags,

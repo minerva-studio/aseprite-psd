@@ -203,6 +203,9 @@ fn collect_animation_inputs(
         id,
         path: path_string,
         is_group: layer.children.is_some(),
+        is_container_group: layer.children.as_ref().is_some_and(|children| {
+            !children.is_empty() && children.iter().all(|child| child.children.is_some())
+        }),
         hidden: layer.hidden.unwrap_or(false),
         ancestor_ids: ancestors.to_vec(),
     });
@@ -298,6 +301,7 @@ fn apply_animation_states(
             .enumerate()
             .map(|(frame_index, state)| NormalizedLayerFrameState {
                 frame_index: frame_index as u32,
+                record_present: state.record_present,
                 enabled: state.enabled,
                 explicit_enable: state.explicit_enable,
                 offset: state.offset,
@@ -315,6 +319,7 @@ fn apply_static_states(layers: &mut [NormalizedLayer]) {
     for layer in layers {
         layer.frame_states = vec![NormalizedLayerFrameState {
             frame_index: 0,
+            record_present: false,
             enabled: !layer.hidden.unwrap_or(false),
             explicit_enable: false,
             offset: None,
@@ -445,6 +450,7 @@ mod tests {
     fn state(frame_index: u32, enabled: bool) -> NormalizedLayerFrameState {
         NormalizedLayerFrameState {
             frame_index,
+            record_present: false,
             enabled,
             explicit_enable: false,
             offset: None,

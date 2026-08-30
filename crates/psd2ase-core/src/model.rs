@@ -127,6 +127,8 @@ pub enum NormalizedLoopMode {
 pub struct NormalizedLayerFrameState {
     /// Zero-based normalized frame index.
     pub frame_index: u32,
+    /// Whether the source supplied an mlst record for this frame.
+    pub record_present: bool,
     /// Resolved layer enabled state after source enable inheritance.
     pub enabled: bool,
     /// Whether the source supplied an explicit enable value for this frame.
