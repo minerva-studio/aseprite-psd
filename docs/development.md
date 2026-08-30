@@ -1,0 +1,37 @@
+# Development workflow
+
+## Phase gates
+
+1. **Toolchain:** workspace, dependency versions, license records, and CI build
+   matrix are healthy.
+2. **PSD compatibility probe:** an unmodified parser is compared with the
+   TypeScript oracle on a representative PSD before any writer work is enabled.
+3. **Normalized model:** layer ownership, frame state, and pixel lifetime are
+   explicit and format-independent.
+4. **Aseprite writer:** output is written transactionally, read back, and
+   structurally and visually validated before replacement.
+5. **CLI and release:** exit codes, reports, platform artifacts, and manual
+   Aseprite checks are complete.
+
+## Local commands
+
+```text
+cargo fmt --all -- --check
+cargo test --workspace
+cargo run -p psd2ase -- --version
+cargo run -p psd2ase -- --help
+```
+
+Use a real PSD supplied outside the repository for compatibility testing. Do
+not add customer artwork or private fixtures to Git.
+
+## Ownership rules
+
+- `psd2ase-core` owns normalized document semantics and conversion invariants.
+- `psd2ase` owns argument parsing, output policy, exit codes, and presentation.
+- The parser owns PSD decoding; the writer must not reinterpret PSD descriptors.
+- A conversion transaction owns temporary output until read-back validation and
+  atomic commit complete.
+
+The current `convert` entry point returns an explicit not-ready error. This is a
+deliberate safety boundary, not a successful conversion path.

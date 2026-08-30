@@ -1,0 +1,12 @@
+[package]
+name = "psd2ase"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+psd2ase-core = { path = "../psd2ase-core" }
+
+[lints]
+workspace = true

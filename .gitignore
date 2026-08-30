@@ -1,0 +1,6 @@
+/target/
+*.psd
+*.psb
+*.ase
+*.aseprite
+/.cargo/
