@@ -34,5 +34,6 @@ Their upstream repositories and license details are tracked in
 
 The first writer output is experimental: it preserves the normalized layer
 tree, RGBA8 cels, and animation frames, while reporting unsupported mappings
-and using `pixels.left/top` as a provisional cel-origin policy. It must be
+and using `pixels.left/top` plus frame-local PSD offsets as a provisional
+cel-origin policy. It must be
 reviewed in Aseprite before coordinate semantics are considered final.

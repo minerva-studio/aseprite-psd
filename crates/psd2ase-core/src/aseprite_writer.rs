@@ -31,6 +31,8 @@ pub enum WriterError {
     InvalidOpacity { field: String, value: String },
     /// A normalized pixel buffer is inconsistent with its dimensions.
     InvalidPixels { layer_id: u32, message: String },
+    /// A frame-local coordinate is not an integral value representable by the model.
+    InvalidCoordinate { field: String, value: String },
     /// The underlying Aseprite library rejected a write operation.
     Aseprite(String),
 }
@@ -47,6 +49,9 @@ impl std::fmt::Display for WriterError {
             }
             Self::InvalidPixels { layer_id, message } => {
                 write!(formatter, "invalid pixels for layer {layer_id}: {message}")
+            }
+            Self::InvalidCoordinate { field, value } => {
+                write!(formatter, "invalid coordinate for {field}: {value}")
             }
             Self::Aseprite(error) => write!(formatter, "Aseprite writer failed: {error}"),
         }
@@ -113,10 +118,7 @@ pub fn encode(document: &NormalizedDocument) -> Result<EncodedAseprite, WriterEr
                         layer_id: binding.layer.id,
                         message: "pixel layer has no owned data".to_string(),
                     })?;
-            let position = (
-                i16_value("cel x", pixels.left)?,
-                i16_value("cel y", pixels.top)?,
-            );
+            let position = cel_position(pixels, state)?;
             let ase_pixels = aseprite_pixels(binding.layer.id, pixels)?;
             let opacity = normalized_opacity(
                 state.opacity.or(binding.layer.opacity),
@@ -303,6 +305,38 @@ fn u16_value(field: &str, value: u32) -> Result<u16, WriterError> {
     })
 }
 
+/// Computes a cel origin from the base layer bounds and the frame-local PSD offset.
+pub(crate) fn cel_position(
+    pixels: &NormalizedPixels,
+    state: &NormalizedLayerFrameState,
+) -> Result<(i16, i16), WriterError> {
+    let x = add_frame_offset("cel x", pixels.left, state.offset.map(|point| point.x))?;
+    let y = add_frame_offset("cel y", pixels.top, state.offset.map(|point| point.y))?;
+    Ok((i16_value("cel x", x)?, i16_value("cel y", y)?))
+}
+
+/// Adds one integral frame-local offset to a base model coordinate.
+fn add_frame_offset(field: &str, base: i32, offset: Option<f64>) -> Result<i32, WriterError> {
+    let Some(offset) = offset else {
+        return Ok(base);
+    };
+    if !offset.is_finite()
+        || offset.fract() != 0.0
+        || offset < f64::from(i32::MIN)
+        || offset > f64::from(i32::MAX)
+    {
+        return Err(WriterError::InvalidCoordinate {
+            field: field.to_string(),
+            value: offset.to_string(),
+        });
+    }
+    base.checked_add(offset as i32)
+        .ok_or_else(|| WriterError::InvalidCoordinate {
+            field: field.to_string(),
+            value: format!("{base} + {offset}"),
+        })
+}
+
 /// Converts an i32 model coordinate to an Aseprite i16 coordinate.
 fn i16_value(field: &str, value: i32) -> Result<i16, WriterError> {
     i16::try_from(value).map_err(|_| WriterError::FormatLimit {
@@ -314,21 +348,14 @@ fn i16_value(field: &str, value: i32) -> Result<i16, WriterError> {
 
 /// Records animation features that the first Aseprite mapping cannot represent directly.
 fn collect_unmapped_animation_warnings(document: &NormalizedDocument, warnings: &mut Vec<String>) {
-    let mut offset_count = 0;
     let mut reference_point_count = 0;
     let mut group_opacity_count = 0;
     for layer in &document.root_layers {
         collect_layer_animation_warning_counts(
             layer,
-            &mut offset_count,
             &mut reference_point_count,
             &mut group_opacity_count,
         );
-    }
-    if offset_count > 0 {
-        warnings.push(format!(
-            "{offset_count} frame offsets were not applied; provisional cel origins use pixels.left/top"
-        ));
     }
     if reference_point_count > 0 {
         warnings.push(format!(
@@ -348,31 +375,24 @@ fn collect_unmapped_animation_warnings(document: &NormalizedDocument, warnings: 
 /// Counts unsupported frame-local properties recursively.
 fn collect_layer_animation_warning_counts(
     layer: &NormalizedLayer,
-    offset_count: &mut usize,
     reference_point_count: &mut usize,
     group_opacity_count: &mut usize,
 ) {
     for state in &layer.frame_states {
-        *offset_count += usize::from(state.offset.is_some());
         *reference_point_count += usize::from(state.reference_point.is_some());
         if layer.kind == NormalizedLayerKind::Group {
             *group_opacity_count += usize::from(state.opacity.is_some());
         }
     }
     for child in &layer.children {
-        collect_layer_animation_warning_counts(
-            child,
-            offset_count,
-            reference_point_count,
-            group_opacity_count,
-        );
+        collect_layer_animation_warning_counts(child, reference_point_count, group_opacity_count);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{NormalizedBounds, NormalizedFrame, NormalizedLayerFrameState};
+    use crate::{AnimationPoint, NormalizedBounds, NormalizedFrame, NormalizedLayerFrameState};
 
     fn pixel_document(width: u32, height: u32, left: i32, top: i32) -> NormalizedDocument {
         NormalizedDocument {
@@ -438,6 +458,28 @@ mod tests {
         let error = encode(&pixel_document(8, 8, i32::from(i16::MAX) + 1, 0))
             .expect_err("out-of-range cel coordinate must fail");
         assert!(matches!(error, WriterError::FormatLimit { .. }));
+    }
+
+    #[test]
+    fn applies_frame_offset_to_cel_origin() {
+        let mut document = pixel_document(8, 8, 14, 51);
+        document.root_layers[0].frame_states[0].offset = Some(AnimationPoint { x: 6.0, y: 2.0 });
+        let encoded = encode(&document).expect("valid normalized document");
+        let file = AsepriteFile::from_reader(&encoded.bytes[..]).expect("valid Aseprite bytes");
+        let layer = file.layer_ref(0).expect("pixel layer");
+        let cel = file.cel(layer, 0).expect("visible pixel cel");
+        match &cel.kind {
+            aseprite::CelKind::Raw { x, y, .. } => assert_eq!((*x, *y), (20, 53)),
+            _ => panic!("expected raw pixel cel"),
+        }
+    }
+
+    #[test]
+    fn rejects_non_integral_frame_offset() {
+        let mut document = pixel_document(8, 8, 0, 0);
+        document.root_layers[0].frame_states[0].offset = Some(AnimationPoint { x: 0.5, y: 0.0 });
+        let error = encode(&document).expect_err("non-integral frame offset must fail");
+        assert!(matches!(error, WriterError::InvalidCoordinate { .. }));
     }
 
     #[test]

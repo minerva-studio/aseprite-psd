@@ -584,7 +584,7 @@ pub fn convert(
         .map_err(|error| ConversionError::Writer(error.to_string()))?;
     encoded.warnings.insert(
         0,
-        "coordinate policy: provisional pixels.left/top cel origin".to_string(),
+        "coordinate policy: provisional pixels.left/top plus frame offset cel origin".to_string(),
     );
     validate_aseprite_output(&encoded.bytes, &document)?;
     commit_output(output, &encoded.bytes, options.overwrite)?;
@@ -735,6 +735,8 @@ fn validate_cel(
             source.id
         )));
     }
+    let expected_position = aseprite_writer::cel_position(pixels, expected_state)
+        .map_err(|error| ConversionError::OutputValidation(error.to_string()))?;
     let (output_pixels, x, y) = match &cel.kind {
         aseprite::CelKind::Raw { pixels, x, y }
         | aseprite::CelKind::Compressed { pixels, x, y, .. } => (pixels, *x, *y),
@@ -747,8 +749,7 @@ fn validate_cel(
     };
     if output_pixels.width != u16::try_from(pixels.width).unwrap_or(u16::MAX)
         || output_pixels.height != u16::try_from(pixels.height).unwrap_or(u16::MAX)
-        || x != i16::try_from(pixels.left).unwrap_or(i16::MAX)
-        || y != i16::try_from(pixels.top).unwrap_or(i16::MAX)
+        || (x, y) != expected_position
         || output_pixels.data != pixels.data
     {
         return Err(ConversionError::OutputValidation(format!(

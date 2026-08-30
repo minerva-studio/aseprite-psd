@@ -50,8 +50,8 @@ Stage 5 enables the minimal experimental writer. It preserves the normalized
 tree and RGBA8 cels, creates one Aseprite frame per normalized frame, and
 validates the serialized file by reading it back before committing output. The
 first output is `target/first-result/鹦鹉走路.aseprite`; its cel-origin policy is
-explicitly provisional (`pixels.left/top`) and all unsupported mappings are
-reported as warnings.
+explicitly provisional (`pixels.left/top` plus the frame-local PSD offset), and
+all unsupported mappings are reported as warnings.
 
 ## Ownership rules
 
@@ -65,6 +65,7 @@ reported as warnings.
 
 The current writer is deliberately experimental. `convert` writes to a
 same-directory temporary file, reads it back through `aseprite-io`, and only
-then commits it. The first coordinate policy uses `pixels.left/top` as cel
-origins and is reported as provisional; Photoshop coordinate equivalence is
-not claimed until visual review supplies evidence.
+then commits it. The first coordinate policy uses `pixels.left/top` plus
+frame-local PSD offsets as cel origins and is reported as provisional;
+Photoshop coordinate equivalence is not claimed until visual review supplies
+evidence.
