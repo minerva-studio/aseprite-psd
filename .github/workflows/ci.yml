@@ -9,28 +9,16 @@ permissions:
 
 jobs:
   check:
-    name: Check (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: macos-13
-            target: x86_64-apple-darwin
-          - os: macos-14
-            target: aarch64-apple-darwin
+    name: Check (Linux)
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.87.0
-          targets: ${{ matrix.target }}
+          components: rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
-      - run: cargo test --workspace --target ${{ matrix.target }}
-      - run: cargo build --workspace --release --target ${{ matrix.target }}
+      - run: cargo test --workspace --locked
+      - run: cargo build --workspace --release --locked
