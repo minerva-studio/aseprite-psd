@@ -1,0 +1,21 @@
+{
+  "name": "psd2ase-aseprite",
+  "displayName": "PSD to Aseprite",
+  "description": "Import Photoshop PSD documents through the psd2ase converter.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Minerva Studio"
+  },
+  "publisher": "minerva-studio",
+  "license": "MIT",
+  "categories": [
+    "Scripts"
+  ],
+  "contributes": {
+    "scripts": [
+      {
+        "path": "./psd2ase.lua"
+      }
+    ]
+  }
+}
