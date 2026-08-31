@@ -19,9 +19,12 @@ pub use layer_names::{
 };
 pub use logical_layers::{
     AssociationDecision, AssociationDecisionStatus, AssociationExclusionKind, AssociationPhase,
-    AssociationReport, LayerAssociationMode, LayerWritePlan, LayerZOrderMode, LogicalLayerTrack,
-    PlannedCel, PlannedNode, StableOrderMode, build_layer_write_plan,
-    build_layer_write_plan_with_order_modes, build_layer_write_plan_with_z_order,
+    AssociationReport, CandidateGroupReport, CandidateTrackRelation, CandidateTrackRelationReport,
+    LayerAssociationMode, LayerAssociationStrategy, LayerWritePlan, LayerZOrderMode,
+    LogicalLayerTrack, PlannedCel, PlannedNode, StableOrderMode, UncertainLayerMode,
+    build_layer_write_plan, build_layer_write_plan_with_layout_modes,
+    build_layer_write_plan_with_order_modes, build_layer_write_plan_with_strategy_and_layout_modes,
+    build_layer_write_plan_with_z_order,
 };
 pub use model::{
     DocumentInspection, NormalizedBounds, NormalizedDocument, NormalizedFrame, NormalizedLayer,
@@ -49,10 +52,14 @@ pub struct ConvertOptions {
     pub overwrite: bool,
     /// Selects the source-preserving or experimental logical-layer output plan.
     pub layer_association: LayerAssociationMode,
+    /// Selects compact baseline or conservative automatic identity matching.
+    pub association_strategy: LayerAssociationStrategy,
     /// Selects stable track order or experimental per-cel Z-Index adjustments.
     pub z_order: LayerZOrderMode,
     /// Selects the stable logical-track ordering strategy.
     pub stable_order: StableOrderMode,
+    /// Selects whether uncertain automatic tracks are grouped for review.
+    pub uncertain_layers: UncertainLayerMode,
 }
 
 /// Summary produced after a conversion has committed its output.
@@ -609,10 +616,12 @@ pub fn convert(
     let plan = match options.layer_association {
         LayerAssociationMode::Preserve => None,
         LayerAssociationMode::Auto => Some(
-            build_layer_write_plan_with_order_modes(
+            build_layer_write_plan_with_strategy_and_layout_modes(
                 &document,
+                options.association_strategy,
                 options.z_order,
                 options.stable_order,
+                options.uncertain_layers,
             )
             .map_err(|error| ConversionError::Writer(error.to_string()))?,
         ),

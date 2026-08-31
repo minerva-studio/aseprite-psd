@@ -16,19 +16,26 @@ included in the release binary.
 - `psd2ase inspect INPUT.psd` exercises the PSD parser without writing output.
 - `psd2ase convert INPUT.psd [-o OUTPUT] [--overwrite]` writes a validated
   experimental Aseprite output through the normalized model.
-- `psd2ase convert INPUT.psd --layer-association auto` enables experimental
-  cross-frame logical-layer association; the default preserves the PSD source
-  tree.
+- `psd2ase convert INPUT.psd --layer-association auto` enables cross-frame
+  logical-layer association. It defaults to `--association-strategy compact`,
+  which keeps the compact behavior of `651eb65` for easier manual cleanup.
+- Use `--association-strategy conservative` for the multilingual copy-family,
+  multi-track, and candidate-folder planner. This mode is more conservative and
+  explainable, but can produce more tracks.
 - Auto association uses stable track order by default. Use
   `--z-order auto` explicitly to enable experimental per-cel Z-Index changes;
   `--z-order auto` requires `--layer-association auto`.
 - Stable ordering defaults to cross-frame overlap consensus. Use
   `--stable-order anchor` for the legacy anchor-frame order, or
   `--stable-order strict` to fail when overlapping order evidence is unresolved.
-- Auto association uses a versioned multilingual copy-suffix catalog for names
+- Conservative association uses a versioned multilingual copy-suffix catalog for names
   such as `Copy`, `拷贝`, `副本`, `コピー`, and `복사`. Copy suffixes are weak
   evidence only; same-frame duplicates are never forced together, and ambiguous
   associations remain separate with their source-name evidence in the report.
+- Conservative association groups structurally mutually-exclusive uncertain tracks under
+  descriptive `候选 - ...` folders only when no members are co-visible and the
+  complete stable-order interval is safe. Use `--uncertain-layers flat` to keep
+  the tracks flat; candidate folders do not merge identities or cels.
 - No PSD or PSB fixtures are committed to this repository.
 
 ## Build

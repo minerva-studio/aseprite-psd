@@ -13,17 +13,23 @@ TypeScript `ag-psd` 只作为开发期差分 oracle，不会进入发布 binary�
 - `psd2ase inspect INPUT.psd` 只读取 PSD，不写输出文件。
 - `psd2ase convert INPUT.psd [-o OUTPUT] [--overwrite]` 已可生成经过回读验证的
   实验性 `.aseprite` 输出。
-- `psd2ase convert INPUT.psd --layer-association auto` 可实验性地把跨帧源图层
-  关联为长期逻辑轨道；默认仍保留 PSD 源图层树。
+- `psd2ase convert INPUT.psd --layer-association auto` 可把跨帧源图层关联为长期
+  逻辑轨道；默认使用 `--association-strategy compact`，输出接近
+  `651eb65` 的紧凑结果，方便后续人工整理。
+- 使用 `--association-strategy conservative` 可启用多语言复制家族、多轨匹配和
+  候选 Folder；这是更保守、可解释但可能产生更多轨道的实验策略。
 - auto 模式默认使用稳定轨道顺序，不写 cel `z_index`；只有显式使用
   `--z-order auto` 才启用实验性的逐 cel z-order，且该选项必须配合
   `--layer-association auto`。
 - Stable 默认使用跨帧实际重叠像素的顺序共识；可使用
   `--stable-order anchor` 回退到旧的锚点顺序，或使用
   `--stable-order strict` 在顺序证据无法确定时直接失败。
-- auto 关联使用版本化的多语言复制后缀词表，识别 `Copy`、`拷贝`、`副本`、
+- conservative 关联使用版本化的多语言复制后缀词表，识别 `Copy`、`拷贝`、`副本`、
   `コピー`、`복사` 等名称家族；复制后缀只作为弱证据，同帧重复名称不会强制合并，
   模糊关联会保留独立轨道并在报告中列出原名、基础名和候选证据。
+- conservative 只在成员结构性互斥、没有同帧共现且占据完整安全顺序区间时，才把可疑轨道
+  收进 `候选 - ...` Folder；使用 `--uncertain-layers flat` 可保持平铺。候选
+  Folder 不代表身份合并，原始名称和 cel 始终保持独立。
 - 仓库不提交 PSD 或 PSB 样本。
 - 阶段四已将递归图层树、图层属性、独立 RGBA8 像素所有权、帧顺序、时长、
   循环策略和逐层状态统一到 `psd2ase-core::normalize` 的中间模型；静态 PSD
