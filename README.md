@@ -1,60 +1,94 @@
 # psd2ase
 
-`psd2ase` is a standalone converter from Photoshop PSD documents to Aseprite
-documents. The project is currently in phase six: the normalized reader,
-minimal writer, and experimental cross-frame logical-layer association are
-being validated.
+[简体中文](README.zh-CN.md)
 
-The release implementation is intended to be native Rust so the final artifact
-is one executable with no user-side runtime dependency. TypeScript `ag-psd`
-remains a development-only oracle for differential validation; it will not be
-included in the release binary.
+`psd2ase` converts Photoshop PSD documents into Aseprite documents. It is
+available as a native command-line program and as an Aseprite extension that
+bundles the converter for a menu-driven import workflow.
 
-## Current status
+## Quick start: Aseprite extension
 
-- `psd2ase --version` and `psd2ase --help` are available.
-- `psd2ase inspect INPUT.psd` exercises the PSD parser without writing output.
-- `psd2ase convert INPUT.psd [-o OUTPUT] [--overwrite]` writes a validated
-  experimental Aseprite output through the normalized model.
-- `psd2ase convert INPUT.psd --layer-association auto` enables cross-frame
-  logical-layer association. It defaults to `--association-strategy compact`,
-  which keeps the compact behavior of `651eb65` for easier manual cleanup.
-- Use `--association-strategy conservative` for the multilingual copy-family,
-  multi-track, and candidate-folder planner. This mode is more conservative and
-  explainable, but can produce more tracks.
-- Auto association uses stable track order by default. Use
-  `--z-order auto` explicitly to enable experimental per-cel Z-Index changes;
-  `--z-order auto` requires `--layer-association auto`.
-- Stable ordering defaults to cross-frame overlap consensus. Use
-  `--stable-order anchor` for the legacy anchor-frame order, or
-  `--stable-order strict` to fail when overlapping order evidence is unresolved.
-- Conservative association uses a versioned multilingual copy-suffix catalog for names
-  such as `Copy`, `拷贝`, `副本`, `コピー`, and `복사`. Copy suffixes are weak
-  evidence only; same-frame duplicates are never forced together, and ambiguous
-  associations remain separate with their source-name evidence in the report.
-- Conservative association groups structurally mutually-exclusive uncertain tracks under
-  descriptive `候选 - ...` folders only when no members are co-visible and the
-  complete stable-order interval is safe. Use `--uncertain-layers flat` to keep
-  the tracks flat; candidate folders do not merge identities or cels.
-- No PSD or PSB fixtures are committed to this repository.
+1. Open the [latest GitHub Release](https://github.com/minerva-studio/psd-to-ase/releases/latest).
+2. Download the extension for your platform:
+   - `psd2ase-aseprite-windows-x64.aseprite-extension` for Windows x64.
+   - `psd2ase-aseprite-linux-x64.aseprite-extension` for Linux x64 with glibc.
+3. Open the downloaded package to install it in Aseprite, then restart Aseprite
+   if the command is not immediately visible.
+4. Select **File > Import > Import PSD to Aseprite...** and choose a PSD.
+5. Allow the extension to launch its bundled converter when Aseprite asks for
+   external-program permission for the first time.
 
-## Build
+The imported sprite opens as a modified document that is not associated with
+the temporary conversion file. Press Ctrl+S or use Save As to choose the final
+`.aseprite` path; Aseprite suggests the PSD's directory and base name.
+
+The extension defaults to `preserve`, which keeps source layers separate. Its
+dialog also exposes the experimental automatic association modes described
+below.
+
+## Command line
+
+Build the native CLI with Rust 1.88 or newer:
+
+```text
+cargo build --release --locked -p psd2ase
+```
+
+Inspect a PSD without writing output:
+
+```text
+psd2ase inspect INPUT.psd
+```
+
+Convert a PSD, refusing to replace an existing output unless `--overwrite` is
+specified:
+
+```text
+psd2ase convert INPUT.psd -o OUTPUT.aseprite
+psd2ase convert INPUT.psd -o OUTPUT.aseprite --overwrite
+```
+
+Run `psd2ase --help` for the complete command syntax.
+
+## Layer association
+
+- `--layer-association preserve` is the default and preserves source-layer
+  identity.
+- `--layer-association auto --association-strategy compact` enables the
+  compact cross-frame logical-layer planner.
+- `--association-strategy conservative` enables multilingual copy-family,
+  multi-track, and candidate-folder analysis. Ambiguous identities remain
+  separate.
+- Stable track order uses cross-frame overlap consensus by default. Use
+  `--stable-order anchor` for anchor-frame ordering or `strict` to reject
+  unresolved evidence.
+- `--z-order auto` enables experimental per-cel Z-Index changes and requires
+  automatic association. Conservative mode also accepts
+  `--uncertain-layers flat` to disable candidate folders.
+
+## Current boundaries
+
+- The extension packages have been validated with Aseprite 1.3.18.3 on Windows
+  x64 and Ubuntu/WSL2 Linux x64 with glibc.
+- macOS is not packaged or tested in this release.
+- This is an import workflow extension. It does not register `.psd` with
+  Aseprite's File > Open dialog.
+- Conversion preserves the normalized layer tree, RGBA8 cels, Photoshop frame
+  animation, and supported layer state. Logical-layer association and some
+  coordinate mappings remain experimental, so important output should be
+  reviewed in Aseprite.
+- PSD and PSB fixtures are intentionally not committed to this repository.
+
+## Development
 
 ```text
 cargo fmt --all -- --check
-cargo test --workspace
+cargo test --workspace --locked
 cargo run -p psd2ase -- --version
+cargo run -p psd2ase -- --help
 ```
 
-The parser and writer dependencies are the crates published as `ag-psd` and
-`aseprite-io`.
-Their upstream repositories and license details are tracked in
-`THIRD_PARTY_LICENSES.md`.
-
-## Scope gate
-
-The first writer output is experimental: it preserves the normalized layer
-tree, RGBA8 cels, and animation frames, while reporting unsupported mappings
-and using `pixels.left/top` plus frame-local PSD offsets as a provisional
-cel-origin policy. It must be
-reviewed in Aseprite before coordinate semantics are considered final.
+The parser and writer dependencies are the published `ag-psd` and
+`aseprite-io` crates. Upstream repositories and license details are recorded in
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md). The project is licensed
+under the [MIT License](LICENSE).

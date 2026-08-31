@@ -1,54 +1,81 @@
 # psd2ase
 
-`psd2ase` 计划提供一个独立的 Photoshop PSD → Aseprite 转换器。当前处于
-**阶段六**：建立 Rust workspace、PSD 兼容探针、Photoshop 帧动画兼容层、
-`NormalizedDocument` 中间模型、基础 writer 和实验性逻辑图层关联。
+[English](README.md)
 
-最终版本采用原生 Rust，目标是向用户提供不依赖额外运行时的单一可执行文件。
-TypeScript `ag-psd` 只作为开发期差分 oracle，不会进入发布 binary。
+`psd2ase` 用于将 Photoshop PSD 文档转换为 Aseprite 文档。项目同时提供原生
+命令行程序，以及内附 converter、可通过菜单完成导入的 Aseprite 扩展。
 
-## 当前状态
+## 快速开始：Aseprite 扩展
 
-- `psd2ase --version` 和 `psd2ase --help` 已可用。
-- `psd2ase inspect INPUT.psd` 只读取 PSD，不写输出文件。
-- `psd2ase convert INPUT.psd [-o OUTPUT] [--overwrite]` 已可生成经过回读验证的
-  实验性 `.aseprite` 输出。
-- `psd2ase convert INPUT.psd --layer-association auto` 可把跨帧源图层关联为长期
-  逻辑轨道；默认使用 `--association-strategy compact`，输出接近
-  `651eb65` 的紧凑结果，方便后续人工整理。
-- 使用 `--association-strategy conservative` 可启用多语言复制家族、多轨匹配和
-  候选 Folder；这是更保守、可解释但可能产生更多轨道的实验策略。
-- auto 模式默认使用稳定轨道顺序，不写 cel `z_index`；只有显式使用
-  `--z-order auto` 才启用实验性的逐 cel z-order，且该选项必须配合
-  `--layer-association auto`。
-- Stable 默认使用跨帧实际重叠像素的顺序共识；可使用
-  `--stable-order anchor` 回退到旧的锚点顺序，或使用
-  `--stable-order strict` 在顺序证据无法确定时直接失败。
-- conservative 关联使用版本化的多语言复制后缀词表，识别 `Copy`、`拷贝`、`副本`、
-  `コピー`、`복사` 等名称家族；复制后缀只作为弱证据，同帧重复名称不会强制合并，
-  模糊关联会保留独立轨道并在报告中列出原名、基础名和候选证据。
-- conservative 只在成员结构性互斥、没有同帧共现且占据完整安全顺序区间时，才把可疑轨道
-  收进 `候选 - ...` Folder；使用 `--uncertain-layers flat` 可保持平铺。候选
-  Folder 不代表身份合并，原始名称和 cel 始终保持独立。
-- 仓库不提交 PSD 或 PSB 样本。
-- 阶段四已将递归图层树、图层属性、独立 RGBA8 像素所有权、帧顺序、时长、
-  循环策略和逐层状态统一到 `psd2ase-core::normalize` 的中间模型；静态 PSD
-  表示为无时长的单帧；阶段五 writer 使用 100ms 序列化默认值，并把
-  `pixels.left/top` 作为 provisional cel 原点。
+1. 打开 [最新 GitHub Release](https://github.com/minerva-studio/psd-to-ase/releases/latest)。
+2. 下载对应平台的扩展：
+   - Windows x64 使用 `psd2ase-aseprite-windows-x64.aseprite-extension`。
+   - 使用 glibc 的 Linux x64 使用 `psd2ase-aseprite-linux-x64.aseprite-extension`。
+3. 打开下载的扩展包并安装到 Aseprite；如果菜单命令没有立即出现，请重启
+   Aseprite。
+4. 选择 **File > Import > Import PSD to Aseprite...**，然后选择 PSD。
+5. 首次使用时，允许 Aseprite 启动扩展内附的外部 converter。
 
-## 构建
+导入结果会作为已修改、但未与转换临时文件关联的文档打开。按 Ctrl+S 或使用
+Save As 选择最终 `.aseprite` 路径；Aseprite 会默认建议 PSD 所在目录和同名文件。
+
+扩展默认使用 `preserve`，保持源图层相互独立。导入对话框也提供下文所述的
+实验性自动关联模式。
+
+## 命令行
+
+使用 Rust 1.88 或更高版本构建原生 CLI：
+
+```text
+cargo build --release --locked -p psd2ase
+```
+
+只检查 PSD，不写输出文件：
+
+```text
+psd2ase inspect INPUT.psd
+```
+
+转换 PSD。除非指定 `--overwrite`，否则不会替换已有输出：
+
+```text
+psd2ase convert INPUT.psd -o OUTPUT.aseprite
+psd2ase convert INPUT.psd -o OUTPUT.aseprite --overwrite
+```
+
+使用 `psd2ase --help` 查看完整命令格式。
+
+## 图层关联
+
+- `--layer-association preserve` 是默认模式，保持源图层身份。
+- `--layer-association auto --association-strategy compact` 启用紧凑的跨帧
+  逻辑图层规划。
+- `--association-strategy conservative` 启用多语言复制家族、多轨和候选 Folder
+  分析；身份不明确的图层仍保持分离。
+- 稳定轨道顺序默认使用跨帧重叠共识。使用 `--stable-order anchor` 可改用锚点帧
+  顺序，使用 `strict` 可在证据无法确定时拒绝转换。
+- `--z-order auto` 启用实验性的逐 cel Z-Index，并且必须配合自动关联。
+  conservative 模式还可使用 `--uncertain-layers flat` 禁用候选 Folder。
+
+## 当前边界
+
+- 扩展包已在 Aseprite 1.3.18.3、Windows x64 和使用 glibc 的 Ubuntu/WSL2
+  Linux x64 环境验证。
+- 本版本没有打包或测试 macOS。
+- 这是导入工作流扩展，不会在 Aseprite 的 File > Open 中注册 `.psd` 后缀。
+- 转换会保留规范化图层树、RGBA8 cel、Photoshop 帧动画和受支持的图层状态。
+  逻辑图层关联及部分坐标映射仍属实验功能，重要输出应在 Aseprite 中人工检查。
+- 仓库有意不提交 PSD 或 PSB 测试素材。
+
+## 开发
 
 ```text
 cargo fmt --all -- --check
-cargo test --workspace
+cargo test --workspace --locked
 cargo run -p psd2ase -- --version
+cargo run -p psd2ase -- --help
 ```
 
-解析和写入依赖在 crates.io 上的实际包名分别是 `ag-psd` 与 `aseprite-io`；上游仓库
-和许可证记录见 `THIRD_PARTY_LICENSES.md`。
-
-## 阶段门槛
-
-启用转换写入前，必须使用提供的真实 PSD 做差分探针，比较画布元数据、完整图层树、
-图层属性、每个图层的像素哈希以及 Photoshop 动画元数据。没有通过这一步，
-不会声称已经完成转换器。
+解析和写入依赖为已发布的 `ag-psd` 与 `aseprite-io` crates。上游仓库和许可证
+详情记录在 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)。项目采用
+[MIT License](LICENSE)。
