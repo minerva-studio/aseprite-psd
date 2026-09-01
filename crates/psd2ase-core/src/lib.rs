@@ -531,6 +531,7 @@ pub fn convert(
             InformationLocation {
                 layer_id: None,
                 path: "document".to_string(),
+                frame_index: None,
             },
             format!(
                 "source color mode {:?} at {:?} bits per channel is normalized to RGBA8",
@@ -579,7 +580,7 @@ pub fn convert(
     let jitter =
         (options.jitter.mode != crate::JitterMode::Off).then(|| jitter_plan.report.clone());
     let association = plan.as_ref().map(|plan| plan.report.clone());
-    let mut encoded = match plan.as_ref() {
+    let encoded = match plan.as_ref() {
         None => aseprite_writer::encode_with_linked_cels_and_jitter(
             &document,
             options.linked_cels,
@@ -593,72 +594,18 @@ pub fn convert(
         ),
     }
     .map_err(|error| ConversionError::Writer(error.to_string()))?;
-    encoded.warnings.insert(
-        0,
+    let retained_warnings = vec![
         "coordinate policy: provisional pixels.left/top plus frame offset cel origin".to_string(),
-    );
-    let mut retained_warnings = Vec::new();
-    for warning in encoded.warnings {
-        let (code, disposition, visual, editable) = if warning.contains("blend mode") {
-            (
-                Some(InformationLossCode::UnknownBlendMode),
-                LossDisposition::Degraded,
-                true,
-                true,
-            )
-        } else if warning.contains("opacity") && warning.contains("quantized") {
-            (
-                Some(InformationLossCode::OpacityQuantization),
-                LossDisposition::Degraded,
-                true,
-                true,
-            )
-        } else if warning.contains("reference points") {
-            (
-                Some(InformationLossCode::ReferencePoint),
-                LossDisposition::Dropped,
-                false,
-                true,
-            )
-        } else if warning.contains("group frame opacity") {
-            (
-                Some(InformationLossCode::GroupFrameOpacity),
-                LossDisposition::Dropped,
-                true,
-                true,
-            )
-        } else if warning.contains("active frame") {
-            (
-                Some(InformationLossCode::ActiveFrame),
-                LossDisposition::Dropped,
-                false,
-                true,
-            )
-        } else if warning.contains("pixel layer") && warning.contains("children") {
-            (
-                Some(InformationLossCode::PixelLayerChildren),
-                LossDisposition::Dropped,
-                true,
-                true,
-            )
-        } else {
-            (None, LossDisposition::Unknown, false, false)
-        };
-        if let Some(code) = code {
-            information_loss.add(
-                code,
-                disposition,
-                InformationLocation {
-                    layer_id: None,
-                    path: String::new(),
-                },
-                warning,
-                visual,
-                editable,
-            );
-        } else {
-            retained_warnings.push(warning);
-        }
+    ];
+    for warning in encoded.warning_details {
+        information_loss.add(
+            warning.code,
+            warning.disposition,
+            warning.location,
+            warning.message,
+            warning.visual_impact,
+            warning.editability_impact,
+        );
     }
     match plan.as_ref() {
         None => {

@@ -340,6 +340,130 @@ fn reports_unknown_blend_mode_instead_of_silently_accepting_it() {
 }
 
 #[test]
+fn reports_nested_layer_and_frame_locations_for_loss_warnings() {
+    let mut document = pixel_document(8, 8, 0, 0);
+    document.frames.push(NormalizedFrame {
+        index: 1,
+        source_id: Some(2),
+        duration_ms: Some(100),
+        dispose: None,
+    });
+
+    let mut child = document.root_layers.remove(0);
+    child.id = 42;
+    child.name = "手臂".to_string();
+    child.opacity = Some(0.501);
+    child.frame_states.push(NormalizedLayerFrameState {
+        frame_index: 1,
+        record_present: true,
+        enabled: true,
+        explicit_enable: true,
+        offset: None,
+        reference_point: Some(AnimationPoint { x: 1.0, y: 2.0 }),
+        opacity: None,
+    });
+
+    let group = NormalizedLayer {
+        id: 7,
+        name: "角色".to_string(),
+        kind: NormalizedLayerKind::Group,
+        bounds: NormalizedBounds {
+            left: 0,
+            top: 0,
+            right: 1,
+            bottom: 1,
+        },
+        opacity: None,
+        blend_mode: Some("normal".to_string()),
+        hidden: Some(false),
+        pixels: None,
+        children: vec![child],
+        frame_states: vec![
+            NormalizedLayerFrameState {
+                frame_index: 0,
+                record_present: true,
+                enabled: true,
+                explicit_enable: true,
+                offset: None,
+                reference_point: None,
+                opacity: Some(0.501),
+            },
+            NormalizedLayerFrameState {
+                frame_index: 1,
+                record_present: true,
+                enabled: true,
+                explicit_enable: true,
+                offset: None,
+                reference_point: None,
+                opacity: Some(0.501),
+            },
+        ],
+    };
+    document.root_layers = vec![group];
+    document.active_frame_index = Some(1);
+
+    let encoded = encode(&document).expect("nested source document should encode");
+    let reference = encoded
+        .warning_details
+        .iter()
+        .find(|warning| warning.code == InformationLossCode::ReferencePoint)
+        .expect("reference point warning");
+    assert_eq!(reference.location.path, "角色/手臂");
+    assert_eq!(reference.location.layer_id, Some(42));
+    assert_eq!(reference.location.frame_index, Some(1));
+
+    let group_opacity = encoded
+        .warning_details
+        .iter()
+        .filter(|warning| warning.code == InformationLossCode::GroupFrameOpacity)
+        .collect::<Vec<_>>();
+    assert_eq!(group_opacity.len(), 2);
+    assert!(group_opacity.iter().any(|warning| {
+        warning.location.path == "角色"
+            && warning.location.layer_id == Some(7)
+            && warning.location.frame_index == Some(0)
+    }));
+    assert!(group_opacity.iter().any(|warning| {
+        warning.location.path == "角色"
+            && warning.location.layer_id == Some(7)
+            && warning.location.frame_index == Some(1)
+    }));
+    let mut aggregated = crate::InformationLossReport::default();
+    for warning in &group_opacity {
+        aggregated.add(
+            warning.code,
+            warning.disposition,
+            warning.location.clone(),
+            warning.message.clone(),
+            warning.visual_impact,
+            warning.editability_impact,
+        );
+    }
+    assert_eq!(aggregated.entries[0].count, 2);
+    assert_eq!(aggregated.entries[0].locations.len(), 2);
+
+    let opacity = encoded
+        .warning_details
+        .iter()
+        .filter(|warning| warning.code == InformationLossCode::OpacityQuantization)
+        .collect::<Vec<_>>();
+    assert!(opacity.iter().any(|warning| {
+        warning.location.path == "角色/手臂"
+            && warning.location.layer_id == Some(42)
+            && warning.location.frame_index == Some(1)
+    }));
+
+    let active_frame = encoded
+        .warning_details
+        .iter()
+        .find(|warning| warning.code == InformationLossCode::ActiveFrame)
+        .expect("active frame warning");
+    assert_eq!(active_frame.location.path, "");
+    assert_eq!(active_frame.location.layer_id, None);
+    assert_eq!(active_frame.location.frame_index, None);
+}
+
+#[test]
 fn converts_normalized_opacity_to_aseprite_scale() {
     assert_eq!(opacity_to_u8(None, "layer"), Ok(255));
     assert_eq!(opacity_to_u8(Some(0.0), "layer"), Ok(0));

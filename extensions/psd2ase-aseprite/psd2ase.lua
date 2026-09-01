@@ -295,7 +295,7 @@ local function show_information_loss(report_filename, operation)
   if raw == "" then return end
   local ok, report, losses = pcall(function()
     local decoded = json.decode(raw)
-    if decoded.schema_version ~= 1 then
+    if decoded.schema_version ~= 1 and decoded.schema_version ~= 2 then
       return nil, nil
     end
     local decoded_losses = decoded.losses or {}
@@ -316,7 +316,35 @@ local function show_information_loss(report_filename, operation)
   local lines = {"Some PSD information could not be preserved:"}
   for index = 1, math.min(loss_count, 8) do
     local loss = losses[index]
-    table.insert(lines, string.format("%s: %s (%d)", loss.code or "unknown", loss.disposition or "unknown", loss.count or 0))
+    local occurrence_count = loss.count or 0
+    local locations = loss.locations or {}
+    table.insert(lines, string.format(
+      "%s: %s (%d)",
+      loss.code or "unknown",
+      loss.disposition or "unknown",
+      occurrence_count))
+    for _, location in ipairs(locations) do
+      local path = location.path or ""
+      if path == "" then
+        path = "document"
+      end
+      local qualifiers = {}
+      if location.frame_index ~= nil then
+        table.insert(qualifiers, string.format("Frame %d", location.frame_index + 1))
+      end
+      if location.layer_id ~= nil then
+        table.insert(qualifiers, string.format("Layer ID: %d", location.layer_id))
+      end
+      if #qualifiers > 0 then
+        path = path .. " (" .. table.concat(qualifiers, ", ") .. ")"
+      end
+      table.insert(lines, "  " .. path)
+    end
+    if occurrence_count > #locations then
+      table.insert(lines, string.format(
+        "  ... and %d more occurrences not listed",
+        occurrence_count - #locations))
+    end
   end
   if loss_count > 8 then
     table.insert(lines, string.format("... and %d more entries", loss_count - 8))

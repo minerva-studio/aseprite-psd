@@ -6,9 +6,9 @@ use aseprite::{
 };
 
 use crate::{
-    LayerWritePlan, LogicalLayerTrack, NormalizedDocument, NormalizedLayer,
-    NormalizedLayerFrameState, NormalizedLayerKind, NormalizedLoopMode, NormalizedPixels,
-    PlannedNode,
+    InformationLocation, InformationLossCode, LayerWritePlan, LogicalLayerTrack, LossDisposition,
+    NormalizedDocument, NormalizedLayer, NormalizedLayerFrameState, NormalizedLayerKind,
+    NormalizedLoopMode, NormalizedPixels, PlannedNode,
     jitter::{JitterPlan, resolved_pixels},
 };
 
@@ -22,8 +22,65 @@ pub struct EncodedAseprite {
     pub bytes: Vec<u8>,
     /// Non-fatal compatibility warnings collected during mapping.
     pub warnings: Vec<String>,
+    /// Structured warning metadata used to build the information-loss report.
+    pub(crate) warning_details: Vec<WriterWarning>,
     /// Counts of ordinary and linked cels emitted by the serializer.
     pub cel_reuse: CelReuseReport,
+}
+
+/// A non-fatal writer warning with its source loss classification and location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WriterWarning {
+    /// Human-readable warning detail retained in the conversion report.
+    pub(crate) message: String,
+    /// Stable report code for this warning.
+    pub(crate) code: InformationLossCode,
+    /// Report disposition for this warning.
+    pub(crate) disposition: LossDisposition,
+    /// Source location affected by this warning.
+    pub(crate) location: InformationLocation,
+    /// Whether the warning can change rendered pixels.
+    pub(crate) visual_impact: bool,
+    /// Whether the warning can change editability.
+    pub(crate) editability_impact: bool,
+}
+
+/// Collects writer warnings while keeping their presentation and source metadata together.
+#[derive(Debug, Default)]
+struct WarningCollector {
+    entries: Vec<WriterWarning>,
+}
+
+impl WarningCollector {
+    /// Records one structured writer warning.
+    fn push(
+        &mut self,
+        code: InformationLossCode,
+        disposition: LossDisposition,
+        location: InformationLocation,
+        message: impl Into<String>,
+        visual_impact: bool,
+        editability_impact: bool,
+    ) {
+        self.entries.push(WriterWarning {
+            message: message.into(),
+            code,
+            disposition,
+            location,
+            visual_impact,
+            editability_impact,
+        });
+    }
+
+    /// Splits structured warnings into legacy text and source-aware details.
+    fn into_parts(self) -> (Vec<String>, Vec<WriterWarning>) {
+        let messages = self
+            .entries
+            .iter()
+            .map(|warning| warning.message.clone())
+            .collect();
+        (messages, self.entries)
+    }
 }
 
 /// Summarizes identical-pixel cel reuse performed by the serializer.
@@ -84,11 +141,11 @@ impl std::error::Error for WriterError {}
 /// Initializes the shared canvas, timeline, loop tag, and warning collection.
 fn initialize_file(
     document: &NormalizedDocument,
-) -> Result<(AsepriteFile, Vec<String>), WriterError> {
+) -> Result<(AsepriteFile, WarningCollector), WriterError> {
     let width = u16_value("canvas width", document.canvas.0)?;
     let height = u16_value("canvas height", document.canvas.1)?;
     let mut file = AsepriteFile::new(width, height, ColorMode::Rgba);
-    let mut warnings = Vec::new();
+    let mut warnings = WarningCollector::default();
     collect_unmapped_animation_warnings(document, &mut warnings);
 
     if document.frames.is_empty() {
@@ -148,7 +205,8 @@ pub fn encode_with_linked_cels_and_jitter(
 
     let mut bindings = Vec::new();
     for layer in &document.root_layers {
-        create_layer_tree(&mut file, layer, None, &mut bindings, &mut warnings)?;
+        let path = layer_path(None, layer);
+        create_layer_tree(&mut file, layer, None, path, &mut bindings, &mut warnings)?;
     }
 
     let mut reuse = (0..bindings.len())
@@ -182,6 +240,7 @@ pub fn encode_with_linked_cels_and_jitter(
             let opacity = normalized_opacity(
                 state.opacity.or(binding.layer.opacity),
                 format!("layer {} frame {frame_index}", binding.layer.id),
+                with_frame(&binding.location, frame_index as u32),
                 &mut warnings,
             )?;
             emit_cel(
@@ -203,9 +262,11 @@ pub fn encode_with_linked_cels_and_jitter(
     let mut bytes = Vec::new();
     file.write_to(&mut bytes)
         .map_err(|error| WriterError::Aseprite(error.to_string()))?;
+    let (warnings, warning_details) = warnings.into_parts();
     Ok(EncodedAseprite {
         bytes,
         warnings,
+        warning_details,
         cel_reuse: reuse.into_iter().map(|tracker| tracker.report).fold(
             CelReuseReport::default(),
             |mut total, report| {
@@ -290,6 +351,7 @@ pub fn encode_with_plan_and_linked_cels_and_jitter(
             let opacity = normalized_opacity(
                 state.opacity.or(source.opacity),
                 format!("layer {} frame {frame_index}", source.id),
+                with_frame(&binding.location, frame_index as u32),
                 &mut warnings,
             )?;
             emit_cel(
@@ -311,9 +373,11 @@ pub fn encode_with_plan_and_linked_cels_and_jitter(
     let mut bytes = Vec::new();
     file.write_to(&mut bytes)
         .map_err(|error| WriterError::Aseprite(error.to_string()))?;
+    let (warnings, warning_details) = warnings.into_parts();
     Ok(EncodedAseprite {
         bytes,
         warnings,
+        warning_details,
         cel_reuse: reuse.into_iter().map(|tracker| tracker.report).fold(
             CelReuseReport::default(),
             |mut total, report| {
@@ -466,10 +530,12 @@ fn create_layer_tree<'a>(
     file: &mut AsepriteFile,
     layer: &'a NormalizedLayer,
     parent: Option<GroupRef>,
+    path: String,
     bindings: &mut Vec<PixelBinding<'a>>,
-    warnings: &mut Vec<String>,
+    warnings: &mut WarningCollector,
 ) -> Result<(), WriterError> {
-    let options = layer_options(layer, warnings)?;
+    let location = layer_location(&path, layer.id);
+    let options = layer_options(layer, &location, warnings)?;
     match layer.kind {
         NormalizedLayerKind::Group => {
             let group = match parent {
@@ -477,7 +543,14 @@ fn create_layer_tree<'a>(
                 None => file.add_group_with(&layer.name, options),
             };
             for child in &layer.children {
-                create_layer_tree(file, child, Some(group), bindings, warnings)?;
+                create_layer_tree(
+                    file,
+                    child,
+                    Some(group),
+                    layer_path(Some(&path), child),
+                    bindings,
+                    warnings,
+                )?;
             }
         }
         NormalizedLayerKind::Pixel => {
@@ -485,12 +558,23 @@ fn create_layer_tree<'a>(
                 Some(parent) => file.add_layer_in_with(&layer.name, parent, options),
                 None => file.add_layer_with(&layer.name, options),
             };
-            bindings.push(PixelBinding { layer, handle });
+            bindings.push(PixelBinding {
+                layer,
+                handle,
+                location: location.clone(),
+            });
             if !layer.children.is_empty() {
-                warnings.push(format!(
-                    "pixel layer {} has children; children were not serialized",
-                    layer.id
-                ));
+                warnings.push(
+                    InformationLossCode::PixelLayerChildren,
+                    LossDisposition::Dropped,
+                    location,
+                    format!(
+                        "pixel layer {} has children; children were not serialized",
+                        layer.id
+                    ),
+                    true,
+                    true,
+                );
             }
         }
     }
@@ -501,12 +585,14 @@ fn create_layer_tree<'a>(
 struct PixelBinding<'a> {
     layer: &'a NormalizedLayer,
     handle: LayerRef,
+    location: InformationLocation,
 }
 
 /// Associates one planned logical track with its output Aseprite layer.
 struct PlannedBinding<'a> {
     track: &'a LogicalLayerTrack,
     handle: LayerRef,
+    location: InformationLocation,
 }
 
 /// Creates the output tree described by a logical-layer plan.
@@ -517,7 +603,7 @@ fn create_planned_tree<'a>(
     document: &NormalizedDocument,
     plan: &'a LayerWritePlan,
     bindings: &mut Vec<PlannedBinding<'a>>,
-    warnings: &mut Vec<String>,
+    warnings: &mut WarningCollector,
 ) -> Result<(), WriterError> {
     match node {
         PlannedNode::Group {
@@ -526,8 +612,10 @@ fn create_planned_tree<'a>(
             children,
         } => {
             let source = source_layer_id.and_then(|id| document.find_layer(id));
+            let source_location = source.map(|layer| find_layer_location(document, layer.id));
             let mut options = source
-                .map(|layer| layer_options(layer, warnings))
+                .zip(source_location.as_ref())
+                .map(|(layer, location)| layer_options(layer, location, warnings))
                 .transpose()?
                 .unwrap_or_default();
             options.visible = true;
@@ -549,13 +637,18 @@ fn create_planned_tree<'a>(
                     layer_id: track.representative_source_layer_id,
                     message: "logical track representative layer was not found".to_string(),
                 })?;
-            let mut options = layer_options(source, warnings)?;
+            let location = find_layer_location(document, source.id);
+            let mut options = layer_options(source, &location, warnings)?;
             options.visible = track.cels.iter().any(Option::is_some);
             let handle = match parent {
                 Some(parent) => file.add_layer_in_with(&track.name, parent, options),
                 None => file.add_layer_with(&track.name, options),
             };
-            bindings.push(PlannedBinding { track, handle });
+            bindings.push(PlannedBinding {
+                track,
+                handle,
+                location,
+            });
         }
     }
     Ok(())
@@ -564,18 +657,28 @@ fn create_planned_tree<'a>(
 /// Maps base layer properties to Aseprite layer options.
 fn layer_options(
     layer: &NormalizedLayer,
-    warnings: &mut Vec<String>,
+    location: &InformationLocation,
+    warnings: &mut WarningCollector,
 ) -> Result<LayerOptions, WriterError> {
     Ok(LayerOptions {
-        opacity: normalized_opacity(layer.opacity, format!("layer {}", layer.id), warnings)?,
-        blend_mode: blend_mode(layer.blend_mode.as_deref(), layer.id, warnings),
+        opacity: normalized_opacity(
+            layer.opacity,
+            format!("layer {}", layer.id),
+            location.clone(),
+            warnings,
+        )?,
+        blend_mode: blend_mode(layer.blend_mode.as_deref(), location.clone(), warnings),
         visible: layer.frame_states.iter().any(|state| state.enabled),
         ..LayerOptions::default()
     })
 }
 
 /// Maps an Aseprite-compatible blend-mode name, warning when it cannot be preserved.
-fn blend_mode(value: Option<&str>, layer_id: u32, warnings: &mut Vec<String>) -> BlendMode {
+fn blend_mode(
+    value: Option<&str>,
+    location: InformationLocation,
+    warnings: &mut WarningCollector,
+) -> BlendMode {
     match value.unwrap_or("normal") {
         "normal" => BlendMode::Normal,
         "multiply" => BlendMode::Multiply,
@@ -596,9 +699,15 @@ fn blend_mode(value: Option<&str>, layer_id: u32, warnings: &mut Vec<String>) ->
         "subtract" | "subtraction" => BlendMode::Subtract,
         "divide" => BlendMode::Divide,
         other => {
-            warnings.push(format!(
-                "layer {layer_id} blend mode {other:?} mapped to normal"
-            ));
+            let layer_id = location.layer_id.unwrap_or_default();
+            warnings.push(
+                InformationLossCode::UnknownBlendMode,
+                LossDisposition::Degraded,
+                location,
+                format!("layer {layer_id} blend mode {other:?} mapped to normal"),
+                true,
+                true,
+            );
             BlendMode::Normal
         }
     }
@@ -608,14 +717,20 @@ fn blend_mode(value: Option<&str>, layer_id: u32, warnings: &mut Vec<String>) ->
 fn normalized_opacity(
     value: Option<f64>,
     field: String,
-    warnings: &mut Vec<String>,
+    location: InformationLocation,
+    warnings: &mut WarningCollector,
 ) -> Result<u8, WriterError> {
     let value = value.unwrap_or(1.0);
     let opacity = opacity_to_u8(Some(value), &field)?;
     if (value * 255.0) != f64::from(opacity) {
-        warnings.push(format!(
-            "{field} opacity {value} quantized to {opacity}/255 for Aseprite"
-        ));
+        warnings.push(
+            InformationLossCode::OpacityQuantization,
+            LossDisposition::Degraded,
+            location,
+            format!("{field} opacity {value} quantized to {opacity}/255 for Aseprite"),
+            true,
+            true,
+        );
     }
     Ok(opacity)
 }
@@ -709,46 +824,126 @@ fn i16_value(field: &str, value: i32) -> Result<i16, WriterError> {
 }
 
 /// Records animation features that the first Aseprite mapping cannot represent directly.
-fn collect_unmapped_animation_warnings(document: &NormalizedDocument, warnings: &mut Vec<String>) {
-    let mut reference_point_count = 0;
-    let mut group_opacity_count = 0;
+fn collect_unmapped_animation_warnings(
+    document: &NormalizedDocument,
+    warnings: &mut WarningCollector,
+) {
     for layer in &document.root_layers {
-        collect_layer_animation_warning_counts(
-            layer,
-            &mut reference_point_count,
-            &mut group_opacity_count,
-        );
-    }
-    if reference_point_count > 0 {
-        warnings.push(format!(
-            "{reference_point_count} reference points were not serialized"
-        ));
-    }
-    if group_opacity_count > 0 {
-        warnings.push(format!(
-            "{group_opacity_count} group frame opacity overrides were not serialized"
-        ));
+        collect_layer_animation_warnings(layer, None, warnings);
     }
     if document.active_frame_index.is_some() {
-        warnings.push("Photoshop active frame is not serialized as Aseprite UI state".to_string());
+        warnings.push(
+            InformationLossCode::ActiveFrame,
+            LossDisposition::Dropped,
+            document_location(),
+            "Photoshop active frame is not serialized as Aseprite UI state",
+            false,
+            true,
+        );
     }
 }
 
 /// Counts unsupported frame-local properties recursively.
-fn collect_layer_animation_warning_counts(
+fn collect_layer_animation_warnings(
     layer: &NormalizedLayer,
-    reference_point_count: &mut usize,
-    group_opacity_count: &mut usize,
+    parent_path: Option<&str>,
+    warnings: &mut WarningCollector,
 ) {
+    let path = layer_path(parent_path, layer);
+    let location = layer_location(&path, layer.id);
     for state in &layer.frame_states {
-        *reference_point_count += usize::from(state.reference_point.is_some());
-        if layer.kind == NormalizedLayerKind::Group {
-            *group_opacity_count += usize::from(state.opacity.is_some());
+        if state.reference_point.is_some() {
+            warnings.push(
+                InformationLossCode::ReferencePoint,
+                LossDisposition::Dropped,
+                with_frame(&location, state.frame_index),
+                format!(
+                    "layer {} frame {} reference point was not serialized",
+                    layer.id, state.frame_index
+                ),
+                false,
+                true,
+            );
+        }
+        if layer.kind == NormalizedLayerKind::Group && state.opacity.is_some() {
+            warnings.push(
+                InformationLossCode::GroupFrameOpacity,
+                LossDisposition::Dropped,
+                with_frame(&location, state.frame_index),
+                format!(
+                    "layer {} frame {} group frame opacity override was not serialized",
+                    layer.id, state.frame_index
+                ),
+                true,
+                true,
+            );
         }
     }
     for child in &layer.children {
-        collect_layer_animation_warning_counts(child, reference_point_count, group_opacity_count);
+        collect_layer_animation_warnings(child, Some(&path), warnings);
     }
+}
+
+/// Builds a human-readable source path from normalized layer names.
+fn layer_path(parent: Option<&str>, layer: &NormalizedLayer) -> String {
+    let segment = if layer.name.is_empty() {
+        "<unnamed>"
+    } else {
+        layer.name.as_str()
+    };
+    match parent {
+        Some(parent) if !parent.is_empty() => format!("{parent}/{segment}"),
+        _ => segment.to_string(),
+    }
+}
+
+/// Builds a location for a normalized source layer.
+fn layer_location(path: &str, layer_id: u32) -> InformationLocation {
+    InformationLocation {
+        layer_id: Some(layer_id),
+        path: path.to_string(),
+        frame_index: None,
+    }
+}
+
+/// Builds the document-level location used for unscoped metadata losses.
+fn document_location() -> InformationLocation {
+    InformationLocation {
+        layer_id: None,
+        path: String::new(),
+        frame_index: None,
+    }
+}
+
+/// Adds a normalized frame index to an existing source location.
+fn with_frame(location: &InformationLocation, frame_index: u32) -> InformationLocation {
+    InformationLocation {
+        frame_index: Some(frame_index),
+        ..location.clone()
+    }
+}
+
+/// Finds a normalized source layer location by its stable layer identifier.
+fn find_layer_location(document: &NormalizedDocument, layer_id: u32) -> InformationLocation {
+    fn find(
+        layers: &[NormalizedLayer],
+        parent_path: Option<&str>,
+        layer_id: u32,
+    ) -> Option<InformationLocation> {
+        for layer in layers {
+            let path = layer_path(parent_path, layer);
+            if layer.id == layer_id {
+                return Some(layer_location(&path, layer.id));
+            }
+            if let Some(found) = find(&layer.children, Some(&path), layer_id) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    find(&document.root_layers, None, layer_id)
+        .unwrap_or_else(|| layer_location(&format!("<unknown:{layer_id}>"), layer_id))
 }
 
 #[cfg(test)]

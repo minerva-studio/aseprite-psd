@@ -98,6 +98,7 @@ fn record_document_losses(file: &AsepriteFile, report: &mut InformationLossRepor
             InformationLocation {
                 layer_id: None,
                 path: "document".to_string(),
+                frame_index: None,
             },
             "Aseprite color data is converted to RGBA8 for Photoshop",
             false,
@@ -111,6 +112,7 @@ fn record_document_losses(file: &AsepriteFile, report: &mut InformationLossRepor
             InformationLocation {
                 layer_id: None,
                 path: "document/slices".to_string(),
+                frame_index: None,
             },
             "Aseprite slices are not represented by the PSD export",
             false,
@@ -124,6 +126,7 @@ fn record_document_losses(file: &AsepriteFile, report: &mut InformationLossRepor
             InformationLocation {
                 layer_id: None,
                 path: "document/color-profile".to_string(),
+                frame_index: None,
             },
             "Aseprite color-profile metadata is not embedded in the PSD export",
             false,
@@ -190,6 +193,7 @@ fn playback_sequence(
         InformationLocation {
             layer_id: None,
             path: "document/tags".to_string(),
+            frame_index: None,
         },
         "Aseprite tag ranges are expanded into one deterministic Photoshop frame sequence; tag names and boundaries are not editable",
         false,
@@ -321,7 +325,7 @@ fn build_cel_layers(
         .ok_or_else(|| ExportError::AsepriteRead("normal layer has no layer handle".to_string()))?;
     let mut variants: Vec<CelSample> = Vec::new();
     let mut occurrences = Vec::with_capacity(sequence.len());
-    for source_frame in sequence {
+    for (frame_index, source_frame) in sequence.iter().enumerate() {
         let sample = cel_sample(file, layer_ref, *source_frame)?;
         let Some(sample) = sample else {
             occurrences.push(None);
@@ -334,6 +338,7 @@ fn build_cel_layers(
                 InformationLocation {
                     layer_id: Some((layer_index + 1) as u32),
                     path: layer.name.clone(),
+                    frame_index: Some(frame_index as u32),
                 },
                 "Aseprite per-cel z-index is reduced to the static Photoshop layer order",
                 true,
@@ -361,6 +366,7 @@ fn build_cel_layers(
             InformationLocation {
                 layer_id: Some((layer_index + 1) as u32),
                 path: layer.name.clone(),
+                frame_index: None,
             },
             "An empty Aseprite pixel layer is represented by a permanently hidden transparent PSD pixel",
             false,
@@ -669,6 +675,7 @@ fn record_tilemap_losses(file: &AsepriteFile, report: &mut InformationLossReport
                 InformationLocation {
                     layer_id: Some((index + 1) as u32),
                     path: layer.name.clone(),
+                    frame_index: None,
                 },
                 "Aseprite tilemap editability is rasterized using the independently flattened composite snapshot",
                 false,

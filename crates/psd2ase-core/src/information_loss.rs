@@ -92,6 +92,8 @@ impl LossDisposition {
 pub struct InformationLocation {
     pub layer_id: Option<u32>,
     pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_index: Option<u32>,
 }
 
 /// One aggregated compatibility loss.
@@ -134,7 +136,7 @@ pub fn report_json(
     report: &InformationLossReport,
 ) -> Result<Vec<u8>, serde_json::Error> {
     serde_json::to_vec_pretty(&JsonReport {
-        schema_version: 1,
+        schema_version: 2,
         tool_version: crate::VERSION,
         input: input.display().to_string(),
         output: output.display().to_string(),
@@ -215,6 +217,7 @@ mod tests {
                 InformationLocation {
                     layer_id: Some(index),
                     path: format!("layer/{index}"),
+                    frame_index: None,
                 },
                 "clipping is not represented",
                 true,
@@ -224,5 +227,51 @@ mod tests {
         assert_eq!(report.entries.len(), 1);
         assert_eq!(report.entries[0].count, 10);
         assert_eq!(report.entries[0].locations.len(), 8);
+    }
+
+    #[test]
+    fn report_json_uses_v2_and_omits_unset_frame_indices() {
+        let mut report = InformationLossReport::default();
+        report.add(
+            InformationLossCode::ReferencePoint,
+            LossDisposition::Dropped,
+            InformationLocation {
+                layer_id: Some(42),
+                path: "角色/手臂".to_string(),
+                frame_index: Some(2),
+            },
+            "reference point is not serialized",
+            false,
+            true,
+        );
+        report.add(
+            InformationLossCode::ActiveFrame,
+            LossDisposition::Dropped,
+            InformationLocation {
+                layer_id: None,
+                path: String::new(),
+                frame_index: None,
+            },
+            "active frame is not serialized",
+            false,
+            true,
+        );
+
+        let value: serde_json::Value = serde_json::from_slice(
+            &report_json(
+                Path::new("input.psd"),
+                Path::new("output.aseprite"),
+                &report,
+            )
+            .expect("report JSON should serialize"),
+        )
+        .expect("report JSON should decode");
+        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["losses"][0]["locations"][0]["frame_index"], 2);
+        assert!(
+            value["losses"][1]["locations"][0]
+                .get("frame_index")
+                .is_none()
+        );
     }
 }
