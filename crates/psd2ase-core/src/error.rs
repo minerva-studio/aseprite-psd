@@ -64,3 +64,49 @@ impl Display for ConversionError {
 }
 
 impl std::error::Error for ConversionError {}
+
+/// Errors raised while exporting Aseprite snapshots to PSD or PSB.
+#[derive(Debug)]
+pub enum ExportError {
+    /// An input snapshot is absent or is not a regular file.
+    InputMissing(PathBuf),
+    /// The output exists and overwrite was not authorized.
+    OutputExists(PathBuf),
+    /// An input extension or output extension is unsupported.
+    InvalidPath(String),
+    /// Reading or normalizing an Aseprite snapshot failed.
+    AsepriteRead(String),
+    /// Building the PSD document failed.
+    Writer(String),
+    /// The encoded PSD failed ag-psd read-back validation.
+    OutputValidation(String),
+    /// An output transaction could not complete.
+    OutputIo(io::Error),
+}
+
+impl Display for ExportError {
+    /// Formats an export error for a human-readable CLI message.
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InputMissing(path) => {
+                write!(formatter, "input is not a file: {}", path.display())
+            }
+            Self::OutputExists(path) => {
+                write!(formatter, "output already exists: {}", path.display())
+            }
+            Self::InvalidPath(message) => formatter.write_str(message),
+            Self::AsepriteRead(message) => {
+                write!(formatter, "could not read Aseprite input: {message}")
+            }
+            Self::Writer(message) => {
+                write!(formatter, "could not write Photoshop output: {message}")
+            }
+            Self::OutputValidation(message) => {
+                write!(formatter, "Photoshop output validation failed: {message}")
+            }
+            Self::OutputIo(error) => write!(formatter, "could not commit output: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ExportError {}

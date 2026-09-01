@@ -2,9 +2,9 @@
 
 [简体中文](README.zh-CN.md)
 
-`psd2ase` converts Photoshop PSD documents into Aseprite documents. It is
-available as a native command-line program and as an Aseprite extension that
-bundles the converter for a menu-driven import workflow.
+`psd2ase` converts Photoshop PSD/PSB documents to and from Aseprite documents.
+It is available as a native command-line program and as an Aseprite extension
+that bundles the converter for import and native Save As workflows.
 
 ## Quick start: Aseprite extension
 
@@ -25,6 +25,11 @@ the temporary conversion file. Press Ctrl+S or use Save As to choose the final
 The extension defaults to `preserve`, which keeps source layers separate. Its
 dialog also exposes the experimental automatic association modes described
 below.
+
+To export, choose **File > Save As...** and select `.psd` or `.psb`. The
+extension snapshots isolated original and flattened copies, runs the bundled
+converter, validates the Photoshop document, and only then writes it through
+Aseprite's custom-format save stream. Ctrl+S reuses the selected format.
 
 ## Command line
 
@@ -58,6 +63,15 @@ psd2ase convert INPUT.psd -o OUTPUT.aseprite
 psd2ase convert INPUT.psd -o OUTPUT.aseprite --overwrite
 psd2ase convert INPUT.psd -o OUTPUT.aseprite --layer-association auto --linked-cels identical
 psd2ase convert INPUT.psd -o OUTPUT.aseprite --layer-association auto --linked-cels identical --jitter-mode repair --jitter-kind all
+```
+
+Export an Aseprite snapshot using a separately flattened snapshot produced by
+Aseprite. The output extension selects PSD or PSB, and existing output is
+preserved unless `--overwrite` is explicit:
+
+```text
+psd2ase export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite
+psd2ase export INPUT.aseprite -o OUTPUT.psb --composite COMPOSITE.aseprite --report REPORT.json --overwrite
 ```
 
 Run `psd2ase --help` for the complete command syntax.
@@ -99,15 +113,22 @@ than synthesizing colors. Advanced overrides are available through
 
 ## Current boundaries
 
-- The extension packages have been validated with Aseprite 1.3.18.3 on Windows
-  x64 and Ubuntu/WSL2 Linux x64 with glibc.
+- Import packages have been validated with Aseprite 1.3.18.3 on Windows x64 and
+  Ubuntu/WSL2 Linux x64 with glibc. PSD/PSB Save As additionally requires the
+  custom-format save callback implemented by Aseprite #6008 until that API is
+  available in a stable Aseprite release.
 - macOS is not packaged or tested in this release.
-- This is an import workflow extension. It does not register `.psd` with
-  Aseprite's File > Open dialog.
+- The extension registers PSD/PSB custom-format load and save callbacks. The
+  explicit import command remains available for configurable import policies.
 - Conversion preserves the normalized layer tree, RGBA8 cels, Photoshop frame
   animation, and supported layer state. Logical-layer association and some
   coordinate mappings remain experimental, so important output should be
   reviewed in Aseprite.
+- Export preserves supported groups, static layer properties, frame duration,
+  cel visibility/position/opacity, identical cel reuse, and deterministic tag
+  playback. Tilemaps use the independently flattened composite snapshot and
+  are reported as rasterized; tag names/boundaries, slices, color profiles,
+  and per-cel Z-Index are reported when they cannot remain editable.
 - PSD and PSB fixtures are intentionally not committed to this repository.
 
 ## Development

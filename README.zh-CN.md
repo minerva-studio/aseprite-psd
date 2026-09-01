@@ -2,8 +2,9 @@
 
 [English](README.md)
 
-`psd2ase` 用于将 Photoshop PSD 文档转换为 Aseprite 文档。项目同时提供原生
-命令行程序，以及内附 converter、可通过菜单完成导入的 Aseprite 扩展。
+`psd2ase` 用于在 Photoshop PSD/PSB 与 Aseprite 文档之间双向转换。项目同时
+提供原生命令行程序，以及内附 converter、支持导入和原生 Save As 的 Aseprite
+扩展。
 
 ## 快速开始：Aseprite 扩展
 
@@ -21,6 +22,10 @@ Save As 选择最终 `.aseprite` 路径；Aseprite 会默认建议 PSD 所在目
 
 扩展默认使用 `preserve`，保持源图层相互独立。导入对话框也提供下文所述的
 实验性自动关联模式。
+
+导出时选择 **File > Save As...**，并指定 `.psd` 或 `.psb`。扩展会分别创建
+隔离的原始副本与扁平副本，调用内附 converter 并验证 Photoshop 文档，最后
+才通过 Aseprite 自定义格式的保存流写入；此后 Ctrl+S 会继续使用所选格式。
 
 ## 命令行
 
@@ -53,6 +58,14 @@ psd2ase convert INPUT.psd -o OUTPUT.aseprite
 psd2ase convert INPUT.psd -o OUTPUT.aseprite --overwrite
 psd2ase convert INPUT.psd -o OUTPUT.aseprite --layer-association auto --linked-cels identical
 psd2ase convert INPUT.psd -o OUTPUT.aseprite --layer-association auto --linked-cels identical --jitter-mode repair --jitter-kind all
+```
+
+使用由 Aseprite 另行生成的扁平快照导出 Aseprite 文档。输出后缀决定 PSD 或
+PSB；除非明确指定 `--overwrite`，已有输出不会被替换：
+
+```text
+psd2ase export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite
+psd2ase export INPUT.aseprite -o OUTPUT.psb --composite COMPOSITE.aseprite --report REPORT.json --overwrite
 ```
 
 使用 `psd2ase --help` 查看完整命令格式。
@@ -88,12 +101,18 @@ cel 复用候选。
 
 ## 当前边界
 
-- 扩展包已在 Aseprite 1.3.18.3、Windows x64 和使用 glibc 的 Ubuntu/WSL2
-  Linux x64 环境验证。
+- 导入扩展包已在 Aseprite 1.3.18.3、Windows x64 和使用 glibc 的
+  Ubuntu/WSL2 Linux x64 环境验证。在该 API 进入 Aseprite 稳定版前，
+  PSD/PSB Save As 还要求 Aseprite #6008 所实现的自定义格式保存回调。
 - 本版本没有打包或测试 macOS。
-- 这是导入工作流扩展，不会在 Aseprite 的 File > Open 中注册 `.psd` 后缀。
+- 扩展会注册 PSD/PSB 自定义格式的加载与保存回调；需要配置导入策略时仍可使用
+  明确的导入菜单命令。
 - 转换会保留规范化图层树、RGBA8 cel、Photoshop 帧动画和受支持的图层状态。
   逻辑图层关联及部分坐标映射仍属实验功能，重要输出应在 Aseprite 中人工检查。
+- 导出会保留受支持的组、静态图层属性、帧时长、cel 可见性/位置/透明度、相同
+  cel 复用，以及确定性的 tag 播放序列。Tilemap 使用独立扁平快照并报告为
+  rasterized；无法继续编辑的 tag 名称/边界、slice、颜色配置和逐 cel Z-Index
+  会进入信息损失报告。
 - 仓库有意不提交 PSD 或 PSB 测试素材。
 
 ## 开发

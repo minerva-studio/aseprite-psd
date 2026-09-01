@@ -107,6 +107,10 @@ local function build_arguments(binary, input, output, options)
     "--output",
     output,
   }
+  if options.report then
+    table.insert(arguments, "--report")
+    table.insert(arguments, options.report)
+  end
 
   if options.overwrite then
     table.insert(arguments, "--overwrite")
@@ -142,6 +146,21 @@ local function build_arguments(binary, input, output, options)
   end
 
   return arguments
+end
+
+--- Builds the single Rust export command used by the custom file-format saver.
+local function build_export_arguments(binary, input, output, composite, report)
+  return {
+    binary,
+    "export",
+    input,
+    "--output",
+    output,
+    "--composite",
+    composite,
+    "--report",
+    report,
+  }
 end
 
 --- Builds an ASCII-only PowerShell launcher for Unicode Windows arguments.
@@ -182,16 +201,12 @@ local function format_exit_status(result, reason, code)
 end
 
 --- Runs psd2ase and returns its captured diagnostic output.
-local function run_conversion(binary, input, output, options)
+local function run_converter(binary, arguments, output)
   if not app.fs.isFile(binary) then
     error("Bundled psd2ase executable was not found: " .. binary)
   end
-  if not app.fs.isFile(input) then
-    error("PSD input file was not found: " .. input)
-  end
 
   local log_filename = temporary_path("log")
-  local arguments = build_arguments(binary, input, output, options)
   local command = build_command(arguments, log_filename)
   local launch_ok, result, reason, code = pcall(function()
     return os.execute(command)
@@ -199,30 +214,127 @@ local function run_conversion(binary, input, output, options)
   local diagnostics = read_text_file(log_filename)
 
   if not launch_ok then
-    error("Could not launch psd2ase: " .. tostring(result) .. "\n\nLog: " .. log_filename)
+    remove_file(log_filename)
+    error("Could not launch psd2ase: " .. tostring(result))
   end
   if not command_succeeded(result, reason, code) then
     local detail = diagnostics
     if detail == "" then
       detail = "The converter exited without diagnostic output."
     end
+    remove_file(log_filename)
     error(string.format(
-      "psd2ase conversion failed (%s).\n\n%s\n\nLog: %s",
+      "psd2ase conversion failed (%s).\n\n%s",
       format_exit_status(result, reason, code),
-      detail,
-      log_filename
+      detail
     ))
   end
   if not app.fs.isFile(output) then
-    error("psd2ase reported success but did not create: " .. output .. "\n\nLog: " .. log_filename)
+    remove_file(log_filename)
+    error("psd2ase reported success but did not create: " .. output)
   end
   remove_file(log_filename)
   return diagnostics
 end
 
+--- Runs the PSD import subcommand through the common converter launcher.
+local function run_conversion(binary, input, output, options)
+  if not app.fs.isFile(input) then
+    error("PSD input file was not found: " .. input)
+  end
+  return run_converter(binary, build_arguments(binary, input, output, options), output)
+end
+
+--- Runs the Aseprite export subcommand through the common converter launcher.
+local function run_export_conversion(binary, input, output, composite, report)
+  if not app.fs.isFile(input) or not app.fs.isFile(composite) then
+    error("Aseprite export snapshots were not created.")
+  end
+  return run_converter(
+    binary,
+    build_export_arguments(binary, input, output, composite, report),
+    output)
+end
+
 --- Shows a single alert containing an operation failure.
 local function show_error(title, message)
+  print(title .. ": " .. tostring(message))
   app.alert{ title=title, text=message }
+end
+
+--- Saves one structured compatibility report after an explicit export choice.
+local function save_information_loss_report(raw, operation)
+  local operation_title = operation:gsub("^%l", string.upper)
+  local chooser = Dialog{ title="Export PSD " .. operation_title .. " Report" }
+  if not chooser then
+    show_error("PSD " .. operation .. " report", "Aseprite does not have an available UI.")
+    return
+  end
+  chooser:file{ id="destination", label="Report", save=true, entry=false, filetypes={"json"} }
+  chooser:button{ id="save", text="Save", focus=true }
+  chooser:button{ id="cancel", text="Cancel" }
+  chooser:show()
+  if not chooser.data.save then return end
+  local saved = chooser.data.destination
+  if saved and saved ~= "" then
+    local file = io.open(saved, "wb")
+    if file then
+      file:write(raw)
+      file:close()
+    else
+      show_error("PSD " .. operation .. " report", "Could not save the report.")
+    end
+  end
+end
+
+--- Shows structured compatibility losses and offers an explicit report export.
+local function show_information_loss(report_filename, operation)
+  operation = operation or "import"
+  local operation_title = operation:gsub("^%l", string.upper)
+  local raw = read_text_file(report_filename)
+  if raw == "" then return end
+  local ok, report, losses = pcall(function()
+    local decoded = json.decode(raw)
+    if decoded.schema_version ~= 1 then
+      return nil, nil
+    end
+    local decoded_losses = decoded.losses or {}
+    local loss_count = #decoded_losses
+    for index = 1, math.min(loss_count, 8) do
+      if decoded_losses[index] == nil then
+        error("report losses must be an array")
+      end
+    end
+    return decoded, decoded_losses
+  end)
+  if not ok or report == nil then
+    show_error("PSD " .. operation .. " report", "The converter produced an unreadable or unsupported report.")
+    return
+  end
+  local loss_count = #losses
+  if loss_count == 0 then return end
+  local lines = {"Some PSD information could not be preserved:"}
+  for index = 1, math.min(loss_count, 8) do
+    local loss = losses[index]
+    table.insert(lines, string.format("%s: %s (%d)", loss.code or "unknown", loss.disposition or "unknown", loss.count or 0))
+  end
+  if loss_count > 8 then
+    table.insert(lines, string.format("... and %d more entries", loss_count - 8))
+  end
+  local dialog = Dialog{ title="PSD " .. operation_title .. " Information Loss" }
+  for index, line in ipairs(lines) do
+    if index > 1 then
+      dialog:newrow()
+    end
+    dialog:label{ id="summary_" .. index, text=line }
+  end
+  dialog:newrow()
+  dialog:button{ id="export", text="Export Full Report..." }
+  dialog:button{ id="ok", text="OK", focus=true }
+  dialog:show()
+  if dialog.data.export then
+    save_information_loss_report(raw, operation)
+  end
 end
 
 --- Returns the compact label shown for the current jitter settings.
@@ -296,26 +408,47 @@ local function select_jitter_options(parent_dialog, initial, automatic)
   }
 end
 
---- Shows the complete PSD import dialog and returns the selected options.
-local function select_import_options()
-  local dialog = Dialog{ title="Import PSD" }
-  local jitter_options = {
+--- Returns the non-interactive defaults used when Aseprite opens a PSD directly.
+local function default_import_options()
+  return {
+    overwrite = true,
+    layer_association = "preserve",
+    link_identical_cels = false,
     jitter_mode = "off",
     jitter_kind = "alpha",
     jitter_profile = "conservative",
+    association_strategy = "compact",
+    z_order = "stable",
+    stable_order = "consensus",
+    uncertain_layers = "group",
+  }
+end
+
+--- Shows the complete PSD import dialog and returns the selected options.
+local function select_import_options(input_filename)
+  local dialog = Dialog{ title="Import PSD" }
+  local defaults = default_import_options()
+  local jitter_options = {
+    jitter_mode = defaults.jitter_mode,
+    jitter_kind = defaults.jitter_kind,
+    jitter_profile = defaults.jitter_profile,
   }
   if not dialog then
     show_error("PSD to Aseprite", "Aseprite does not have an available UI.")
     return nil
   end
-  dialog:file{
-    id="input",
-    label="PSD",
-    title="Select Photoshop document",
-    open=true,
-    entry=true,
-    filetypes={"psd"},
-  }
+  if input_filename then
+    dialog:label{ id="input_summary", label="PSD", text=app.fs.fileTitle(input_filename) }
+  else
+    dialog:file{
+      id="input",
+      label="PSD",
+      title="Select Photoshop document",
+      open=true,
+      entry=true,
+      filetypes={"psd"},
+    }
+  end
   --- Keeps advanced association controls aligned with the selected mode.
   local function update_option_controls()
     local current = dialog.data
@@ -339,7 +472,7 @@ local function select_import_options()
   dialog:combobox{
     id="layer_association",
     label="Layer association",
-    option="preserve",
+    option=defaults.layer_association,
     options={"preserve", "auto"},
     onchange=update_option_controls,
   }
@@ -347,13 +480,13 @@ local function select_import_options()
     id="link_identical_cels",
     label="Linked cels",
     text="Link identical cels",
-    selected=false,
+    selected=defaults.link_identical_cels,
     enabled=false,
   }
   dialog:combobox{
     id="association_strategy",
     label="Association strategy",
-    option="compact",
+    option=defaults.association_strategy,
     options={"compact", "conservative"},
     enabled=false,
     onchange=update_option_controls,
@@ -361,21 +494,21 @@ local function select_import_options()
   dialog:combobox{
     id="z_order",
     label="Z-order",
-    option="stable",
+    option=defaults.z_order,
     options={"stable", "auto"},
     enabled=false,
   }
   dialog:combobox{
     id="stable_order",
     label="Stable order",
-    option="consensus",
+    option=defaults.stable_order,
     options={"consensus", "anchor", "strict"},
     enabled=false,
   }
   dialog:combobox{
     id="uncertain_layers",
     label="Uncertain layers",
-    option="group",
+    option=defaults.uncertain_layers,
     options={"group", "flat"},
     enabled=false,
   }
@@ -403,6 +536,7 @@ local function select_import_options()
   dialog:button{ id="cancel", text="Cancel" }
   dialog:show()
   local data = dialog.data
+  data.input = input_filename or data.input
   if not data.import or not data.input or data.input == "" then
     return nil
   end
@@ -411,22 +545,6 @@ local function select_import_options()
   data.jitter_kind = jitter_options.jitter_kind
   data.jitter_profile = jitter_options.jitter_profile
   return data
-end
-
---- Returns the non-interactive defaults used when Aseprite opens a PSD directly.
-local function default_import_options()
-  return {
-    overwrite = true,
-    layer_association = "preserve",
-    link_identical_cels = false,
-    jitter_mode = "off",
-    jitter_kind = "alpha",
-    jitter_profile = "conservative",
-    association_strategy = "compact",
-    z_order = "stable",
-    stable_order = "consensus",
-    uncertain_layers = "group",
-  }
 end
 
 --- Returns the native Save As suggestion for an imported PSD.
@@ -466,6 +584,87 @@ local function open_as_unsaved_document(filename, suggested_filename)
   return sprite
 end
 
+--- Closes an isolated sprite copy without turning cleanup into an export error.
+local function close_sprite(sprite)
+  if sprite then
+    pcall(function() sprite:close() end)
+  end
+end
+
+--- Saves original and flattened isolated snapshots without mutating the source sprite.
+local function create_export_snapshots(source, original_filename, composite_filename)
+  local original_copy
+  local composite_copy
+  local success, result = pcall(function()
+    original_copy = Sprite(source)
+    composite_copy = Sprite(source)
+    if not original_copy or not composite_copy then
+      error("Aseprite could not create isolated export copies.")
+    end
+    if not original_copy:saveCopyAs(original_filename) then
+      error("Aseprite could not save the isolated original snapshot.")
+    end
+    composite_copy:flatten()
+    if not composite_copy:saveCopyAs(composite_filename) then
+      error("Aseprite could not save the isolated flattened snapshot.")
+    end
+  end)
+  close_sprite(original_copy)
+  close_sprite(composite_copy)
+  local restored, restore_error = pcall(function()
+    app.sprite = source
+  end)
+  if not restored then
+    error("Aseprite could not restore the source document after snapshot cleanup: "
+      .. tostring(restore_error), 0)
+  end
+  if not success then
+    error(result, 0)
+  end
+end
+
+--- Exports one sprite into a verified temporary PSD/PSB and commits it to ev.file.
+local function save_photoshop_document(binary, ev)
+  if not binary then
+    show_error("PSD export failed", "This extension has no converter for the current platform.")
+    return false
+  end
+  local extension = (app.fs.fileExtension(ev.filename) or ""):lower()
+  if extension ~= "psd" and extension ~= "psb" then
+    show_error("PSD export failed", "The destination must use a .psd or .psb extension.")
+    return false
+  end
+  local original_filename = temporary_path("aseprite")
+  local composite_filename = temporary_path("aseprite")
+  local output_filename = temporary_path(extension)
+  local report_filename = temporary_path("json")
+  local success, result = pcall(function()
+    create_export_snapshots(ev.sprite, original_filename, composite_filename)
+    run_export_conversion(
+      binary,
+      original_filename,
+      output_filename,
+      composite_filename,
+      report_filename)
+    local bytes = read_text_file(output_filename)
+    if bytes == "" then
+      error("The converter produced an empty Photoshop document.")
+    end
+    ev.file:write(bytes)
+    ev.file:flush()
+    show_information_loss(report_filename, "export")
+  end)
+  remove_file(original_filename)
+  remove_file(composite_filename)
+  remove_file(output_filename)
+  remove_file(report_filename)
+  if not success then
+    show_error("PSD export failed", tostring(result))
+    return false
+  end
+  return true
+end
+
 --- Executes the menu-driven import workflow through a temporary output file.
 local function import_from_menu(binary)
   local options = select_import_options()
@@ -473,11 +672,14 @@ local function import_from_menu(binary)
     return
   end
   local temporary_output = temporary_path("aseprite")
+  options.report = temporary_path("json")
   local success, result = pcall(function()
     run_conversion(binary, options.input, temporary_output, options)
     open_as_unsaved_document(temporary_output, suggested_output_path(options.input))
+    show_information_loss(options.report)
   end)
   remove_file(temporary_output)
+  remove_file(options.report)
   if not success then
     show_error("PSD import failed", tostring(result))
   end
@@ -502,18 +704,29 @@ function init(plugin)
     name="Photoshop Document (PSD/PSB)",
     extensions={"psd", "psb"},
     binary=true,
+    onsave=function(ev)
+      return save_photoshop_document(binary, ev)
+    end,
     onload=function(ev)
       if not binary then
         error("This extension has no converter for the current platform.")
       end
       local temporary_output = temporary_path("aseprite")
+      local report_filename = temporary_path("json")
+      local options = select_import_options(ev.filename)
+      if not options then
+        error("PSD import cancelled.", 0)
+      end
+      options.report = report_filename
       local success, result = pcall(function()
-        run_conversion(binary, ev.filename, temporary_output, default_import_options())
+        run_conversion(binary, ev.filename, temporary_output, options)
         return open_as_unsaved_document(
           temporary_output,
           suggested_output_path(ev.filename))
       end)
+      if success then show_information_loss(report_filename) end
       remove_file(temporary_output)
+      remove_file(report_filename)
       if not success then
         error(result, 0)
       end

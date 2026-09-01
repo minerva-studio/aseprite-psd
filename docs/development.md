@@ -8,7 +8,7 @@
    TypeScript oracle on a representative PSD before any writer work is enabled.
 3. **Normalized model:** layer ownership, frame state, and pixel lifetime are
    explicit and format-independent.
-4. **Aseprite writer:** output is written transactionally, read back, and
+4. **Format writers:** output is written transactionally, read back, and
    structurally and visually validated before replacement.
 5. **CLI and release:** exit codes, reports, platform artifacts, and manual
    Aseprite checks are complete.
@@ -67,8 +67,8 @@ all unsupported mappings are reported as warnings.
 ## Ownership rules
 
 - `psd2ase-core` owns normalized document semantics, pixel ownership, and
-  conversion invariants. Future PSD and Aseprite writers must use this model as
-  their conversion boundary.
+  conversion invariants. PSD and Aseprite writers use this model as their only
+  conversion boundary.
 - `LayerAssociation` is the conversion-policy source of truth. Preserve mode
   carries no automatic-only settings; auto mode carries `AutoAssociationOptions`,
   and only the conservative strategy can carry an uncertain-layer policy.
@@ -99,6 +99,16 @@ all unsupported mappings are reported as warnings.
   preserve and planned topology checks separate.
 - A conversion transaction owns temporary output until read-back validation and
   atomic commit complete.
+
+The PSD export reader accepts two Aseprite-owned snapshots: an untouched
+original for editable layer/cel data and a separately flattened copy for the
+trusted composite. It never recomposites the original layer tree. The exporter
+maps cels to static PSD pixel layers plus frame-local visibility, position, and
+opacity metadata, then validates both the ag-psd container and the normalized
+animation/composite before committing. Because published ag-psd 0.2.0 does not
+write `shmd`, the writer has one bounded post-processor for that missing block;
+it uses ag-psd descriptor primitives and does not introduce another document
+model.
 
 The current writer is deliberately experimental. `convert` writes to a
 same-directory temporary file, reads it back through `aseprite-io`, and only

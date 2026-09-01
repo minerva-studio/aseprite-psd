@@ -4,11 +4,13 @@ use std::process::ExitCode;
 
 use psd2ase_core::{
     AssociationDecisionStatus, AssociationStrategy, AutoAssociationOptions, ConvertOptions,
-    JitterKind, JitterMode, JitterOptions, JitterProfile, LayerAssociation, LayerZOrderMode,
-    LinkedCelMode, StableOrderMode, UncertainLayerMode, VERSION, convert, inspect,
+    ExportOptions, JitterKind, JitterMode, JitterOptions, JitterProfile, LayerAssociation,
+    LayerZOrderMode, LinkedCelMode, StableOrderMode, UncertainLayerMode, VERSION, convert, export,
+    inspect, write_report,
 };
 
-const CONVERT_USAGE: &str = "usage: psd2ase convert INPUT [-o OUTPUT] [--overwrite] [--linked-cels off|identical] [--layer-association preserve|auto] [--association-strategy compact|conservative] [--z-order stable|auto] [--stable-order consensus|anchor|strict] [--uncertain-layers group|flat] [--jitter-mode off|report|assist|repair] [--jitter-kind alpha|color|all] [--jitter-profile conservative|balanced] [--jitter-alpha-threshold N] [--jitter-max-speck-area N] [--jitter-max-changed-ratio N] [--jitter-max-channel-delta N]";
+const CONVERT_USAGE: &str = "usage: psd2ase convert INPUT [-o OUTPUT] [--report PATH] [--overwrite] [--linked-cels off|identical] [--layer-association preserve|auto] [--association-strategy compact|conservative] [--z-order stable|auto] [--stable-order consensus|anchor|strict] [--uncertain-layers group|flat] [--jitter-mode off|report|assist|repair] [--jitter-kind alpha|color|all] [--jitter-profile conservative|balanced] [--jitter-alpha-threshold N] [--jitter-max-speck-area N] [--jitter-max-changed-ratio N] [--jitter-max-channel-delta N]";
+const EXPORT_USAGE: &str = "usage: psd2ase export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite [--report PATH] [--overwrite]";
 
 #[derive(Debug, PartialEq, Eq)]
 struct ConvertCommand {
@@ -18,6 +20,16 @@ struct ConvertCommand {
     linked_cels: LinkedCelMode,
     layer_association: LayerAssociation,
     jitter: JitterOptions,
+    report: Option<PathBuf>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ExportCommand {
+    input: PathBuf,
+    output: PathBuf,
+    composite: PathBuf,
+    report: Option<PathBuf>,
+    overwrite: bool,
 }
 
 /// Runs the command-line entry point and returns its stable process result.
@@ -44,8 +56,48 @@ fn run(arguments: Vec<String>) -> Result<(), CliError> {
         }
         Some("inspect") => run_inspect(&arguments[1..]),
         Some("convert") => run_convert(&arguments[1..]),
+        Some("export") => run_export(&arguments[1..]),
         Some(command) => Err(CliError::Usage(format!("unknown command: {command}"))),
     }
+}
+
+/// Executes the independently validated Aseprite-to-PSD/PSB export command.
+fn run_export(arguments: &[String]) -> Result<(), CliError> {
+    let command = export_arguments(arguments)?;
+    let report = export(
+        &command.input,
+        &command.composite,
+        &command.output,
+        &ExportOptions {
+            overwrite: command.overwrite,
+        },
+    )
+    .map_err(|error| CliError::Conversion(error.to_string()))?;
+    println!("wrote {}", report.output.display());
+    if let Some(path) = command.report {
+        write_report(
+            &path,
+            &report.input,
+            &report.output,
+            &report.information_loss,
+        )
+        .map_err(|error| {
+            CliError::Conversion(format!(
+                "output generated, report write failed for {}: {error}",
+                path.display()
+            ))
+        })?;
+    }
+    for loss in &report.information_loss.entries {
+        println!(
+            "information-loss {} {} count={} {}",
+            loss.disposition.as_str(),
+            loss.code.as_str(),
+            loss.count,
+            loss.detail
+        );
+    }
+    Ok(())
 }
 
 /// Executes the metadata-only inspection command.
@@ -74,12 +126,35 @@ fn run_convert(arguments: &[String]) -> Result<(), CliError> {
     )
     .map_err(|error| CliError::Conversion(error.to_string()))?;
     println!("wrote {}", report.output.display());
+    if let Some(path) = command.report {
+        write_report(
+            &path,
+            &report.input,
+            &report.output,
+            &report.information_loss,
+        )
+        .map_err(|error| {
+            CliError::Conversion(format!(
+                "output generated, report write failed for {}: {error}",
+                path.display()
+            ))
+        })?;
+    }
     println!(
         "cel reuse: {} pixel cels, {} linked cels",
         report.cel_reuse.pixel_cel_count, report.cel_reuse.linked_cel_count
     );
     for warning in report.warnings {
         println!("warning: {warning}");
+    }
+    for loss in &report.information_loss.entries {
+        println!(
+            "information-loss {} {} count={} {}",
+            loss.disposition.as_str(),
+            loss.code.as_str(),
+            loss.count,
+            loss.detail
+        );
     }
     if let Some(association) = report.association {
         let exclusion_diagnostics = association.exclusion_diagnostics();
@@ -219,6 +294,7 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
     }
     let mut input = None;
     let mut output = None;
+    let mut report = None;
     let mut overwrite = false;
     let mut linked_cels = LinkedCelMode::Off;
     let mut automatic = false;
@@ -420,6 +496,13 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
                     .ok_or_else(|| CliError::Usage(CONVERT_USAGE.to_string()))?;
                 output = Some(PathBuf::from(value));
             }
+            "--report" => {
+                index += 1;
+                let value = arguments
+                    .get(index)
+                    .ok_or_else(|| CliError::Usage(CONVERT_USAGE.to_string()))?;
+                report = Some(PathBuf::from(value));
+            }
             value if value.starts_with('-') => {
                 return Err(CliError::Usage(format!("unknown convert option: {value}")));
             }
@@ -507,6 +590,65 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
         linked_cels,
         layer_association,
         jitter,
+        report,
+    })
+}
+
+/// Parses the deliberately narrow export command without adding another protocol layer.
+fn export_arguments(arguments: &[String]) -> Result<ExportCommand, CliError> {
+    if arguments.is_empty() {
+        return Err(CliError::Usage(EXPORT_USAGE.to_string()));
+    }
+    let mut input = None;
+    let mut output = None;
+    let mut composite = None;
+    let mut report = None;
+    let mut overwrite = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "-o" | "--output" => {
+                index += 1;
+                output = Some(PathBuf::from(
+                    arguments
+                        .get(index)
+                        .ok_or_else(|| CliError::Usage(EXPORT_USAGE.to_string()))?,
+                ));
+            }
+            "--composite" => {
+                index += 1;
+                composite = Some(PathBuf::from(
+                    arguments
+                        .get(index)
+                        .ok_or_else(|| CliError::Usage(EXPORT_USAGE.to_string()))?,
+                ));
+            }
+            "--report" => {
+                index += 1;
+                report = Some(PathBuf::from(
+                    arguments
+                        .get(index)
+                        .ok_or_else(|| CliError::Usage(EXPORT_USAGE.to_string()))?,
+                ));
+            }
+            "--overwrite" => overwrite = true,
+            value if value.starts_with('-') => {
+                return Err(CliError::Usage(format!("unknown export option: {value}")));
+            }
+            value => {
+                if input.replace(PathBuf::from(value)).is_some() {
+                    return Err(CliError::Usage(EXPORT_USAGE.to_string()));
+                }
+            }
+        }
+        index += 1;
+    }
+    Ok(ExportCommand {
+        input: input.ok_or_else(|| CliError::Usage(EXPORT_USAGE.to_string()))?,
+        output: output.ok_or_else(|| CliError::Usage(EXPORT_USAGE.to_string()))?,
+        composite: composite.ok_or_else(|| CliError::Usage(EXPORT_USAGE.to_string()))?,
+        report,
+        overwrite,
     })
 }
 
@@ -548,7 +690,7 @@ fn one_path_argument(arguments: &[String], command: &str) -> Result<PathBuf, Cli
 fn print_help() {
     println!(
         "psd2ase {VERSION}\n\n\
-         Usage:\n  psd2ase inspect INPUT\n  {CONVERT_USAGE}\n  psd2ase --version"
+         Usage:\n  psd2ase inspect INPUT\n  {CONVERT_USAGE}\n  {EXPORT_USAGE}\n  psd2ase --version"
     );
 }
 

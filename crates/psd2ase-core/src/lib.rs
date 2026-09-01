@@ -4,18 +4,26 @@
 //! Aseprite writer. Coordinate mapping remains provisional until visual review
 //! of a generated file is complete.
 
+pub mod aseprite_reader;
 pub mod aseprite_writer;
+mod atomic_output;
 mod error;
+pub mod information_loss;
 pub mod jitter;
 pub mod layer_names;
 pub mod logical_layers;
 mod model;
 pub mod photoshop_animation;
+pub mod psd_writer;
 
 pub use aseprite_writer::{
     CelReuseReport, DEFAULT_FRAME_DURATION_MS, EncodedAseprite, WriterError,
 };
-pub use error::{ConversionError, InspectionError};
+pub use error::{ConversionError, ExportError, InspectionError};
+pub use information_loss::{
+    InformationLocation, InformationLoss, InformationLossCode, InformationLossReport,
+    LossDisposition, report_json, write_report,
+};
 pub use jitter::{
     JitterKind, JitterMode, JitterOptions, JitterPlan, JitterProfile, JitterReport,
     JitterThresholds, build_jitter_plan, resolved_pixels, stabilized_document,
@@ -40,12 +48,12 @@ pub use photoshop_animation::{
     LayerFrameState, LoopMode, PhotoshopAnimation, PhotoshopFrame, VisibleFrameLayers,
     parse_photoshop_animation,
 };
+pub use psd_writer::{ExportOptions, ExportReport, export};
 
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, OpenOptions};
-use std::io::{Cursor, Write};
+use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The package version exposed to the CLI and reports.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -82,6 +90,8 @@ pub struct ConversionReport {
     pub output: PathBuf,
     /// Warnings produced while mapping or validating the document.
     pub warnings: Vec<String>,
+    /// Structured source and output compatibility losses.
+    pub information_loss: InformationLossReport,
     /// Automatic layer-association diagnostics, when auto mode was selected.
     pub association: Option<AssociationReport>,
     /// Counts of ordinary and linked cels in the committed output.
@@ -118,7 +128,7 @@ pub fn normalize(input: &Path) -> Result<NormalizedDocument, InspectionError> {
 }
 
 /// Converts one parser buffer without exposing ag-psd types to callers.
-fn normalize_bytes(bytes: &[u8]) -> Result<NormalizedDocument, InspectionError> {
+pub(crate) fn normalize_bytes(bytes: &[u8]) -> Result<NormalizedDocument, InspectionError> {
     let options = ag_psd::psd::ReadOptions {
         use_image_data: Some(true),
         skip_thumbnail: Some(true),
@@ -382,12 +392,22 @@ fn normalized_loop_mode(value: &LoopMode) -> NormalizedLoopMode {
 
 /// Validates a Photoshop layer ID before it enters the normalized model.
 fn layer_id(value: Option<f64>, path: &str) -> Result<u32, InspectionError> {
-    value
+    if let Some(value) = value
         .filter(|value| {
             value.is_finite() && *value >= 1.0 && value.fract() == 0.0 && *value <= u32::MAX as f64
         })
         .map(|value| value as u32)
-        .ok_or_else(|| InspectionError::Normalization(format!("layer at {path} has an invalid ID")))
+    {
+        return Ok(value);
+    }
+    // Static PSDs may omit Photoshop's optional layer ID. A path-based
+    // identity is stable and independent of the user-facing layer name.
+    let mut hash = 0x811c9dc5_u32;
+    for byte in path.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    Ok(hash | 0x8000_0000)
 }
 
 /// Converts an integral finite PSD number to a u32 model field.
@@ -501,6 +521,25 @@ pub fn convert(
 
     let document =
         normalize(input).map_err(|error| ConversionError::InputInspection(error.to_string()))?;
+    let mut information_loss = InformationLossReport::default();
+    if document.bits_per_channel != Some(8)
+        || !matches!(document.color_mode.as_deref(), Some("rgb" | "rgba"))
+    {
+        information_loss.add(
+            InformationLossCode::UnsupportedColor,
+            LossDisposition::Degraded,
+            InformationLocation {
+                layer_id: None,
+                path: "document".to_string(),
+            },
+            format!(
+                "source color mode {:?} at {:?} bits per channel is normalized to RGBA8",
+                document.color_mode, document.bits_per_channel
+            ),
+            true,
+            true,
+        );
+    }
     let initial_plan = match options.layer_association {
         LayerAssociation::Preserve => None,
         LayerAssociation::Auto(auto_options) => Some(
@@ -558,6 +597,69 @@ pub fn convert(
         0,
         "coordinate policy: provisional pixels.left/top plus frame offset cel origin".to_string(),
     );
+    let mut retained_warnings = Vec::new();
+    for warning in encoded.warnings {
+        let (code, disposition, visual, editable) = if warning.contains("blend mode") {
+            (
+                Some(InformationLossCode::UnknownBlendMode),
+                LossDisposition::Degraded,
+                true,
+                true,
+            )
+        } else if warning.contains("opacity") && warning.contains("quantized") {
+            (
+                Some(InformationLossCode::OpacityQuantization),
+                LossDisposition::Degraded,
+                true,
+                true,
+            )
+        } else if warning.contains("reference points") {
+            (
+                Some(InformationLossCode::ReferencePoint),
+                LossDisposition::Dropped,
+                false,
+                true,
+            )
+        } else if warning.contains("group frame opacity") {
+            (
+                Some(InformationLossCode::GroupFrameOpacity),
+                LossDisposition::Dropped,
+                true,
+                true,
+            )
+        } else if warning.contains("active frame") {
+            (
+                Some(InformationLossCode::ActiveFrame),
+                LossDisposition::Dropped,
+                false,
+                true,
+            )
+        } else if warning.contains("pixel layer") && warning.contains("children") {
+            (
+                Some(InformationLossCode::PixelLayerChildren),
+                LossDisposition::Dropped,
+                true,
+                true,
+            )
+        } else {
+            (None, LossDisposition::Unknown, false, false)
+        };
+        if let Some(code) = code {
+            information_loss.add(
+                code,
+                disposition,
+                InformationLocation {
+                    layer_id: None,
+                    path: String::new(),
+                },
+                warning,
+                visual,
+                editable,
+            );
+        } else {
+            retained_warnings.push(warning);
+        }
+    }
     match plan.as_ref() {
         None => {
             validate_aseprite_output(&encoded.bytes, &document, options.linked_cels, &jitter_plan)?
@@ -575,7 +677,8 @@ pub fn convert(
     Ok(ConversionReport {
         input: input.to_path_buf(),
         output: output.to_path_buf(),
-        warnings: encoded.warnings,
+        warnings: retained_warnings,
+        information_loss,
         association,
         cel_reuse: encoded.cel_reuse,
         jitter,
@@ -926,46 +1029,7 @@ fn validate_cel(
 
 /// Writes validated bytes through a same-directory temporary transaction.
 fn commit_output(output: &Path, bytes: &[u8], overwrite: bool) -> Result<(), ConversionError> {
-    let parent = output.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(ConversionError::OutputIo)?;
-    let file_name = output
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("output.aseprite");
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| ConversionError::OutputIo(std::io::Error::other(error)))?
-        .as_nanos();
-    let temporary = parent.join(format!(".{file_name}.{stamp}.tmp"));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(ConversionError::OutputIo)?;
-    let result = (|| {
-        file.write_all(bytes).map_err(ConversionError::OutputIo)?;
-        file.sync_all().map_err(ConversionError::OutputIo)?;
-        if !overwrite || !output.exists() {
-            fs::rename(&temporary, output).map_err(ConversionError::OutputIo)?;
-            return Ok(());
-        }
-        let backup = parent.join(format!(".{file_name}.{stamp}.bak"));
-        fs::rename(output, &backup).map_err(ConversionError::OutputIo)?;
-        match fs::rename(&temporary, output) {
-            Ok(()) => {
-                fs::remove_file(backup).map_err(ConversionError::OutputIo)?;
-                Ok(())
-            }
-            Err(error) => {
-                let _ = fs::rename(&backup, output);
-                Err(ConversionError::OutputIo(error))
-            }
-        }
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    atomic_output::commit_bytes(output, bytes, overwrite).map_err(ConversionError::OutputIo)
 }
 
 #[cfg(test)]
