@@ -8,3 +8,4 @@
 /.probe/
 tools/ag-psd-oracle/node_modules/
 tools/ag-psd-oracle/.npm-cache/
+tools/ag-psd-oracle/target/

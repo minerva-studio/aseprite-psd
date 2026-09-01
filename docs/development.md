@@ -20,7 +20,7 @@ cargo fmt --all -- --check
 cargo test --workspace --locked
 cargo run -p psd2ase -- --version
 cargo run -p psd2ase -- --help
-npm --prefix tools/ag-psd-oracle install --ignore-scripts --cache tools/ag-psd-oracle/.npm-cache
+npm --prefix tools/ag-psd-oracle install --ignore-scripts --allow-git=all --cache tools/ag-psd-oracle/.npm-cache
 pwsh -File tools/probe.ps1
 ```
 
@@ -46,8 +46,10 @@ size and SHA-256 before and after the run, and never creates an Aseprite file.
 Stage 3 adds a Photoshop frame-animation gate to the same probe command. The
 Rust scanner reads bounded image-resource and layer additional-info sections
 (4000/4003, shmd/mlst/mdyn) and converts them into the format-independent
-animation model in psd2ase-core. The published ag-psd 0.2.0 remains unchanged;
-TypeScript ag-psd is still only the development oracle.
+animation model in psd2ase-core. The TypeScript `ag-psd` master snapshot is
+pinned as the development oracle for overlapping parser behaviour; the
+Minerva-maintained Rust `ag-psd` fork remains the product runtime and includes
+documented extensions beyond that oracle.
 
 Stage 4 exposes `psd2ase_core::normalize` as the reader boundary. It owns the
 recursive layer tree, validated document bounds, copied RGBA8 pixels, and
@@ -105,8 +107,8 @@ original for editable layer/cel data and a separately flattened copy for the
 trusted composite. It never recomposites the original layer tree. The exporter
 maps cels to static PSD pixel layers plus frame-local visibility, position, and
 opacity metadata, then validates both the ag-psd container and the normalized
-animation/composite before committing. Because published ag-psd 0.2.0 does not
-write `shmd`, the writer has one bounded post-processor for that missing block;
+animation/composite before committing. Because the Minerva ag-psd fork does not
+yet write `shmd`, the writer has one bounded post-processor for that missing block;
 it uses ag-psd descriptor primitives and does not introduce another document
 model.
 
