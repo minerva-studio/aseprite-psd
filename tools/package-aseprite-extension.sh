@@ -3,15 +3,19 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: package-aseprite-extension.sh --platform PLATFORM --binary PATH [--output PATH]
+Usage: package-aseprite-extension.sh --platform PLATFORM [--binary PATH] [--output PATH]
 
 PLATFORM must be linux-x64 or windows-x64.
+
+When --binary is omitted, the script builds the native release converter before
+packaging it. Use --no-build with --binary when the converter was built elsewhere.
 EOF
 }
 
 platform=""
 binary=""
 output=""
+build_binary=1
 
 while (($# > 0)); do
   case "$1" in
@@ -23,7 +27,12 @@ while (($# > 0)); do
     --binary)
       [[ $# -ge 2 ]] || { usage >&2; exit 64; }
       binary="$2"
+      build_binary=0
       shift 2
+      ;;
+    --no-build)
+      build_binary=0
+      shift
       ;;
     --output)
       [[ $# -ge 2 ]] || { usage >&2; exit 64; }
@@ -58,10 +67,24 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/.." && pwd)"
 source_dir="$repo_root/extensions/psd2ase-aseprite"
 
-[[ -n "$binary" ]] || { echo "error: --binary is required" >&2; exit 64; }
-[[ -f "$binary" ]] || { echo "error: converter binary not found: $binary" >&2; exit 66; }
 [[ -f "$source_dir/package.json" ]] || { echo "error: package.json not found" >&2; exit 66; }
 [[ -f "$source_dir/psd2ase.lua" ]] || { echo "error: psd2ase.lua not found" >&2; exit 66; }
+
+if [[ "$build_binary" -eq 1 ]]; then
+  case "$platform" in
+    linux-x64)
+      binary="$repo_root/target/release/psd2ase"
+      ;;
+    windows-x64)
+      binary="$repo_root/target/release/psd2ase.exe"
+      ;;
+  esac
+  echo "building release converter: $binary"
+  (cd "$repo_root" && cargo build --release --locked -p psd2ase)
+fi
+
+[[ -n "$binary" ]] || { echo "error: --binary is required when --no-build is used" >&2; exit 64; }
+[[ -f "$binary" ]] || { echo "error: converter binary not found: $binary" >&2; exit 66; }
 
 if [[ -z "$output" ]]; then
   output="$repo_root/dist/psd2ase-aseprite-$platform.aseprite-extension"
@@ -91,6 +114,12 @@ for candidate in python3 python; do
   fi
 done
 
+quote_powershell_literal() {
+  local value="$1"
+  value="${value//\'/\'\'}"
+  printf "'%s'" "$value"
+}
+
 if command -v zip >/dev/null 2>&1; then
   (cd "$staging" && zip -q -r "$output" .)
 elif [[ -n "$python_command" ]]; then
@@ -106,8 +135,13 @@ with ZipFile(output, "w", ZIP_DEFLATED) as archive:
         if path.is_file():
             archive.write(path, path.relative_to(staging).as_posix())
 PY
+elif command -v powershell.exe >/dev/null 2>&1 && command -v cygpath >/dev/null 2>&1; then
+  windows_staging="$(cygpath -w "$staging")"
+  windows_output="$(cygpath -w "$output")"
+  powershell_script="\$staging = $(quote_powershell_literal "$windows_staging"); \$output = $(quote_powershell_literal "$windows_output"); Compress-Archive -Path (Join-Path \$staging '*') -DestinationPath \$output -CompressionLevel Optimal -Force"
+  powershell.exe -NoLogo -NoProfile -NonInteractive -Command "$powershell_script"
 else
-  echo "error: install zip or Python 3 to create the extension archive" >&2
+  echo "error: install zip, Python 3, or PowerShell to create the extension archive" >&2
   exit 69
 fi
 

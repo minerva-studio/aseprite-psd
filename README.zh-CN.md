@@ -30,6 +30,16 @@ Save As 选择最终 `.aseprite` 路径；Aseprite 会默认建议 PSD 所在目
 cargo build --release --locked -p psd2ase
 ```
 
+也可以一条命令构建 Windows x64 Aseprite 扩展；脚本会先构建 release
+converter，再把它嵌入扩展包：
+
+```text
+bash tools/package-aseprite-extension.sh --platform windows-x64
+```
+
+产物写入 `dist/psd2ase-aseprite-windows-x64.aseprite-extension`。如果
+converter 已经在其他位置构建完成，可改用 `--binary PATH --no-build`。
+
 只检查 PSD，不写输出文件：
 
 ```text
@@ -41,6 +51,7 @@ psd2ase inspect INPUT.psd
 ```text
 psd2ase convert INPUT.psd -o OUTPUT.aseprite
 psd2ase convert INPUT.psd -o OUTPUT.aseprite --overwrite
+psd2ase convert INPUT.psd -o OUTPUT.aseprite --layer-association auto --linked-cels identical
 ```
 
 使用 `psd2ase --help` 查看完整命令格式。
@@ -56,6 +67,12 @@ psd2ase convert INPUT.psd -o OUTPUT.aseprite --overwrite
   顺序，使用 `strict` 可在证据无法确定时拒绝转换。
 - `--z-order auto` 启用实验性的逐 cel Z-Index，并且必须配合自动关联。
   conservative 模式还可使用 `--uncertain-layers flat` 禁用候选 Folder。
+
+`--linked-cels identical` 会在自动关联生成的同一个输出图层内无损复用完全
+相同的 RGBA 像素缓冲；位置、透明度和逐 cel Z-Index 仍按帧保留。默认值为
+`off`，只有尺寸和字节都完全一致时才会建立链接。它要求同时使用
+`--layer-association auto`，因为 `preserve` 会独立输出每个源图层，没有跨图层
+cel 复用候选。
 
 ## 当前边界
 

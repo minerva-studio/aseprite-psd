@@ -4,17 +4,18 @@ use std::process::ExitCode;
 
 use psd2ase_core::{
     AssociationDecisionStatus, AssociationStrategy, AutoAssociationOptions, ConvertOptions,
-    LayerAssociation, LayerZOrderMode, StableOrderMode, UncertainLayerMode, VERSION, convert,
-    inspect,
+    LayerAssociation, LayerZOrderMode, LinkedCelMode, StableOrderMode, UncertainLayerMode, VERSION,
+    convert, inspect,
 };
 
-const CONVERT_USAGE: &str = "usage: psd2ase convert INPUT [-o OUTPUT] [--overwrite] [--layer-association preserve|auto] [--association-strategy compact|conservative] [--z-order stable|auto] [--stable-order consensus|anchor|strict] [--uncertain-layers group|flat]";
+const CONVERT_USAGE: &str = "usage: psd2ase convert INPUT [-o OUTPUT] [--overwrite] [--linked-cels off|identical] [--layer-association preserve|auto] [--association-strategy compact|conservative] [--z-order stable|auto] [--stable-order consensus|anchor|strict] [--uncertain-layers group|flat]";
 
 #[derive(Debug, PartialEq, Eq)]
 struct ConvertCommand {
     input: PathBuf,
     output: PathBuf,
     overwrite: bool,
+    linked_cels: LinkedCelMode,
     layer_association: LayerAssociation,
 }
 
@@ -65,11 +66,16 @@ fn run_convert(arguments: &[String]) -> Result<(), CliError> {
         &command.output,
         &ConvertOptions {
             overwrite: command.overwrite,
+            linked_cels: command.linked_cels,
             layer_association: command.layer_association,
         },
     )
     .map_err(|error| CliError::Conversion(error.to_string()))?;
     println!("wrote {}", report.output.display());
+    println!(
+        "cel reuse: {} pixel cels, {} linked cels",
+        report.cel_reuse.pixel_cel_count, report.cel_reuse.linked_cel_count
+    );
     for warning in report.warnings {
         println!("warning: {warning}");
     }
@@ -199,6 +205,7 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
     let mut input = None;
     let mut output = None;
     let mut overwrite = false;
+    let mut linked_cels = LinkedCelMode::Off;
     let mut automatic = false;
     let mut conservative = false;
     let mut association_strategy_explicit = false;
@@ -211,6 +218,21 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
     while index < arguments.len() {
         match arguments[index].as_str() {
             "--overwrite" => overwrite = true,
+            "--linked-cels" => {
+                index += 1;
+                let value = arguments
+                    .get(index)
+                    .ok_or_else(|| CliError::Usage(CONVERT_USAGE.to_string()))?;
+                linked_cels = match value.as_str() {
+                    "off" => LinkedCelMode::Off,
+                    "identical" => LinkedCelMode::Identical,
+                    _ => {
+                        return Err(CliError::Usage(format!(
+                            "invalid --linked-cels value: {value:?}"
+                        )));
+                    }
+                };
+            }
             "--layer-association" => {
                 index += 1;
                 let value = arguments
@@ -331,6 +353,11 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
             "--association-strategy requires --layer-association auto".to_string(),
         ));
     }
+    if !automatic && linked_cels == LinkedCelMode::Identical {
+        return Err(CliError::Usage(
+            "--linked-cels identical requires --layer-association auto".to_string(),
+        ));
+    }
     if !conservative && uncertain_layers_explicit {
         return Err(CliError::Usage(
             "--uncertain-layers requires --association-strategy conservative".to_string(),
@@ -354,6 +381,7 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
         input,
         output,
         overwrite,
+        linked_cels,
         layer_association,
     })
 }

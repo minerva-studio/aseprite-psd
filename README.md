@@ -34,6 +34,16 @@ Build the native CLI with Rust 1.88 or newer:
 cargo build --release --locked -p psd2ase
 ```
 
+Build the Windows x64 Aseprite extension in one step (the script builds the
+release converter and embeds it in the package):
+
+```text
+bash tools/package-aseprite-extension.sh --platform windows-x64
+```
+
+The package is written to `dist/psd2ase-aseprite-windows-x64.aseprite-extension`.
+Pass `--binary PATH --no-build` when packaging a converter built elsewhere.
+
 Inspect a PSD without writing output:
 
 ```text
@@ -46,6 +56,7 @@ specified:
 ```text
 psd2ase convert INPUT.psd -o OUTPUT.aseprite
 psd2ase convert INPUT.psd -o OUTPUT.aseprite --overwrite
+psd2ase convert INPUT.psd -o OUTPUT.aseprite --layer-association auto --linked-cels identical
 ```
 
 Run `psd2ase --help` for the complete command syntax.
@@ -65,6 +76,13 @@ Run `psd2ase --help` for the complete command syntax.
 - `--z-order auto` enables experimental per-cel Z-Index changes and requires
   automatic association. Conservative mode also accepts
   `--uncertain-layers flat` to disable candidate folders.
+
+`--linked-cels identical` enables lossless reuse of equal RGBA pixel buffers on
+the same automatically associated output layer. Positions, opacity, and
+per-cel Z-Index remain frame-local. The default is `off`; only exact
+size-and-byte matches are linked. It requires `--layer-association auto` because
+`preserve` emits each source layer independently and has no cross-layer cel
+reuse candidates.
 
 ## Current boundaries
 

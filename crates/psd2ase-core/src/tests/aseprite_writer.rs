@@ -116,6 +116,174 @@ fn does_not_reuse_cels_between_frames() {
 }
 
 #[test]
+fn links_identical_pixels_on_one_layer_and_reports_reuse() {
+    let mut document = pixel_document(8, 8, 0, 0);
+    document.frames.push(NormalizedFrame {
+        index: 1,
+        source_id: Some(2),
+        duration_ms: Some(120),
+        dispose: None,
+    });
+    document.frames.push(NormalizedFrame {
+        index: 2,
+        source_id: Some(3),
+        duration_ms: Some(120),
+        dispose: None,
+    });
+    document.root_layers[0]
+        .frame_states
+        .push(NormalizedLayerFrameState {
+            frame_index: 1,
+            record_present: true,
+            enabled: true,
+            explicit_enable: true,
+            offset: None,
+            reference_point: None,
+            opacity: None,
+        });
+    document.root_layers[0]
+        .frame_states
+        .push(NormalizedLayerFrameState {
+            frame_index: 2,
+            record_present: true,
+            enabled: true,
+            explicit_enable: true,
+            offset: None,
+            reference_point: None,
+            opacity: None,
+        });
+
+    let encoded = encode_with_linked_cels(&document, crate::LinkedCelMode::Identical)
+        .expect("identical pixels should encode");
+    assert_eq!(encoded.cel_reuse.pixel_cel_count, 1);
+    assert_eq!(encoded.cel_reuse.linked_cel_count, 2);
+    let file = AsepriteFile::from_reader(&encoded.bytes[..]).expect("valid Aseprite bytes");
+    let layer = file.layer_ref(0).expect("pixel layer");
+    assert!(matches!(
+        &file.cel(layer, 0).unwrap().kind,
+        aseprite::CelKind::Raw { .. }
+    ));
+    assert!(matches!(
+        &file.cel(layer, 1).unwrap().kind,
+        aseprite::CelKind::Linked {
+            source_frame: 0,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &file.cel(layer, 2).unwrap().kind,
+        aseprite::CelKind::Linked {
+            source_frame: 0,
+            ..
+        }
+    ));
+    assert_eq!(
+        &file.resolve_cel(layer, 1).unwrap().kind,
+        &file.cel(layer, 0).unwrap().kind
+    );
+}
+
+#[test]
+fn linked_cel_keeps_frame_specific_attributes() {
+    let mut document = pixel_document(8, 8, 0, 0);
+    document.frames.push(NormalizedFrame {
+        index: 1,
+        source_id: Some(2),
+        duration_ms: Some(120),
+        dispose: None,
+    });
+    document.root_layers[0]
+        .frame_states
+        .push(NormalizedLayerFrameState {
+            frame_index: 1,
+            record_present: true,
+            enabled: true,
+            explicit_enable: true,
+            offset: Some(AnimationPoint { x: 4.0, y: 3.0 }),
+            reference_point: None,
+            opacity: Some(0.5),
+        });
+
+    let encoded = encode_with_linked_cels(&document, crate::LinkedCelMode::Identical)
+        .expect("identical pixels should encode");
+    let file = AsepriteFile::from_reader(&encoded.bytes[..]).expect("valid Aseprite bytes");
+    let layer = file.layer_ref(0).expect("pixel layer");
+    let cel = file.cel(layer, 1).expect("linked cel");
+    assert_eq!(cel.opacity, 128);
+    assert!(matches!(
+        &cel.kind,
+        aseprite::CelKind::Linked { x: 4, y: 3, .. }
+    ));
+}
+
+#[test]
+fn off_mode_keeps_identical_pixels_independent() {
+    let mut document = pixel_document(8, 8, 0, 0);
+    document.frames.push(NormalizedFrame {
+        index: 1,
+        source_id: Some(2),
+        duration_ms: Some(120),
+        dispose: None,
+    });
+    document.root_layers[0]
+        .frame_states
+        .push(NormalizedLayerFrameState {
+            frame_index: 1,
+            record_present: true,
+            enabled: true,
+            explicit_enable: true,
+            offset: None,
+            reference_point: None,
+            opacity: None,
+        });
+
+    let encoded = encode(&document).expect("default mode should encode");
+    assert_eq!(encoded.cel_reuse.pixel_cel_count, 2);
+    assert_eq!(encoded.cel_reuse.linked_cel_count, 0);
+}
+
+#[test]
+fn different_pixels_are_not_linked() {
+    let mut file = AsepriteFile::new(8, 8, ColorMode::Rgba);
+    let layer = file.add_layer("pixel");
+    file.add_frame(100);
+    file.add_frame(100);
+    let mut reuse = CelReuseTracker::new(crate::LinkedCelMode::Identical);
+    let first = Pixels::new(vec![1, 2, 3, 4], 1, 1, ColorMode::Rgba).unwrap();
+    let second = Pixels::new(vec![9, 2, 3, 4], 1, 1, ColorMode::Rgba).unwrap();
+    emit_cel(
+        &mut file,
+        layer,
+        0,
+        PreparedCel {
+            pixels: first,
+            x: 0,
+            y: 0,
+            opacity: 255,
+            z_index: 0,
+        },
+        &mut reuse,
+    )
+    .unwrap();
+    emit_cel(
+        &mut file,
+        layer,
+        1,
+        PreparedCel {
+            pixels: second,
+            x: 0,
+            y: 0,
+            opacity: 255,
+            z_index: 0,
+        },
+        &mut reuse,
+    )
+    .unwrap();
+    assert_eq!(reuse.report.pixel_cel_count, 2);
+    assert_eq!(reuse.report.linked_cel_count, 0);
+}
+
+#[test]
 fn applies_frame_offset_to_cel_origin() {
     let mut document = pixel_document(8, 8, 14, 51);
     document.root_layers[0].frame_states[0].offset = Some(AnimationPoint { x: 6.0, y: 2.0 });

@@ -391,6 +391,36 @@ fn family_association_matches_copy_variants_across_multiple_frames() {
 }
 
 #[test]
+fn auto_association_writes_one_layer_with_linked_frame_cels() {
+    let document = three_frame_document(vec![
+        three_frame_family_layer(1, "前翅膀", 0, [1, 2, 3, 255]),
+        three_frame_family_layer(2, "前翅膀 拷贝 2", 1, [1, 2, 3, 255]),
+        three_frame_family_layer(3, "前翅膀 拷贝 5", 2, [1, 2, 3, 255]),
+    ]);
+    let plan = build_layer_write_plan(&document).expect("association should succeed");
+    assert_eq!(plan.tracks.len(), 1);
+
+    let encoded = crate::aseprite_writer::encode_with_plan_and_linked_cels(
+        &document,
+        &plan,
+        crate::LinkedCelMode::Identical,
+    )
+    .expect("planned output should encode");
+    assert_eq!(encoded.cel_reuse.pixel_cel_count, 1);
+    assert_eq!(encoded.cel_reuse.linked_cel_count, 2);
+    let file = aseprite::AsepriteFile::from_reader(&encoded.bytes[..]).expect("valid Aseprite");
+    assert_eq!(file.layers().len(), 1);
+    let layer = file.layer_ref(0).expect("logical layer");
+    assert!(matches!(
+        &file.cel(layer, 1).unwrap().kind,
+        aseprite::CelKind::Linked {
+            source_frame: 0,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn family_association_keeps_same_frame_instances_on_separate_tracks() {
     let plan = build_layer_write_plan(&document(vec![
         pixel(1, "wing", 0, [1, 2, 3, 255]),

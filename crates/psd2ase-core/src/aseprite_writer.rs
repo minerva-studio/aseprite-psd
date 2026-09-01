@@ -1,8 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use aseprite::{
     AsepriteFile, BlendMode, CelOptions, ColorMode, GroupRef, LayerOptions, LayerRef,
-    LoopDirection, Pixels,
+    LinkedCelOptions, LoopDirection, Pixels,
 };
 
 use crate::{
@@ -21,6 +21,17 @@ pub struct EncodedAseprite {
     pub bytes: Vec<u8>,
     /// Non-fatal compatibility warnings collected during mapping.
     pub warnings: Vec<String>,
+    /// Counts of ordinary and linked cels emitted by the serializer.
+    pub cel_reuse: CelReuseReport,
+}
+
+/// Summarizes identical-pixel cel reuse performed by the serializer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CelReuseReport {
+    /// Number of cels containing their own pixel data.
+    pub pixel_cel_count: usize,
+    /// Number of cels linked to an earlier cel on the same layer.
+    pub linked_cel_count: usize,
 }
 
 /// Errors raised while mapping the normalized model to Aseprite.
@@ -115,6 +126,14 @@ fn initialize_file(
 
 /// Encodes one normalized document as an RGBA Aseprite file.
 pub fn encode(document: &NormalizedDocument) -> Result<EncodedAseprite, WriterError> {
+    encode_with_linked_cels(document, crate::LinkedCelMode::Off)
+}
+
+/// Encodes one normalized document with the selected linked-cel policy.
+pub fn encode_with_linked_cels(
+    document: &NormalizedDocument,
+    linked_cels: crate::LinkedCelMode,
+) -> Result<EncodedAseprite, WriterError> {
     let (mut file, mut warnings) = initialize_file(document)?;
 
     let mut bindings = Vec::new();
@@ -122,6 +141,9 @@ pub fn encode(document: &NormalizedDocument) -> Result<EncodedAseprite, WriterEr
         create_layer_tree(&mut file, layer, None, &mut bindings, &mut warnings)?;
     }
 
+    let mut reuse = (0..bindings.len())
+        .map(|_| CelReuseTracker::new(linked_cels))
+        .collect::<Vec<_>>();
     for frame in &document.frames {
         let frame_index = frame.index as usize;
         let mut visible_ids = Vec::new();
@@ -129,7 +151,7 @@ pub fn encode(document: &NormalizedDocument) -> Result<EncodedAseprite, WriterEr
             layer.collect_visible_pixel_layer_ids(frame_index, true, &mut visible_ids);
         }
         let visible_ids = visible_ids.into_iter().collect::<HashSet<_>>();
-        for binding in &bindings {
+        for (binding_index, binding) in bindings.iter().enumerate() {
             if !visible_ids.contains(&binding.layer.id) {
                 continue;
             }
@@ -150,42 +172,52 @@ pub fn encode(document: &NormalizedDocument) -> Result<EncodedAseprite, WriterEr
                 format!("layer {} frame {frame_index}", binding.layer.id),
                 &mut warnings,
             )?;
-            if opacity == 255 {
-                file.set_raw_cel(
-                    binding.handle,
-                    frame_index,
-                    ase_pixels,
-                    position.0,
-                    position.1,
-                )
-                .map_err(|error| WriterError::Aseprite(error.to_string()))?;
-            } else {
-                file.set_cel_with(
-                    binding.handle,
-                    frame_index,
-                    CelOptions {
-                        pixels: ase_pixels,
-                        x: position.0,
-                        y: position.1,
-                        opacity,
-                        z_index: 0,
-                    },
-                )
-                .map_err(|error| WriterError::Aseprite(error.to_string()))?;
-            }
+            emit_cel(
+                &mut file,
+                binding.handle,
+                frame_index,
+                PreparedCel {
+                    pixels: ase_pixels,
+                    x: position.0,
+                    y: position.1,
+                    opacity,
+                    z_index: 0,
+                },
+                &mut reuse[binding_index],
+            )?;
         }
     }
 
     let mut bytes = Vec::new();
     file.write_to(&mut bytes)
         .map_err(|error| WriterError::Aseprite(error.to_string()))?;
-    Ok(EncodedAseprite { bytes, warnings })
+    Ok(EncodedAseprite {
+        bytes,
+        warnings,
+        cel_reuse: reuse.into_iter().map(|tracker| tracker.report).fold(
+            CelReuseReport::default(),
+            |mut total, report| {
+                total.pixel_cel_count += report.pixel_cel_count;
+                total.linked_cel_count += report.linked_cel_count;
+                total
+            },
+        ),
+    })
 }
 
 /// Encodes a normalized document using an experimental logical-layer plan.
 pub fn encode_with_plan(
     document: &NormalizedDocument,
     plan: &LayerWritePlan,
+) -> Result<EncodedAseprite, WriterError> {
+    encode_with_plan_and_linked_cels(document, plan, crate::LinkedCelMode::Off)
+}
+
+/// Encodes a logical-layer plan with the selected linked-cel policy.
+pub fn encode_with_plan_and_linked_cels(
+    document: &NormalizedDocument,
+    plan: &LayerWritePlan,
+    linked_cels: crate::LinkedCelMode,
 ) -> Result<EncodedAseprite, WriterError> {
     let (mut file, mut warnings) = initialize_file(document)?;
 
@@ -201,8 +233,11 @@ pub fn encode_with_plan(
             &mut warnings,
         )?;
     }
+    let mut reuse = (0..bindings.len())
+        .map(|_| CelReuseTracker::new(linked_cels))
+        .collect::<Vec<_>>();
     for frame_index in 0..document.frames.len() {
-        for binding in &bindings {
+        for (binding_index, binding) in bindings.iter().enumerate() {
             let Some(planned_cel) = binding.track.cels[frame_index] else {
                 continue;
             };
@@ -233,36 +268,173 @@ pub fn encode_with_plan(
                 format!("layer {} frame {frame_index}", source.id),
                 &mut warnings,
             )?;
-            if opacity == 255 && planned_cel.z_index == 0 {
-                file.set_raw_cel(
-                    binding.handle,
-                    frame_index,
-                    ase_pixels,
-                    position.0,
-                    position.1,
-                )
-                .map_err(|error| WriterError::Aseprite(error.to_string()))?;
-            } else {
-                file.set_cel_with(
-                    binding.handle,
-                    frame_index,
-                    CelOptions {
-                        pixels: ase_pixels,
-                        x: position.0,
-                        y: position.1,
-                        opacity,
-                        z_index: planned_cel.z_index,
-                    },
-                )
-                .map_err(|error| WriterError::Aseprite(error.to_string()))?;
-            }
+            emit_cel(
+                &mut file,
+                binding.handle,
+                frame_index,
+                PreparedCel {
+                    pixels: ase_pixels,
+                    x: position.0,
+                    y: position.1,
+                    opacity,
+                    z_index: planned_cel.z_index,
+                },
+                &mut reuse[binding_index],
+            )?;
         }
     }
 
     let mut bytes = Vec::new();
     file.write_to(&mut bytes)
         .map_err(|error| WriterError::Aseprite(error.to_string()))?;
-    Ok(EncodedAseprite { bytes, warnings })
+    Ok(EncodedAseprite {
+        bytes,
+        warnings,
+        cel_reuse: reuse.into_iter().map(|tracker| tracker.report).fold(
+            CelReuseReport::default(),
+            |mut total, report| {
+                total.pixel_cel_count += report.pixel_cel_count;
+                total.linked_cel_count += report.linked_cel_count;
+                total
+            },
+        ),
+    })
+}
+
+/// Input attributes needed to emit one ordinary or linked cel.
+struct PreparedCel {
+    pixels: Pixels,
+    x: i16,
+    y: i16,
+    opacity: u8,
+    z_index: i16,
+}
+
+/// Identifies pixel data before the full byte comparison confirms a match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PixelFingerprint {
+    width: u16,
+    height: u16,
+    hash: u64,
+}
+
+/// A prior ordinary cel that can be used as a linked-cel source.
+struct ReusableCel {
+    source_frame: usize,
+    width: u16,
+    height: u16,
+    rgba: Vec<u8>,
+}
+
+/// Tracks reusable ordinary cels independently for one output layer.
+struct CelReuseTracker {
+    mode: crate::LinkedCelMode,
+    sources: HashMap<PixelFingerprint, Vec<ReusableCel>>,
+    report: CelReuseReport,
+}
+
+impl CelReuseTracker {
+    /// Creates an empty tracker for one output layer.
+    fn new(mode: crate::LinkedCelMode) -> Self {
+        Self {
+            mode,
+            sources: HashMap::new(),
+            report: CelReuseReport::default(),
+        }
+    }
+}
+
+/// Describes how one cel was stored.
+enum CelEmission {
+    Pixel,
+    Linked,
+}
+
+/// Emits one cel and optionally links it to the first identical ordinary cel.
+fn emit_cel(
+    file: &mut AsepriteFile,
+    layer: LayerRef,
+    frame: usize,
+    cel: PreparedCel,
+    reuse: &mut CelReuseTracker,
+) -> Result<CelEmission, WriterError> {
+    let width = cel.pixels.width;
+    let height = cel.pixels.height;
+    let fingerprint = PixelFingerprint {
+        width,
+        height,
+        hash: fnv1a(&cel.pixels.data),
+    };
+    if reuse.mode == crate::LinkedCelMode::Identical
+        && let Some(source) = reuse.sources.get(&fingerprint).and_then(|sources| {
+            sources.iter().find(|source| {
+                source.width == width && source.height == height && source.rgba == cel.pixels.data
+            })
+        })
+    {
+        let source_frame = source.source_frame;
+        file.set_linked_cel_with(
+            layer,
+            frame,
+            source_frame,
+            LinkedCelOptions {
+                x: cel.x,
+                y: cel.y,
+                opacity: cel.opacity,
+                z_index: cel.z_index,
+                ..Default::default()
+            },
+        )
+        .map_err(|error| WriterError::Aseprite(error.to_string()))?;
+        reuse.report.linked_cel_count += 1;
+        return Ok(CelEmission::Linked);
+    }
+
+    if cel.opacity == 255 && cel.z_index == 0 {
+        file.set_raw_cel(layer, frame, cel.pixels, cel.x, cel.y)
+            .map_err(|error| WriterError::Aseprite(error.to_string()))?;
+    } else {
+        file.set_cel_with(
+            layer,
+            frame,
+            CelOptions {
+                pixels: cel.pixels,
+                x: cel.x,
+                y: cel.y,
+                opacity: cel.opacity,
+                z_index: cel.z_index,
+            },
+        )
+        .map_err(|error| WriterError::Aseprite(error.to_string()))?;
+    }
+    reuse.report.pixel_cel_count += 1;
+    if reuse.mode == crate::LinkedCelMode::Identical {
+        reuse
+            .sources
+            .entry(fingerprint)
+            .or_default()
+            .push(ReusableCel {
+                source_frame: frame,
+                width,
+                height,
+                rgba: file
+                    .resolve_cel(layer, frame)
+                    .and_then(|cel| match &cel.kind {
+                        aseprite::CelKind::Raw { pixels, .. }
+                        | aseprite::CelKind::Compressed { pixels, .. } => Some(pixels.data.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+            });
+    }
+    Ok(CelEmission::Pixel)
+}
+
+/// Computes a deterministic FNV-1a hash for a pixel buffer.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
 }
 
 /// Associates every normalized pixel layer with its newly-created Aseprite layer.

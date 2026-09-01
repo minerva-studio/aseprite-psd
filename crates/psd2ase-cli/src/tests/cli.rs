@@ -10,7 +10,41 @@ fn extension_preserve_arguments_use_the_preserve_configuration() {
         .expect("extension preserve arguments should parse");
 
     assert_eq!(command.layer_association, LayerAssociation::Preserve);
+    assert_eq!(command.linked_cels, LinkedCelMode::Off);
     assert_eq!(command.output, PathBuf::from("output.aseprite"));
+}
+
+#[test]
+fn identical_linked_cels_option_requires_automatic_association() {
+    let command = convert_arguments(&arguments(&[
+        "input.psd",
+        "--linked-cels",
+        "identical",
+        "--layer-association",
+        "auto",
+    ]))
+    .expect("linked-cel option should parse with automatic association");
+
+    assert_eq!(command.linked_cels, LinkedCelMode::Identical);
+    assert!(matches!(
+        command.layer_association,
+        LayerAssociation::Auto(_)
+    ));
+
+    let error = convert_arguments(&arguments(&["input.psd", "--linked-cels", "identical"]))
+        .expect_err("linked-cel option must reject preserve association");
+    assert_eq!(
+        error.to_string(),
+        "--linked-cels identical requires --layer-association auto"
+    );
+    assert_eq!(error.exit_code(), 64);
+
+    let error = convert_arguments(&arguments(&["input.psd", "--linked-cels", "unknown"]))
+        .expect_err("unknown linked-cel mode must be rejected");
+    assert_eq!(
+        error.to_string(),
+        "invalid --linked-cels value: \"unknown\""
+    );
 }
 
 #[test]

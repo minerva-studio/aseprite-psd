@@ -11,7 +11,9 @@ pub mod logical_layers;
 mod model;
 pub mod photoshop_animation;
 
-pub use aseprite_writer::{DEFAULT_FRAME_DURATION_MS, EncodedAseprite, WriterError};
+pub use aseprite_writer::{
+    CelReuseReport, DEFAULT_FRAME_DURATION_MS, EncodedAseprite, WriterError,
+};
 pub use error::{ConversionError, InspectionError};
 pub use layer_names::{
     COPY_SUFFIX_CATALOG_VERSION, CopySuffixCatalog, CopySuffixKind, CopySuffixMatch,
@@ -50,6 +52,18 @@ pub struct ConvertOptions {
     pub overwrite: bool,
     /// Selects source-preserving output or a valid automatic association configuration.
     pub layer_association: LayerAssociation,
+    /// Selects whether identical pixel cels may share Aseprite storage.
+    pub linked_cels: LinkedCelMode,
+}
+
+/// Selects whether identical cels are emitted as links to an earlier cel.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LinkedCelMode {
+    /// Store every visible cel with its own pixel data.
+    #[default]
+    Off,
+    /// Link exact RGBA/size matches within each output layer.
+    Identical,
 }
 
 /// Summary produced after a conversion has committed its output.
@@ -63,6 +77,8 @@ pub struct ConversionReport {
     pub warnings: Vec<String>,
     /// Automatic layer-association diagnostics, when auto mode was selected.
     pub association: Option<AssociationReport>,
+    /// Counts of ordinary and linked cels in the committed output.
+    pub cel_reuse: CelReuseReport,
 }
 
 /// Reads PSD structure metadata without creating an output file.
@@ -485,8 +501,10 @@ pub fn convert(
     };
     let association = plan.as_ref().map(|plan| plan.report.clone());
     let mut encoded = match plan.as_ref() {
-        None => aseprite_writer::encode(&document),
-        Some(plan) => aseprite_writer::encode_with_plan(&document, plan),
+        None => aseprite_writer::encode_with_linked_cels(&document, options.linked_cels),
+        Some(plan) => {
+            aseprite_writer::encode_with_plan_and_linked_cels(&document, plan, options.linked_cels)
+        }
     }
     .map_err(|error| ConversionError::Writer(error.to_string()))?;
     encoded.warnings.insert(
@@ -494,8 +512,10 @@ pub fn convert(
         "coordinate policy: provisional pixels.left/top plus frame offset cel origin".to_string(),
     );
     match plan.as_ref() {
-        None => validate_aseprite_output(&encoded.bytes, &document)?,
-        Some(plan) => validate_planned_aseprite_output(&encoded.bytes, &document, plan)?,
+        None => validate_aseprite_output(&encoded.bytes, &document, options.linked_cels)?,
+        Some(plan) => {
+            validate_planned_aseprite_output(&encoded.bytes, &document, plan, options.linked_cels)?
+        }
     }
     commit_output(output, &encoded.bytes, options.overwrite)?;
 
@@ -504,6 +524,7 @@ pub fn convert(
         output: output.to_path_buf(),
         warnings: encoded.warnings,
         association,
+        cel_reuse: encoded.cel_reuse,
     })
 }
 
@@ -547,6 +568,7 @@ fn validate_planned_aseprite_output(
     bytes: &[u8],
     document: &NormalizedDocument,
     plan: &LayerWritePlan,
+    linked_cels: LinkedCelMode,
 ) -> Result<(), ConversionError> {
     let file = read_and_validate_output_header(bytes, document)?;
 
@@ -611,7 +633,14 @@ fn validate_planned_aseprite_output(
                                         expected.source_layer_id
                                     ))
                                 })?;
-                        validate_cel(actual, source, frame_index)?;
+                        validate_cel(
+                            &file,
+                            output_handle,
+                            actual,
+                            source,
+                            frame_index,
+                            linked_cels,
+                        )?;
                         if actual.z_index != expected.z_index {
                             return Err(ConversionError::OutputValidation(format!(
                                 "logical track {track_id} frame {frame_index} z-index differs"
@@ -644,6 +673,7 @@ fn flatten_planned_nodes<'a>(
 fn validate_aseprite_output(
     bytes: &[u8],
     document: &NormalizedDocument,
+    linked_cels: LinkedCelMode,
 ) -> Result<(), ConversionError> {
     let file = read_and_validate_output_header(bytes, document)?;
 
@@ -699,7 +729,7 @@ fn validate_aseprite_output(
                         )));
                     }
                     if let Some(cel) = cel {
-                        validate_cel(cel, source, frame_index)?;
+                        validate_cel(&file, output_handle, cel, source, frame_index, linked_cels)?;
                     }
                 }
             }
@@ -732,9 +762,12 @@ fn is_visible_pixel(document: &NormalizedDocument, layer_id: u32, frame_index: u
 
 /// Validates one read-back cel's dimensions, position, opacity, and bytes.
 fn validate_cel(
+    file: &aseprite::AsepriteFile,
+    layer: aseprite::LayerRef,
     cel: &aseprite::Cel,
     source: &NormalizedLayer,
     frame_index: usize,
+    linked_cels: LinkedCelMode,
 ) -> Result<(), ConversionError> {
     let expected_state = source.frame_states.get(frame_index).ok_or_else(|| {
         ConversionError::OutputValidation(format!("missing source frame state {frame_index}"))
@@ -758,6 +791,49 @@ fn validate_cel(
     let (output_pixels, x, y) = match &cel.kind {
         aseprite::CelKind::Raw { pixels, x, y }
         | aseprite::CelKind::Compressed { pixels, x, y, .. } => (pixels, *x, *y),
+        aseprite::CelKind::Linked { source_frame, x, y } => {
+            if linked_cels != LinkedCelMode::Identical {
+                return Err(ConversionError::OutputValidation(format!(
+                    "layer {} frame {frame_index} unexpectedly contains a linked cel",
+                    source.id
+                )));
+            }
+            if *source_frame >= frame_index {
+                return Err(ConversionError::OutputValidation(format!(
+                    "layer {} frame {frame_index} linked cel does not point backward",
+                    source.id
+                )));
+            }
+            let source_cel = file.cel(layer, *source_frame).ok_or_else(|| {
+                ConversionError::OutputValidation(format!(
+                    "layer {} frame {frame_index} linked cel source is missing",
+                    source.id
+                ))
+            })?;
+            if matches!(source_cel.kind, aseprite::CelKind::Linked { .. }) {
+                return Err(ConversionError::OutputValidation(format!(
+                    "layer {} frame {frame_index} linked cel points to another linked cel",
+                    source.id
+                )));
+            }
+            let resolved = file.resolve_cel(layer, frame_index).ok_or_else(|| {
+                ConversionError::OutputValidation(format!(
+                    "layer {} frame {frame_index} linked cel cannot be resolved",
+                    source.id
+                ))
+            })?;
+            let output_pixels = match &resolved.kind {
+                aseprite::CelKind::Raw { pixels, .. }
+                | aseprite::CelKind::Compressed { pixels, .. } => pixels,
+                _ => {
+                    return Err(ConversionError::OutputValidation(format!(
+                        "layer {} frame {frame_index} linked cel resolves to a non-pixel cel",
+                        source.id
+                    )));
+                }
+            };
+            (output_pixels, *x, *y)
+        }
         _ => {
             return Err(ConversionError::OutputValidation(format!(
                 "layer {} frame {frame_index} is not a pixel cel",

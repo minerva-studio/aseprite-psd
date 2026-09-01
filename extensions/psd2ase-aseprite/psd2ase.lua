@@ -112,6 +112,11 @@ local function build_arguments(binary, input, output, options)
     table.insert(arguments, "--overwrite")
   end
 
+  if options.link_identical_cels and options.layer_association == "auto" then
+    table.insert(arguments, "--linked-cels")
+    table.insert(arguments, "identical")
+  end
+
   if options.layer_association == "auto" then
     table.insert(arguments, "--layer-association")
     table.insert(arguments, "auto")
@@ -233,6 +238,10 @@ local function select_import_options()
     dialog:modify{ id="association_strategy", enabled=automatic }
     dialog:modify{ id="z_order", enabled=automatic }
     dialog:modify{ id="stable_order", enabled=automatic }
+    dialog:modify{ id="link_identical_cels", enabled=automatic }
+    if not automatic and current.link_identical_cels then
+      dialog:modify{ id="link_identical_cels", selected=false }
+    end
     dialog:modify{
       id="uncertain_layers",
       enabled=automatic and current.association_strategy == "conservative",
@@ -244,6 +253,13 @@ local function select_import_options()
     option="preserve",
     options={"preserve", "auto"},
     onchange=update_option_controls,
+  }
+  dialog:check{
+    id="link_identical_cels",
+    label="Linked cels",
+    text="Link identical cels",
+    selected=false,
+    enabled=false,
   }
   dialog:combobox{
     id="association_strategy",
