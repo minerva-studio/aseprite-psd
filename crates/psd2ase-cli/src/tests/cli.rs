@@ -1,5 +1,10 @@
 use super::*;
 
+use std::fs;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use aseprite::{AsepriteFile, ColorMode as AseColorMode, Pixels};
+
 fn arguments(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_string()).collect()
 }
@@ -237,4 +242,125 @@ fn export_requires_composite_and_preserves_all_paths() {
     let error = export_arguments(&arguments(&["source.aseprite", "-o", "output.psd"]))
         .expect_err("composite snapshot is mandatory");
     assert_eq!(error.to_string(), EXPORT_USAGE);
+}
+
+#[test]
+fn export_command_writes_psd_and_psb_reports_for_unicode_paths() {
+    let directory = std::env::temp_dir().join(format!(
+        "psd2ase-cli-export-{}-导出",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&directory).expect("create export test directory");
+    let input = directory.join("源文件.aseprite");
+    let composite = directory.join("合成.aseprite");
+    write_export_snapshot(&input, &[255, 0, 0, 255]);
+    write_export_snapshot(&composite, &[255, 0, 0, 255]);
+
+    let psd = directory.join("结果.psd");
+    let psd_report = directory.join("报告.json");
+    run(vec![
+        "export".to_string(),
+        input.to_string_lossy().into_owned(),
+        "-o".to_string(),
+        psd.to_string_lossy().into_owned(),
+        "--composite".to_string(),
+        composite.to_string_lossy().into_owned(),
+        "--report".to_string(),
+        psd_report.to_string_lossy().into_owned(),
+    ])
+    .expect("CLI PSD export should succeed");
+    let psd_bytes = fs::read(&psd).expect("read PSD");
+    assert_eq!(&psd_bytes[..6], b"8BPS\0\x01");
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&psd_report).expect("read PSD report"))
+            .expect("PSD report should be JSON");
+    assert_eq!(report["schema_version"], 3);
+    assert_eq!(report["summary"]["total"], 0);
+    assert!(report["losses"].as_array().expect("loss array").is_empty());
+
+    let psb = directory.join("结果.psb");
+    run(vec![
+        "export".to_string(),
+        input.to_string_lossy().into_owned(),
+        "-o".to_string(),
+        psb.to_string_lossy().into_owned(),
+        "--composite".to_string(),
+        composite.to_string_lossy().into_owned(),
+    ])
+    .expect("CLI PSB export should succeed");
+    let psb_bytes = fs::read(&psb).expect("read PSB");
+    assert_eq!(&psb_bytes[..6], b"8BPS\0\x02");
+
+    let conflict = run(vec![
+        "export".to_string(),
+        input.to_string_lossy().into_owned(),
+        "-o".to_string(),
+        psd.to_string_lossy().into_owned(),
+        "--composite".to_string(),
+        composite.to_string_lossy().into_owned(),
+    ])
+    .expect_err("existing output should be rejected");
+    assert!(conflict.to_string().contains("already exists"));
+
+    fs::remove_dir_all(directory).expect("remove export test directory");
+}
+
+#[test]
+fn export_report_failure_keeps_verified_output() {
+    let directory = std::env::temp_dir().join(format!(
+        "psd2ase-cli-report-failure-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&directory).expect("create report failure directory");
+    let input = directory.join("source.aseprite");
+    let composite = directory.join("composite.aseprite");
+    let output = directory.join("output.psd");
+    let report_directory = directory.join("report-directory");
+    write_export_snapshot(&input, &[0, 255, 0, 255]);
+    write_export_snapshot(&composite, &[0, 255, 0, 255]);
+    fs::create_dir_all(&report_directory).expect("create report target directory");
+
+    let error = run(vec![
+        "export".to_string(),
+        input.to_string_lossy().into_owned(),
+        "-o".to_string(),
+        output.to_string_lossy().into_owned(),
+        "--composite".to_string(),
+        composite.to_string_lossy().into_owned(),
+        "--report".to_string(),
+        report_directory.to_string_lossy().into_owned(),
+    ])
+    .expect_err("report write should fail for a directory target");
+    assert!(
+        error
+            .to_string()
+            .contains("output generated, report write failed")
+    );
+    assert!(output.is_file(), "validated output must remain available");
+
+    fs::remove_dir_all(directory).expect("remove report failure directory");
+}
+
+/// Writes a minimal authentic Aseprite snapshot for CLI export integration tests.
+fn write_export_snapshot(path: &std::path::Path, rgba: &[u8; 4]) {
+    let mut file = AsepriteFile::new(1, 1, AseColorMode::Rgba);
+    let layer = file.add_layer("测试层");
+    let frame = file.add_frame(100);
+    file.set_cel(
+        layer,
+        frame,
+        Pixels::new(rgba.to_vec(), 1, 1, AseColorMode::Rgba).expect("snapshot pixels"),
+        0,
+        0,
+    )
+    .expect("snapshot cel");
+    let mut bytes = Vec::new();
+    file.write_to(&mut bytes).expect("serialize snapshot");
+    fs::write(path, bytes).expect("write snapshot");
 }

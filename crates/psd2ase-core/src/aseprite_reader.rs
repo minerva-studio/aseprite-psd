@@ -308,6 +308,20 @@ fn build_layer(
     next_id: &mut u32,
 ) -> Result<NormalizedLayer, ExportError> {
     let layer = &file.layers()[layer_index];
+    if !is_known_blend_mode(layer.blend_mode) {
+        report.add(
+            InformationLossCode::UnknownBlendMode,
+            LossDisposition::Degraded,
+            InformationLocation {
+                layer_id: Some((layer_index + 1) as u32),
+                path: layer.name.clone(),
+                frame_index: None,
+            },
+            "An Aseprite blend mode unknown to this reader was reduced to Normal",
+            true,
+            true,
+        );
+    }
     match layer.kind {
         LayerKind::Group => {
             let id = take_id(next_id);
@@ -668,6 +682,33 @@ fn blend_mode_name(mode: aseprite::BlendMode) -> String {
         _ => "normal",
     }
     .to_string()
+}
+
+/// Returns whether the current reader has an explicit PSD mapping for a blend mode.
+fn is_known_blend_mode(mode: aseprite::BlendMode) -> bool {
+    use aseprite::BlendMode;
+    matches!(
+        mode,
+        BlendMode::Normal
+            | BlendMode::Multiply
+            | BlendMode::Screen
+            | BlendMode::Overlay
+            | BlendMode::Darken
+            | BlendMode::Lighten
+            | BlendMode::ColorDodge
+            | BlendMode::ColorBurn
+            | BlendMode::HardLight
+            | BlendMode::SoftLight
+            | BlendMode::Difference
+            | BlendMode::Exclusion
+            | BlendMode::Hue
+            | BlendMode::Saturation
+            | BlendMode::Color
+            | BlendMode::Luminosity
+            | BlendMode::Addition
+            | BlendMode::Subtract
+            | BlendMode::Divide
+    )
 }
 
 /// Allocates one stable layer ID in traversal order.

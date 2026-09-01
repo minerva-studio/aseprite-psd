@@ -1,6 +1,6 @@
 //! PSD/PSB writer and read-back validator for normalized Aseprite exports.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 
@@ -84,7 +84,8 @@ pub fn export(
 
     let source =
         read_aseprite_export_with_active_frame(input, composite, options.active_frame_index)?;
-    let model = build_psd(&source.document, &source.composites)?;
+    let mut information_loss = source.information_loss;
+    let model = build_psd(&source.document, &source.composites, &mut information_loss)?;
     let write_options = WriteOptions {
         no_background: Some(true),
         psb: Some(psb),
@@ -107,13 +108,17 @@ pub fn export(
         input: input.to_path_buf(),
         composite: composite.to_path_buf(),
         output: output.to_path_buf(),
-        information_loss: source.information_loss,
+        information_loss,
         active_frame_index: source.document.active_frame_index,
     })
 }
 
 /// Builds the ag-psd document while keeping NormalizedDocument as the sole domain model.
-fn build_psd(document: &NormalizedDocument, composites: &[Vec<u8>]) -> Result<Psd, ExportError> {
+fn build_psd(
+    document: &NormalizedDocument,
+    composites: &[Vec<u8>],
+    report: &mut InformationLossReport,
+) -> Result<Psd, ExportError> {
     let composite = composites.first().ok_or_else(|| {
         ExportError::Writer("normalized export has no composite frames".to_string())
     })?;
@@ -158,7 +163,10 @@ fn build_psd(document: &NormalizedDocument, composites: &[Vec<u8>]) -> Result<Ps
             document
                 .root_layers
                 .iter()
-                .map(build_psd_layer)
+                .map(|layer| {
+                    let path = export_layer_path(None, layer);
+                    build_psd_layer(layer, &path, report)
+                })
                 .collect::<Result<Vec<_>, _>>()?,
         ),
         image_data: Some(PixelData {
@@ -183,7 +191,11 @@ fn build_psd(document: &NormalizedDocument, composites: &[Vec<u8>]) -> Result<Ps
 }
 
 /// Converts one normalized group or static cel layer into the ag-psd tree.
-fn build_psd_layer(source: &NormalizedLayer) -> Result<Layer, ExportError> {
+fn build_psd_layer(
+    source: &NormalizedLayer,
+    path: &str,
+    report: &mut InformationLossReport,
+) -> Result<Layer, ExportError> {
     let animation_frames = source
         .frame_states
         .iter()
@@ -208,6 +220,21 @@ fn build_psd_layer(source: &NormalizedLayer) -> Result<Layer, ExportError> {
         unify_layer_style: Some(false),
         unify_layer_visibility: Some(false),
     };
+    let blend_mode = psd_blend_mode(source.blend_mode.as_deref());
+    if blend_mode.1 {
+        report.add(
+            crate::InformationLossCode::UnknownBlendMode,
+            crate::LossDisposition::Degraded,
+            crate::InformationLocation {
+                layer_id: Some(source.id),
+                path: path.to_string(),
+                frame_index: None,
+            },
+            "A blend mode that is not supported by the PSD writer was written as Normal",
+            true,
+            true,
+        );
+    }
     let mut layer = Layer {
         additional_info: LayerAdditionalInfo {
             name: Some(source.name.clone()),
@@ -216,7 +243,7 @@ fn build_psd_layer(source: &NormalizedLayer) -> Result<Layer, ExportError> {
             animation_frame_flags: Some(flags),
             ..Default::default()
         },
-        blend_mode: Some(psd_blend_mode(source.blend_mode.as_deref())),
+        blend_mode: Some(blend_mode.0),
         opacity: source.opacity,
         hidden: source.hidden,
         ..Default::default()
@@ -228,7 +255,10 @@ fn build_psd_layer(source: &NormalizedLayer) -> Result<Layer, ExportError> {
                 source
                     .children
                     .iter()
-                    .map(build_psd_layer)
+                    .map(|child| {
+                        let child_path = export_layer_path(Some(path), child);
+                        build_psd_layer(child, &child_path, report)
+                    })
                     .collect::<Result<Vec<_>, _>>()?,
             );
         }
@@ -251,8 +281,9 @@ fn build_psd_layer(source: &NormalizedLayer) -> Result<Layer, ExportError> {
 }
 
 /// Maps every supported normalized/Aseprite blend spelling to ag-psd.
-fn psd_blend_mode(value: Option<&str>) -> BlendMode {
-    match value.unwrap_or("normal") {
+fn psd_blend_mode(value: Option<&str>) -> (BlendMode, bool) {
+    let value = value.unwrap_or("normal");
+    let mode = match value {
         "multiply" => BlendMode::Multiply,
         "screen" => BlendMode::Screen,
         "overlay" => BlendMode::Overlay,
@@ -272,6 +303,45 @@ fn psd_blend_mode(value: Option<&str>) -> BlendMode {
         "subtract" => BlendMode::Subtract,
         "divide" => BlendMode::Divide,
         _ => BlendMode::Normal,
+    };
+    (
+        mode,
+        !matches!(
+            value,
+            "normal"
+                | "multiply"
+                | "screen"
+                | "overlay"
+                | "darken"
+                | "lighten"
+                | "color dodge"
+                | "color burn"
+                | "hard light"
+                | "soft light"
+                | "difference"
+                | "exclusion"
+                | "hue"
+                | "saturation"
+                | "color"
+                | "luminosity"
+                | "linear dodge"
+                | "addition"
+                | "subtract"
+                | "divide"
+        ),
+    )
+}
+
+/// Builds a stable human-readable path for one exported normalized layer.
+fn export_layer_path(parent: Option<&str>, layer: &NormalizedLayer) -> String {
+    let segment = if layer.name.is_empty() {
+        "<unnamed>"
+    } else {
+        layer.name.as_str()
+    };
+    match parent {
+        Some(parent) if !parent.is_empty() => format!("{parent}/{segment}"),
+        _ => segment.to_string(),
     }
 }
 
@@ -857,12 +927,22 @@ fn validate_output(
     };
     let parsed = ag_psd::read_psd(bytes, &options)
         .map_err(|error| ExportError::OutputValidation(error.to_string()))?;
+    if !matches!(parsed.channels, Some(3.0 | 4.0))
+        || parsed.bits_per_channel != Some(8.0)
+        || parsed.color_mode != Some(ColorMode::Rgb)
+    {
+        return Err(ExportError::OutputValidation(format!(
+            "exported document is not RGBA8/RGB as required (channels={:?}, bits={:?}, mode={:?})",
+            parsed.channels, parsed.bits_per_channel, parsed.color_mode
+        )));
+    }
     if parsed.width != f64::from(expected.canvas.0) || parsed.height != f64::from(expected.canvas.1)
     {
         return Err(ExportError::OutputValidation(
             "canvas dimensions differ after ag-psd read-back".to_string(),
         ));
     }
+    validate_layer_records(bytes, expected, psb)?;
     let (normalized, _) = crate::normalize_bytes(bytes)
         .map_err(|error| ExportError::OutputValidation(error.to_string()))?;
     compare_normalized(expected, &normalized)?;
@@ -901,15 +981,66 @@ fn validate_output(
     Ok(())
 }
 
+/// Checks that the encoded layer records contain exactly one stable ID per model layer.
+fn validate_layer_records(
+    bytes: &[u8],
+    expected: &NormalizedDocument,
+    psb: bool,
+) -> Result<(), ExportError> {
+    let layout = layer_record_layout(bytes, psb)?;
+    let expected_ids = collect_layer_ids(&expected.root_layers);
+    let mut ids = BTreeSet::new();
+    let mut records_without_id = 0usize;
+    for record in layout.records {
+        let Some(id) = record.layer_id else {
+            records_without_id += 1;
+            continue;
+        };
+        if !ids.insert(id) {
+            return Err(ExportError::OutputValidation(format!(
+                "duplicate Photoshop layer ID in encoded output: {id}"
+            )));
+        }
+    }
+    if records_without_id > 1 || ids != expected_ids {
+        return Err(ExportError::OutputValidation(format!(
+            "encoded layer IDs differ: expected {:?}, got {:?} (records without ID: {records_without_id})",
+            expected_ids, ids
+        )));
+    }
+    Ok(())
+}
+
+/// Collects normalized layer IDs recursively, including groups and pixel layers.
+fn collect_layer_ids(layers: &[NormalizedLayer]) -> BTreeSet<u32> {
+    let mut ids = BTreeSet::new();
+    for layer in layers {
+        ids.insert(layer.id);
+        ids.extend(collect_layer_ids(&layer.children));
+    }
+    ids
+}
+
 /// Compares the enduring normalized contracts written into the PSD.
 fn compare_normalized(
     expected: &NormalizedDocument,
     actual: &NormalizedDocument,
 ) -> Result<(), ExportError> {
-    if expected.canvas != actual.canvas || expected.frames != actual.frames {
+    if expected.canvas != actual.canvas
+        || expected.frames != actual.frames
+        || expected.loop_mode != actual.loop_mode
+        || expected.active_frame_index != actual.active_frame_index
+    {
         return Err(ExportError::OutputValidation(format!(
-            "canvas, frame IDs, durations, or disposal differ: expected {:?} {:?}, got {:?} {:?}",
-            expected.canvas, expected.frames, actual.canvas, actual.frames
+            "canvas, frames, loop mode, or active frame differ: expected {:?} {:?} {:?} {:?}, got {:?} {:?} {:?} {:?}",
+            expected.canvas,
+            expected.frames,
+            expected.loop_mode,
+            expected.active_frame_index,
+            actual.canvas,
+            actual.frames,
+            actual.loop_mode,
+            actual.active_frame_index,
         )));
     }
     compare_layers(&expected.root_layers, &actual.root_layers)
@@ -930,6 +1061,9 @@ fn compare_layers(
             || expected.name != actual.name
             || expected.kind != actual.kind
             || expected.bounds != actual.bounds
+            || !same_optional_float(expected.opacity, actual.opacity)
+            || expected.blend_mode != actual.blend_mode
+            || expected.hidden != actual.hidden
             || expected.pixels != actual.pixels
             || expected.frame_states.len() != actual.frame_states.len()
         {
@@ -943,6 +1077,10 @@ fn compare_layers(
             if expected_state.frame_index != actual_state.frame_index
                 || expected_state.enabled != actual_state.enabled
                 || expected_state.offset != actual_state.offset
+                || !same_optional_point(
+                    expected_state.reference_point,
+                    actual_state.reference_point,
+                )
                 || !same_optional_float(expected_state.opacity, actual_state.opacity)
             {
                 return Err(ExportError::OutputValidation(format!(
@@ -961,6 +1099,20 @@ fn same_optional_float(left: Option<f64>, right: Option<f64>) -> bool {
     match (left, right) {
         (None, None) => true,
         (Some(left), Some(right)) => (left - right).abs() < 1e-9,
+        _ => false,
+    }
+}
+
+/// Compares optional animation points with descriptor-level float tolerance.
+fn same_optional_point(
+    left: Option<crate::AnimationPoint>,
+    right: Option<crate::AnimationPoint>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            (left.x - right.x).abs() < 1e-9 && (left.y - right.y).abs() < 1e-9
+        }
         _ => false,
     }
 }
@@ -1065,7 +1217,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use aseprite::{
-        AsepriteFile, ColorMode as AseColorMode, Pixels, Tileset, TilesetData, TilesetFlags,
+        AsepriteFile, BlendMode as AseBlendMode, ColorMode as AseColorMode, LayerOptions, Pixels,
+        Tileset, TilesetData, TilesetFlags,
     };
 
     #[test]
@@ -1086,7 +1239,14 @@ mod tests {
         let psb_output = directory.join("output.psb");
 
         let mut source = AsepriteFile::new(2, 1, AseColorMode::Rgba);
-        let layer = source.add_layer("动画层");
+        let layer = source.add_layer_with(
+            "动画层",
+            LayerOptions {
+                opacity: 200,
+                blend_mode: AseBlendMode::Multiply,
+                ..Default::default()
+            },
+        );
         let first = source.add_frame(120);
         let second = source.add_frame(80);
         let third = source.add_frame(60);
@@ -1111,7 +1271,13 @@ mod tests {
         source
             .set_linked_cel(layer, third, first)
             .expect("linked third cel");
-        source.add_layer("Empty Pixel Layer");
+        source.add_layer_with(
+            "Empty Pixel Layer",
+            LayerOptions {
+                visible: false,
+                ..Default::default()
+            },
+        );
         write_aseprite(&input, &source);
 
         let mut flattened = AsepriteFile::new(2, 1, AseColorMode::Rgba);
@@ -1335,6 +1501,73 @@ mod tests {
             [255, 0, 0, 255].repeat(4)
         );
         fs::remove_dir_all(directory).expect("remove tilemap test directory");
+    }
+
+    #[test]
+    fn unknown_blend_mode_is_reported_when_writer_falls_back_to_normal() {
+        let document = NormalizedDocument {
+            canvas: (1, 1),
+            channels: Some(4),
+            bits_per_channel: Some(8),
+            color_mode: Some("rgba".to_string()),
+            root_layers: vec![NormalizedLayer {
+                id: 7,
+                name: "Future blend".to_string(),
+                kind: NormalizedLayerKind::Pixel,
+                bounds: crate::NormalizedBounds {
+                    left: 0,
+                    top: 0,
+                    right: 1,
+                    bottom: 1,
+                },
+                opacity: Some(0.5),
+                blend_mode: Some("future-blend".to_string()),
+                hidden: Some(false),
+                pixels: Some(crate::NormalizedPixels {
+                    width: 1,
+                    height: 1,
+                    left: 0,
+                    top: 0,
+                    data: vec![255, 0, 0, 255],
+                }),
+                children: Vec::new(),
+                frame_states: vec![crate::NormalizedLayerFrameState {
+                    frame_index: 0,
+                    record_present: true,
+                    enabled: true,
+                    explicit_enable: true,
+                    offset: None,
+                    reference_point: None,
+                    opacity: None,
+                }],
+            }],
+            frames: vec![crate::NormalizedFrame {
+                index: 0,
+                source_id: Some(1),
+                duration_ms: Some(100),
+                dispose: Some("auto".to_string()),
+            }],
+            loop_mode: None,
+            active_frame_index: None,
+            animation_resource_ids: vec![4000],
+            animation_frame_flags: None,
+        };
+        let mut report = InformationLossReport::default();
+        let psd = build_psd(&document, &[vec![255, 0, 0, 255]], &mut report)
+            .expect("future blend mode should fall back safely");
+
+        assert_eq!(
+            psd.children.as_ref().expect("layer")[0].blend_mode,
+            Some(BlendMode::Normal)
+        );
+        assert_eq!(report.entries.len(), 1);
+        let loss = &report.entries[0];
+        assert_eq!(loss.code, crate::InformationLossCode::UnknownBlendMode);
+        assert_eq!(loss.disposition, crate::LossDisposition::Degraded);
+        assert_eq!(loss.count, 1);
+        assert_eq!(loss.locations[0].path, "Future blend");
+        assert!(loss.visual_impact);
+        assert!(loss.editability_impact);
     }
 
     /// Returns the one visible cel contract for every round-tripped frame.

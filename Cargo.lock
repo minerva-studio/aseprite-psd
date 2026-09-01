@@ -140,6 +140,7 @@ dependencies = [
 name = "psd2ase"
 version = "0.1.0"
 dependencies = [
+ "aseprite-io",
  "psd2ase-core",
  "serde",
  "serde_json",
