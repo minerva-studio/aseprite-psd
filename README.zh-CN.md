@@ -107,6 +107,7 @@ cargo run -p psd2ase -- --version
 cargo run -p psd2ase -- --help
 ```
 
-解析和写入依赖为已发布的 `ag-psd` 与 `aseprite-io` crates。上游仓库和许可证
-详情记录在 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)。项目采用
+解析依赖为 Minerva 的 `ag-psd` fork（固定到已审查的 Git commit），`aseprite-io`
+仍使用已发布的 crate。上游仓库和许可证详情记录在
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)。项目采用
 [MIT License](LICENSE)。

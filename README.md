@@ -122,7 +122,7 @@ cargo run -p psd2ase -- --version
 cargo run -p psd2ase -- --help
 ```
 
-The parser and writer dependencies are the published `ag-psd` and
-`aseprite-io` crates. Upstream repositories and license details are recorded in
+The parser dependency is the Minerva fork of `ag-psd`, pinned to a reviewed Git
+commit; `aseprite-io` remains a published crate. Upstream repositories and license details are recorded in
 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md). The project is licensed
 under the [MIT License](LICENSE).

@@ -11,8 +11,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "ag-psd"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3724167d5fc19ae66b8219fb5791f6338706884b713797116dc620773bfe2260"
+source = "git+https://github.com/minerva-studio/ag-psd-rs.git?rev=3a99e89#3a99e8916485992885026591f4879f5ee1e77e3e"
 dependencies = [
  "flate2",
 ]
