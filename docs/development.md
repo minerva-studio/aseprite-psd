@@ -58,8 +58,29 @@ all unsupported mappings are reported as warnings.
 - `psd2ase-core` owns normalized document semantics, pixel ownership, and
   conversion invariants. Future PSD and Aseprite writers must use this model as
   their conversion boundary.
+- `LayerAssociation` is the conversion-policy source of truth. Preserve mode
+  carries no automatic-only settings; auto mode carries `AutoAssociationOptions`,
+  and only the conservative strategy can carry an uncertain-layer policy.
+- The logical-layer planner builds one `ObservationStore` per normalized
+  document. Source-layer names, paths, group evidence, frame-container evidence,
+  and borrowed RGBA pixels are stored once; frame observations and track history
+  refer back to that evidence instead of cloning image buffers.
+- `AssociationEngine` owns mutable tracks, decisions, family preassignments, and
+  selector evidence for one planning run. Compact and conservative association
+  remain explicit branches; the shared weighted matcher lives in
+  `logical_layers/matching.rs`, while report text is derived from decisions in
+  `logical_layers/report.rs`.
+- Layout owns persistent and candidate group identities through `GroupKey`.
+  Candidate folders never reuse a source layer ID and are validated against the
+  public planned topology before writing.
 - `psd2ase` owns argument parsing, output policy, exit codes, and presentation.
 - The parser owns PSD decoding; the writer must not reinterpret PSD descriptors.
+- `NormalizedDocument::find_layer` is the single crate-private source-layer
+  traversal used by planning, writing, and read-back validation.
+- Writer initialization owns the canvas, timeline, loop tag, and initial
+  warnings. Preserve and planned layer/cel emission stay separate because their
+  topology contracts differ. Read-back validation shares header checks but keeps
+  preserve and planned topology checks separate.
 - A conversion transaction owns temporary output until read-back validation and
   atomic commit complete.
 

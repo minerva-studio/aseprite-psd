@@ -321,7 +321,7 @@ fn parse_suffix_tail(tail: &str) -> Option<Option<u32>> {
     if tail.is_empty() {
         return Some(None);
     }
-    let digits = tail.trim_start_matches(|character| matches!(character, '-' | '_' | '.'));
+    let digits = tail.trim_start_matches(['-', '_', '.']);
     let digits = digits.strip_prefix('#').unwrap_or(digits).trim();
     if digits.is_empty() || !digits.chars().all(|character| character.is_ascii_digit()) {
         return None;

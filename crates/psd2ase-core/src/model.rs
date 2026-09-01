@@ -38,6 +38,25 @@ pub struct NormalizedDocument {
     pub animation_frame_flags: Option<crate::AnimationFlags>,
 }
 
+impl NormalizedDocument {
+    /// Finds a normalized layer by its stable source identifier.
+    pub(crate) fn find_layer(&self, id: u32) -> Option<&NormalizedLayer> {
+        find_layer_in(&self.root_layers, id)
+    }
+}
+
+fn find_layer_in(layers: &[NormalizedLayer], id: u32) -> Option<&NormalizedLayer> {
+    for layer in layers {
+        if layer.id == id {
+            return Some(layer);
+        }
+        if let Some(found) = find_layer_in(&layer.children, id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 /// A normalized PSD group or pixel layer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NormalizedLayer {

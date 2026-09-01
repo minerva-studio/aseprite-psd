@@ -339,19 +339,19 @@ fn scan_resources(resources: &[u8], result: &mut ScanResult) -> Result<(), Anima
         let id = cursor.u16("image resource ID")?;
         let name_length = cursor.u8("image resource name length")? as usize;
         cursor.skip(name_length, "image resource name")?;
-        if (1 + name_length) % 2 != 0 {
+        if !(1 + name_length).is_multiple_of(2) {
             cursor.skip(1, "image resource name padding")?;
         }
         let data_length = cursor.u32("image resource length")? as usize;
         let data = cursor.take(data_length, "image resource data")?;
-        if data_length % 2 != 0 {
+        if !data_length.is_multiple_of(2) {
             cursor.skip(1, "image resource data padding")?;
         }
-        if id == 4000 || id == 4003 {
-            if let Some(descriptor) = parse_animation_resource(data)? {
-                result.animation_descriptors.push((id, descriptor));
-                result.resource_ids.push(id);
-            }
+        if (id == 4000 || id == 4003)
+            && let Some(descriptor) = parse_animation_resource(data)?
+        {
+            result.animation_descriptors.push((id, descriptor));
+            result.resource_ids.push(id);
         }
     }
     Ok(())
@@ -374,7 +374,7 @@ fn parse_animation_resource(data: &[u8]) -> Result<Option<Descriptor>, Animation
         let key = section_cursor.take(4, "animation subresource key")?;
         let payload_length = section_cursor.u32("animation descriptor length")? as usize;
         let payload = section_cursor.take(payload_length, "animation descriptor")?;
-        if payload_length % 2 != 0 {
+        if !payload_length.is_multiple_of(2) {
             section_cursor.skip(1, "animation descriptor padding")?;
         }
         if key == b"AnDs" {
@@ -455,7 +455,7 @@ fn scan_layer_extra(data: &[u8]) -> Result<RawLayer, AnimationParseError> {
         let key = cursor.take(4, "layer additional-info key")?;
         let length = cursor.u32("layer additional-info length")? as usize;
         let value = cursor.take(length, "layer additional-info value")?;
-        if length % 2 != 0 {
+        if !length.is_multiple_of(2) {
             cursor.skip(1, "layer additional-info padding")?;
         }
         match key {
@@ -489,12 +489,10 @@ fn scan_layer_extra(data: &[u8]) -> Result<RawLayer, AnimationParseError> {
                 }
                 layer.flags = Some(parse_mdyn(value)?);
             }
-            b"lsct" | b"lsdk" => {
-                if length >= 4 {
-                    let divider_type =
-                        u32::from_be_bytes(value[..4].try_into().expect("length checked"));
-                    layer.is_bounding_divider = divider_type == 3;
-                }
+            b"lsct" | b"lsdk" if length >= 4 => {
+                let divider_type =
+                    u32::from_be_bytes(value[..4].try_into().expect("length checked"));
+                layer.is_bounding_divider = divider_type == 3;
             }
             _ => {}
         }
@@ -513,7 +511,7 @@ fn parse_shmd(data: &[u8]) -> Result<LayerMetadata, AnimationParseError> {
         cursor.skip(4, "shmd record copy flags")?;
         let length = cursor.u32("shmd record length")? as usize;
         let payload = cursor.take(length, "shmd record payload")?;
-        if length % 2 != 0 {
+        if !length.is_multiple_of(2) {
             cursor.skip(1, "shmd record padding")?;
         }
         match key {

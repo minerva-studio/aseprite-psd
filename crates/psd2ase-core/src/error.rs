@@ -33,8 +33,6 @@ pub enum ConversionError {
     InputMissing(PathBuf),
     /// The output exists and overwrite was not authorized.
     OutputExists(PathBuf),
-    /// A future conversion path is deliberately not enabled.
-    ConversionNotReady,
     /// Reading and normalizing the input failed before writing started.
     InputInspection(String),
     /// Mapping the normalized document to Aseprite failed.
@@ -55,10 +53,6 @@ impl Display for ConversionError {
             Self::OutputExists(path) => {
                 write!(formatter, "output already exists: {}", path.display())
             }
-            Self::ConversionNotReady => write!(
-                formatter,
-                "conversion is not enabled for this conversion path"
-            ),
             Self::InputInspection(error) => write!(formatter, "could not inspect input: {error}"),
             Self::Writer(error) => write!(formatter, "could not write Aseprite output: {error}"),
             Self::OutputValidation(error) => {

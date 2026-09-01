@@ -69,8 +69,10 @@ impl std::fmt::Display for WriterError {
 
 impl std::error::Error for WriterError {}
 
-/// Encodes one normalized document as an RGBA Aseprite file.
-pub fn encode(document: &NormalizedDocument) -> Result<EncodedAseprite, WriterError> {
+/// Initializes the shared canvas, timeline, loop tag, and warning collection.
+fn initialize_file(
+    document: &NormalizedDocument,
+) -> Result<(AsepriteFile, Vec<String>), WriterError> {
     let width = u16_value("canvas width", document.canvas.0)?;
     let height = u16_value("canvas height", document.canvas.1)?;
     let mut file = AsepriteFile::new(width, height, ColorMode::Rgba);
@@ -107,6 +109,13 @@ pub fn encode(document: &NormalizedDocument) -> Result<EncodedAseprite, WriterEr
         )
         .map_err(|error| WriterError::Aseprite(error.to_string()))?;
     }
+
+    Ok((file, warnings))
+}
+
+/// Encodes one normalized document as an RGBA Aseprite file.
+pub fn encode(document: &NormalizedDocument) -> Result<EncodedAseprite, WriterError> {
+    let (mut file, mut warnings) = initialize_file(document)?;
 
     let mut bindings = Vec::new();
     for layer in &document.root_layers {
@@ -178,42 +187,7 @@ pub fn encode_with_plan(
     document: &NormalizedDocument,
     plan: &LayerWritePlan,
 ) -> Result<EncodedAseprite, WriterError> {
-    let width = u16_value("canvas width", document.canvas.0)?;
-    let height = u16_value("canvas height", document.canvas.1)?;
-    let mut file = AsepriteFile::new(width, height, ColorMode::Rgba);
-    let mut warnings = Vec::new();
-    collect_unmapped_animation_warnings(document, &mut warnings);
-
-    if document.frames.is_empty() {
-        return Err(WriterError::Aseprite(
-            "normalized document has no frames".to_string(),
-        ));
-    }
-    for (expected_index, frame) in document.frames.iter().enumerate() {
-        if frame.index != expected_index as u32 {
-            return Err(WriterError::InvalidFrameIndex {
-                expected: expected_index,
-                actual: frame.index,
-            });
-        }
-        let duration = frame
-            .duration_ms
-            .unwrap_or(u32::from(DEFAULT_FRAME_DURATION_MS));
-        file.add_frame(u16_value("frame duration", duration)?);
-    }
-    if let Some(loop_mode) = &document.loop_mode {
-        let repeat = match loop_mode {
-            NormalizedLoopMode::Infinite => 0,
-            NormalizedLoopMode::Finite(count) => u16_value("loop repeat count", *count)?,
-        };
-        file.add_tag_with(
-            "PSD Animation",
-            0..=(document.frames.len() - 1),
-            LoopDirection::Forward,
-            repeat,
-        )
-        .map_err(|error| WriterError::Aseprite(error.to_string()))?;
-    }
+    let (mut file, mut warnings) = initialize_file(document)?;
 
     let mut bindings = Vec::new();
     for node in &plan.root_nodes {
@@ -238,12 +212,12 @@ pub fn encode_with_plan(
                     actual: planned_cel.source_frame_index,
                 });
             }
-            let source = find_layer(document, planned_cel.source_layer_id).ok_or_else(|| {
-                WriterError::InvalidPixels {
+            let source = document
+                .find_layer(planned_cel.source_layer_id)
+                .ok_or_else(|| WriterError::InvalidPixels {
                     layer_id: planned_cel.source_layer_id,
                     message: "planned source layer was not found".to_string(),
-                }
-            })?;
+                })?;
             let state = frame_state(source, frame_index)?;
             let pixels = source
                 .pixels
@@ -355,7 +329,7 @@ fn create_planned_tree<'a>(
             source_layer_id,
             children,
         } => {
-            let source = source_layer_id.and_then(|id| find_layer(document, id));
+            let source = source_layer_id.and_then(|id| document.find_layer(id));
             let mut options = source
                 .map(|layer| layer_options(layer, warnings))
                 .transpose()?
@@ -373,12 +347,11 @@ fn create_planned_tree<'a>(
             let track = plan.tracks.get(*track_id).ok_or_else(|| {
                 WriterError::Aseprite(format!("logical track {track_id} is not present in plan"))
             })?;
-            let source =
-                find_layer(document, track.representative_source_layer_id).ok_or_else(|| {
-                    WriterError::InvalidPixels {
-                        layer_id: track.representative_source_layer_id,
-                        message: "logical track representative layer was not found".to_string(),
-                    }
+            let source = document
+                .find_layer(track.representative_source_layer_id)
+                .ok_or_else(|| WriterError::InvalidPixels {
+                    layer_id: track.representative_source_layer_id,
+                    message: "logical track representative layer was not found".to_string(),
                 })?;
             let mut options = layer_options(source, warnings)?;
             options.visible = track.cels.iter().any(Option::is_some);
@@ -390,22 +363,6 @@ fn create_planned_tree<'a>(
         }
     }
     Ok(())
-}
-
-/// Finds a normalized source layer by its stable source ID.
-fn find_layer(document: &NormalizedDocument, id: u32) -> Option<&NormalizedLayer> {
-    fn find(layers: &[NormalizedLayer], id: u32) -> Option<&NormalizedLayer> {
-        for layer in layers {
-            if layer.id == id {
-                return Some(layer);
-            }
-            if let Some(found) = find(&layer.children, id) {
-                return Some(found);
-            }
-        }
-        None
-    }
-    find(&document.root_layers, id)
 }
 
 /// Maps base layer properties to Aseprite layer options.

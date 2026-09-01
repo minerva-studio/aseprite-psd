@@ -1,6 +1,17 @@
 //! Experimental cross-frame layer association and Aseprite write planning.
 
+mod matching;
+mod report;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Deref;
+use std::rc::Rc;
+
+use self::matching::find_best_weighted_matching;
+use self::report::{
+    collect_exclusion_diagnostics, collect_family_diagnostics, collect_name_diagnostics,
+    format_copy_suffixes,
+};
 
 use crate::aseprite_writer::cel_position;
 use crate::layer_names::{
@@ -11,22 +22,54 @@ use crate::{NormalizedDocument, NormalizedLayer, NormalizedLayerKind};
 /// Selects whether the writer should preserve the PSD source tree or infer
 /// long-lived logical layer tracks across animation frames.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum LayerAssociationMode {
+pub enum LayerAssociation {
     /// Preserve every normalized source layer as its own Aseprite layer.
     #[default]
     Preserve,
     /// Infer logical tracks and remove frame-container groups.
-    Auto,
+    Auto(AutoAssociationOptions),
 }
 
-/// Selects the automatic identity-association strategy.
+/// Options used when automatic logical-layer association is enabled.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum LayerAssociationStrategy {
+pub struct AutoAssociationOptions {
+    /// Selects the automatic identity-association strategy.
+    pub strategy: AssociationStrategy,
+    /// Selects stable track order or per-cel Z-Index adjustments.
+    pub z_order: LayerZOrderMode,
+    /// Selects the stable logical-track ordering strategy.
+    pub stable_order: StableOrderMode,
+}
+
+/// Selects the automatic identity-association strategy and its valid layout policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AssociationStrategy {
     /// Reproduce the compact association behavior from the ordering baseline.
     #[default]
     Compact,
     /// Use the conservative multilingual family and candidate-folder planner.
-    Conservative,
+    Conservative {
+        /// Selects whether uncertain tracks are grouped for review.
+        uncertain_layers: UncertainLayerMode,
+    },
+}
+
+impl AssociationStrategy {
+    /// Returns the stable strategy name used by CLI diagnostics.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Compact => "Compact",
+            Self::Conservative { .. } => "Conservative",
+        }
+    }
+
+    /// Returns the effective uncertain-layer presentation policy.
+    pub const fn uncertain_layers(self) -> UncertainLayerMode {
+        match self {
+            Self::Compact => UncertainLayerMode::Group,
+            Self::Conservative { uncertain_layers } => uncertain_layers,
+        }
+    }
 }
 
 /// Selects whether automatic association may reorder individual cels with
@@ -164,15 +207,9 @@ pub struct AssociationReport {
     /// Presentation policy used for uncertain automatic tracks.
     pub uncertain_layer_mode: UncertainLayerMode,
     /// Automatic identity-association strategy used for this plan.
-    pub strategy: LayerAssociationStrategy,
+    pub strategy: AssociationStrategy,
     /// Version of the copy-suffix catalog used for name analysis.
     pub name_catalog_version: u16,
-    /// Name parsing and unresolved-name diagnostics.
-    pub name_diagnostics: Vec<String>,
-    /// Per-family matching summaries and track-slot diagnostics.
-    pub family_diagnostics: Vec<String>,
-    /// Mutual-exclusion hints and order evidence that was intentionally ignored.
-    pub exclusion_diagnostics: Vec<String>,
     /// Potential per-frame order changes detected by the planner.
     pub z_order_diagnostics: Vec<String>,
     /// Evidence and fallbacks used while establishing stable track order.
@@ -247,8 +284,6 @@ pub struct AssociationDecision {
     pub normalized_name: String,
     /// Copy-stripped name family used for matching.
     pub normalized_base_name: String,
-    /// Stable family key used by the multi-track matcher.
-    pub family_key: String,
     /// Copy suffixes recognized at the end of the source name.
     pub copy_suffixes: Vec<CopySuffixMatch>,
     /// Whether copy suffix parsing stopped at the safety limit.
@@ -265,10 +300,6 @@ pub struct AssociationDecision {
     pub rejection_reasons: Vec<String>,
     /// Exclusion relation between the selected observation and prior track data.
     pub exclusion_evidence: AssociationExclusionKind,
-    /// Whether the selected track had a same-frame conflict.
-    pub same_frame_conflict: bool,
-    /// Whether source order was ignored because the containers are incomparable.
-    pub order_evidence_ignored: bool,
     /// Output logical track ID.
     pub track_id: usize,
     /// Decision category.
@@ -296,9 +327,40 @@ pub enum AssociationDecisionStatus {
     Ambiguous,
 }
 
-#[derive(Debug, Clone)]
-struct Observation {
-    frame_index: usize,
+impl AssociationReport {
+    /// Formats name diagnostics from the authoritative decisions.
+    pub fn name_diagnostics(&self) -> Vec<String> {
+        collect_name_diagnostics(&self.decisions)
+    }
+
+    /// Formats family diagnostics from the authoritative decisions.
+    pub fn family_diagnostics(&self) -> Vec<String> {
+        collect_family_diagnostics(&self.decisions)
+    }
+
+    /// Formats exclusion diagnostics from the authoritative decisions.
+    pub fn exclusion_diagnostics(&self) -> Vec<String> {
+        collect_exclusion_diagnostics(&self.decisions)
+    }
+}
+
+impl AssociationDecision {
+    /// Returns whether the selected track had a same-frame conflict.
+    pub const fn same_frame_conflict(&self) -> bool {
+        matches!(self.exclusion_evidence, AssociationExclusionKind::CoVisible)
+    }
+
+    /// Returns whether source order was ignored for incomparable containers.
+    pub const fn order_evidence_ignored(&self) -> bool {
+        matches!(
+            self.exclusion_evidence,
+            AssociationExclusionKind::StructuralMutualExclusion
+        )
+    }
+}
+
+#[derive(Debug)]
+struct LayerEvidence<'doc> {
     source_layer_id: u32,
     source_path: String,
     name: String,
@@ -309,23 +371,56 @@ struct Observation {
     suffix_limit_reached: bool,
     frame_container_ids: Vec<u32>,
     group_path: Vec<GroupSegment>,
+    width: u32,
+    height: u32,
+    pixels: &'doc [u8],
+}
+
+#[derive(Debug, Clone)]
+struct Observation<'doc> {
+    id: ObservationId,
+    evidence: Rc<LayerEvidence<'doc>>,
+    frame_index: usize,
     source_order: usize,
     x: i32,
     y: i32,
-    width: u32,
-    height: u32,
-    pixels: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ObservationId(usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TrackId(usize);
+
+impl TrackId {
+    const fn index(self) -> usize {
+        self.0
+    }
+}
+
+impl<'doc> Deref for Observation<'doc> {
+    type Target = LayerEvidence<'doc>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.evidence
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum GroupKey {
+    Persistent(String),
+    Candidate(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GroupSegment {
-    id: u32,
+    source_layer_id: Option<u32>,
     name: String,
-    key: String,
+    key: GroupKey,
 }
 
 #[derive(Debug, Clone)]
-struct TrackBuilder {
+struct TrackBuilder<'doc> {
     id: usize,
     name: String,
     normalized_name: String,
@@ -334,20 +429,161 @@ struct TrackBuilder {
     copy_suffixes: Vec<CopySuffixMatch>,
     representative_source_layer_id: u32,
     cels: Vec<Option<PlannedCel>>,
-    observations: Vec<ObservationSummary>,
+    observation_ids: Vec<ObservationId>,
+    observations: Vec<ObservationSummary<'doc>>,
     group_paths: Vec<Vec<GroupSegment>>,
 }
 
 #[derive(Debug, Clone)]
-struct ObservationSummary {
+struct ObservationSummary<'doc> {
+    evidence: Rc<LayerEvidence<'doc>>,
     frame_index: usize,
     source_order: usize,
     x: i32,
     y: i32,
     width: u32,
     height: u32,
-    pixels: Vec<u8>,
-    frame_container_ids: Vec<u32>,
+}
+
+impl<'doc> Deref for ObservationSummary<'doc> {
+    type Target = LayerEvidence<'doc>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.evidence
+    }
+}
+
+#[derive(Debug)]
+struct ObservationStore<'doc> {
+    evidence: Vec<Rc<LayerEvidence<'doc>>>,
+    frames: Vec<Vec<Observation<'doc>>>,
+}
+
+struct ObservationCollectionState<'state, 'doc> {
+    selectors: &'state HashMap<u32, FrameContainerInfo>,
+    source_order: &'state mut usize,
+    next_observation_id: &'state mut usize,
+    store: &'state mut ObservationStore<'doc>,
+}
+
+impl ObservationStore<'_> {
+    /// Creates an empty observation store for the document timeline.
+    fn new(frame_count: usize) -> Self {
+        Self {
+            evidence: Vec::new(),
+            frames: vec![Vec::new(); frame_count],
+        }
+    }
+}
+
+struct AssociationEngine<'doc> {
+    observations: ObservationStore<'doc>,
+    selectors: HashMap<u32, FrameContainerInfo>,
+    tracks: Vec<TrackBuilder<'doc>>,
+    decisions: Vec<AssociationDecision>,
+    preassigned: HashMap<(usize, u32), usize>,
+    anchor_frame: usize,
+    frame_count: usize,
+}
+
+impl<'doc> AssociationEngine<'doc> {
+    /// Creates the single owner of mutable association state.
+    fn new(
+        observations: ObservationStore<'doc>,
+        selectors: HashMap<u32, FrameContainerInfo>,
+        anchor_frame: usize,
+        frame_count: usize,
+    ) -> Self {
+        Self {
+            observations,
+            selectors,
+            tracks: Vec::new(),
+            decisions: Vec::new(),
+            preassigned: HashMap::new(),
+            anchor_frame,
+            frame_count,
+        }
+    }
+
+    /// Seeds tracks and decisions from the selected anchor frame.
+    fn seed_anchor(&mut self) {
+        let observations = &self.observations.frames[self.anchor_frame];
+        for observation in observations {
+            let track_id = self.tracks.len();
+            self.tracks
+                .push(new_track(track_id, observation, self.frame_count));
+            record_assignment(
+                &mut self.tracks[track_id],
+                observation,
+                PlannedCel {
+                    source_layer_id: observation.source_layer_id,
+                    source_frame_index: observation.frame_index as u32,
+                    z_index: 0,
+                },
+            );
+            let mut anchor_decision = decision(
+                observation,
+                track_id,
+                AssociationDecisionStatus::Strong,
+                100,
+                100,
+                vec!["anchor frame".to_string()],
+                Vec::new(),
+            );
+            anchor_decision.association_phase = AssociationPhase::Anchor;
+            anchor_decision.same_frame_instance_count = observations
+                .iter()
+                .filter(|candidate| candidate.name_key == observation.name_key)
+                .count();
+            self.decisions.push(anchor_decision);
+        }
+    }
+
+    /// Runs the configured association strategy over every non-anchor frame.
+    fn associate(&mut self, strategy: AssociationStrategy) {
+        if matches!(strategy, AssociationStrategy::Conservative { .. }) {
+            associate_families_globally(
+                &self.observations.frames,
+                self.anchor_frame,
+                &mut self.tracks,
+                self.frame_count,
+                &self.selectors,
+                &mut self.decisions,
+                &mut self.preassigned,
+            );
+        }
+
+        let mut frame_order = (0..self.observations.frames.len()).collect::<Vec<_>>();
+        frame_order.sort_by_key(|frame_index| {
+            if *frame_index == self.anchor_frame {
+                0
+            } else {
+                1 + (*frame_index + self.observations.frames.len() - self.anchor_frame)
+                    % self.observations.frames.len()
+            }
+        });
+        for frame_index in frame_order {
+            if frame_index == self.anchor_frame {
+                continue;
+            }
+            match strategy {
+                AssociationStrategy::Compact => associate_frame_compact(
+                    &self.observations.frames[frame_index],
+                    &mut self.tracks,
+                    self.frame_count,
+                    &mut self.decisions,
+                ),
+                AssociationStrategy::Conservative { .. } => associate_frame(
+                    &self.observations.frames[frame_index],
+                    &mut self.tracks,
+                    self.frame_count,
+                    &self.selectors,
+                    &mut self.decisions,
+                    &self.preassigned,
+                ),
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -364,6 +600,14 @@ struct AssignmentMetadata {
     matching_tie: bool,
 }
 
+struct FamilyAssignmentContext<'state, 'doc> {
+    tracks: &'state mut Vec<TrackBuilder<'doc>>,
+    frame_count: usize,
+    selectors: &'state HashMap<u32, FrameContainerInfo>,
+    decisions: &'state mut Vec<AssociationDecision>,
+    preassigned: &'state mut HashMap<(usize, u32), usize>,
+}
+
 struct FamilyMatching {
     assignments: Vec<(usize, usize)>,
     tied_observations: HashSet<usize>,
@@ -377,13 +621,13 @@ struct GlobalFamilyMatching {
 #[derive(Debug, Clone)]
 struct CandidateGroupPath {
     name: String,
-    key: String,
+    anchor_track_id: usize,
 }
 
 #[derive(Debug, Clone)]
 enum PlannedNodeBuilder {
     Group {
-        key: String,
+        key: GroupKey,
         name: String,
         source_layer_id: Option<u32>,
         children: Vec<PlannedNodeBuilder>,
@@ -395,90 +639,42 @@ enum PlannedNodeBuilder {
 
 const FAMILY_MATCH_ASSIGNMENT_BONUS: u32 = 100;
 const MAX_FAMILY_MATCHING_STATES: usize = 100_000;
-const CANDIDATE_GROUP_ID: u32 = u32::MAX;
 
-/// Builds an experimental logical-layer plan using stable Z-order by default.
-pub fn build_layer_write_plan(document: &NormalizedDocument) -> Result<LayerWritePlan, String> {
-    build_layer_write_plan_with_strategy_and_layout_modes(
-        document,
-        LayerAssociationStrategy::Compact,
-        LayerZOrderMode::Stable,
-        StableOrderMode::Consensus,
-        UncertainLayerMode::Group,
-    )
-}
-
-/// Builds an experimental logical-layer plan with an explicit Z-order policy.
-pub fn build_layer_write_plan_with_z_order(
+/// Builds an automatic logical-layer plan with an explicit, valid configuration.
+pub fn build_layer_write_plan(
     document: &NormalizedDocument,
-    z_order_mode: LayerZOrderMode,
+    options: AutoAssociationOptions,
 ) -> Result<LayerWritePlan, String> {
-    build_layer_write_plan_with_strategy_and_layout_modes(
-        document,
-        LayerAssociationStrategy::Compact,
-        z_order_mode,
-        StableOrderMode::Consensus,
-        UncertainLayerMode::Group,
-    )
-}
-
-/// Builds an automatic logical-layer plan with explicit z-order and stable-order policies.
-pub fn build_layer_write_plan_with_order_modes(
-    document: &NormalizedDocument,
-    z_order_mode: LayerZOrderMode,
-    stable_order_mode: StableOrderMode,
-) -> Result<LayerWritePlan, String> {
-    build_layer_write_plan_with_strategy_and_layout_modes(
-        document,
-        LayerAssociationStrategy::Compact,
-        z_order_mode,
-        stable_order_mode,
-        UncertainLayerMode::Group,
-    )
-}
-
-/// Builds an automatic logical-layer plan with explicit ordering and layout policies.
-pub fn build_layer_write_plan_with_layout_modes(
-    document: &NormalizedDocument,
-    z_order_mode: LayerZOrderMode,
-    stable_order_mode: StableOrderMode,
-    uncertain_layer_mode: UncertainLayerMode,
-) -> Result<LayerWritePlan, String> {
-    build_layer_write_plan_with_strategy_and_layout_modes(
-        document,
-        LayerAssociationStrategy::Conservative,
-        z_order_mode,
-        stable_order_mode,
-        uncertain_layer_mode,
-    )
-}
-
-/// Builds an automatic logical-layer plan with an explicit association strategy.
-pub fn build_layer_write_plan_with_strategy_and_layout_modes(
-    document: &NormalizedDocument,
-    strategy: LayerAssociationStrategy,
-    z_order_mode: LayerZOrderMode,
-    stable_order_mode: StableOrderMode,
-    uncertain_layer_mode: UncertainLayerMode,
-) -> Result<LayerWritePlan, String> {
+    let strategy = options.strategy;
+    let z_order_mode = options.z_order;
+    let stable_order_mode = options.stable_order;
+    let uncertain_layer_mode = strategy.uncertain_layers();
     let selectors = find_frame_selector_groups(&document.root_layers, document.frames.len());
-    let mut frames = vec![Vec::new(); document.frames.len()];
+    let mut observation_store = ObservationStore::new(document.frames.len());
     let mut source_order = 0;
-    for (root_index, layer) in document.root_layers.iter().enumerate() {
-        collect_observations(
-            layer,
-            &[root_index.to_string()],
-            &[],
-            &selectors,
-            &[],
-            &[],
-            &mut source_order,
-            &mut frames,
-        )?;
+    let mut next_observation_id = 0;
+    {
+        let mut collection = ObservationCollectionState {
+            selectors: &selectors,
+            source_order: &mut source_order,
+            next_observation_id: &mut next_observation_id,
+            store: &mut observation_store,
+        };
+        for (root_index, layer) in document.root_layers.iter().enumerate() {
+            collect_observations(
+                layer,
+                &[root_index.to_string()],
+                &[],
+                &[],
+                &[],
+                &mut collection,
+            )?;
+        }
     }
-    for frame in &mut frames {
+    let frames = &mut observation_store.frames;
+    for frame in frames.iter_mut() {
         frame.sort_by_key(|observation| observation.source_order);
-        if strategy == LayerAssociationStrategy::Conservative {
+        if matches!(strategy, AssociationStrategy::Conservative { .. }) {
             for (source_order, observation) in frame.iter_mut().enumerate() {
                 observation.source_order = source_order;
             }
@@ -511,92 +707,23 @@ pub fn build_layer_write_plan_with_strategy_and_layout_modes(
         .map(|(index, _)| index)
         .unwrap_or(0);
 
-    let mut tracks = Vec::new();
-    let mut decisions = Vec::new();
-    for observation in &frames[anchor_frame] {
-        let track_id = tracks.len();
-        tracks.push(new_track(track_id, observation, document.frames.len()));
-        record_assignment(
-            &mut tracks[track_id],
-            observation,
-            PlannedCel {
-                source_layer_id: observation.source_layer_id,
-                source_frame_index: observation.frame_index as u32,
-                z_index: 0,
-            },
-        );
-        let mut anchor_decision = decision(
-            observation,
-            track_id,
-            AssociationDecisionStatus::Strong,
-            100,
-            100,
-            vec!["anchor frame".to_string()],
-            Vec::new(),
-        );
-        anchor_decision.association_phase = AssociationPhase::Anchor;
-        anchor_decision.same_frame_instance_count = frames[anchor_frame]
-            .iter()
-            .filter(|candidate| candidate.name_key == observation.name_key)
-            .count();
-        decisions.push(anchor_decision);
-    }
-
-    let mut preassigned = HashMap::<(usize, u32), usize>::new();
-    if strategy == LayerAssociationStrategy::Conservative {
-        associate_families_globally(
-            &frames,
-            anchor_frame,
-            &mut tracks,
-            document.frames.len(),
-            &selectors,
-            &mut decisions,
-            &mut preassigned,
-        );
-    }
-
-    let mut frame_order = (0..frames.len()).collect::<Vec<_>>();
-    frame_order.sort_by_key(|frame_index| {
-        if *frame_index == anchor_frame {
-            0
-        } else {
-            1 + (*frame_index + frames.len() - anchor_frame) % frames.len()
-        }
-    });
-
-    for frame_index in frame_order {
-        if frame_index == anchor_frame {
-            continue;
-        }
-        if strategy == LayerAssociationStrategy::Compact {
-            associate_frame_compact(
-                &frames[frame_index],
-                &mut tracks,
-                document.frames.len(),
-                &mut decisions,
-            );
-        } else {
-            associate_frame(
-                &frames[frame_index],
-                &mut tracks,
-                document.frames.len(),
-                &selectors,
-                &mut decisions,
-                &preassigned,
-            );
-        }
-    }
+    let mut engine = AssociationEngine::new(
+        observation_store,
+        selectors,
+        anchor_frame,
+        document.frames.len(),
+    );
+    engine.seed_anchor();
+    engine.associate(strategy);
+    let frames = &engine.observations.frames;
+    let tracks = &mut engine.tracks;
+    let decisions = &mut engine.decisions;
+    let selectors = &engine.selectors;
 
     let mut warnings = Vec::new();
-    let anchor_order = anchor_track_order(&tracks);
+    let anchor_order = anchor_track_order(tracks);
     let (track_order, mut stable_order_diagnostics) = if z_order_mode == LayerZOrderMode::Stable {
-        stable_track_order(
-            &tracks,
-            &frames,
-            &decisions,
-            &anchor_order,
-            stable_order_mode,
-        )?
+        stable_track_order(tracks, frames, decisions, &anchor_order, stable_order_mode)?
     } else {
         (anchor_order, Vec::new())
     };
@@ -627,21 +754,15 @@ pub fn build_layer_write_plan_with_strategy_and_layout_modes(
             .then_with(|| left.source_path.cmp(&right.source_path))
             .then_with(|| left.source_layer_id.cmp(&right.source_layer_id))
     });
-    let mut group_paths = choose_group_paths(&mut tracks, document, &mut warnings);
-    flatten_redundant_common_root(
-        &mut group_paths,
-        &tracks,
-        document,
-        &selectors,
-        &mut warnings,
-    );
+    let mut group_paths = choose_group_paths(tracks, document, &mut warnings);
+    flatten_redundant_common_root(&mut group_paths, tracks, document, selectors, &mut warnings);
     let (candidate_groups, candidate_group_paths) =
-        if strategy == LayerAssociationStrategy::Conservative {
+        if matches!(strategy, AssociationStrategy::Conservative { .. }) {
             plan_candidate_groups(
-                &tracks,
-                &decisions,
+                tracks,
+                decisions,
                 &track_order,
-                &selectors,
+                selectors,
                 uncertain_layer_mode,
                 &mut warnings,
             )
@@ -674,17 +795,14 @@ pub fn build_layer_write_plan_with_strategy_and_layout_modes(
             uncertain_layer_mode,
             strategy,
             name_catalog_version: COPY_SUFFIX_CATALOG_VERSION,
-            name_diagnostics: collect_name_diagnostics(&decisions),
-            family_diagnostics: collect_family_diagnostics(&decisions),
-            exclusion_diagnostics: collect_exclusion_diagnostics(&decisions),
             z_order_diagnostics: Vec::new(),
             stable_order_diagnostics,
             candidate_groups,
-            decisions,
+            decisions: std::mem::take(decisions),
             warnings,
         },
     };
-    plan.report.z_order_diagnostics = assign_z_indices(&mut plan, &frames, z_order_mode)?;
+    plan.report.z_order_diagnostics = assign_z_indices(&mut plan, frames, z_order_mode)?;
     Ok(plan)
 }
 
@@ -698,15 +816,13 @@ fn collect_pixel_layer_ids(layers: &[NormalizedLayer], output: &mut Vec<u32>) {
     }
 }
 
-fn collect_observations(
-    layer: &NormalizedLayer,
+fn collect_observations<'doc>(
+    layer: &'doc NormalizedLayer,
     path: &[String],
     group_path: &[GroupSegment],
-    selectors: &HashMap<u32, FrameContainerInfo>,
     ancestors: &[&NormalizedLayer],
     frame_container_ids: &[u32],
-    source_order: &mut usize,
-    frames: &mut [Vec<Observation>],
+    state: &mut ObservationCollectionState<'_, 'doc>,
 ) -> Result<(), String> {
     let is_visible = |frame_index: usize| {
         ancestors.iter().all(|ancestor| {
@@ -723,13 +839,13 @@ fn collect_observations(
         NormalizedLayerKind::Group => {
             let mut next_path = group_path.to_vec();
             let mut next_frame_container_ids = frame_container_ids.to_vec();
-            if selectors.contains_key(&layer.id) {
+            if state.selectors.contains_key(&layer.id) {
                 next_frame_container_ids.push(layer.id);
             } else {
                 next_path.push(GroupSegment {
-                    id: layer.id,
+                    source_layer_id: Some(layer.id),
                     name: layer.name.clone(),
-                    key: canonical_name(&layer.name).0,
+                    key: GroupKey::Persistent(canonical_name(&layer.name)),
                 });
             }
             let mut next_ancestors = ancestors.to_vec();
@@ -741,11 +857,9 @@ fn collect_observations(
                     child,
                     &child_path,
                     &next_path,
-                    selectors,
                     &next_ancestors,
                     &next_frame_container_ids,
-                    source_order,
-                    frames,
+                    state,
                 )?;
             }
         }
@@ -754,50 +868,56 @@ fn collect_observations(
                 .pixels
                 .as_ref()
                 .ok_or_else(|| format!("pixel layer {} has no normalized pixels", layer.id))?;
-            for (frame_index, frame) in frames.iter_mut().enumerate() {
+            let parsed_name = parse_layer_name(&layer.name);
+            let evidence = Rc::new(LayerEvidence {
+                source_layer_id: layer.id,
+                source_path: path.join("/"),
+                name: layer.name.clone(),
+                normalized_name: parsed_name.normalized_name,
+                name_key: parsed_name.base_name,
+                generic_name: parsed_name.generic,
+                copy_suffixes: parsed_name.copy_suffixes,
+                suffix_limit_reached: parsed_name.suffix_limit_reached,
+                frame_container_ids: frame_container_ids.to_vec(),
+                group_path: group_path.to_vec(),
+                width: pixels.width,
+                height: pixels.height,
+                pixels: &pixels.data,
+            });
+            state.store.evidence.push(Rc::clone(&evidence));
+            for (frame_index, frame) in state.store.frames.iter_mut().enumerate() {
                 if !is_visible(frame_index) {
                     continue;
                 }
-                let state = layer.frame_states.get(frame_index).ok_or_else(|| {
+                let frame_state = layer.frame_states.get(frame_index).ok_or_else(|| {
                     format!(
                         "pixel layer {} has no state for frame {frame_index}",
                         layer.id
                     )
                 })?;
-                let (x, y) = cel_position(pixels, state)
+                let (x, y) = cel_position(pixels, frame_state)
                     .map_err(|error| format!("layer {}: {error}", layer.id))?;
-                let parsed_name = parse_layer_name(&layer.name);
                 frame.push(Observation {
+                    id: ObservationId(*state.next_observation_id),
+                    evidence: Rc::clone(&evidence),
                     frame_index,
-                    source_layer_id: layer.id,
-                    source_path: path.join("/"),
-                    name: layer.name.clone(),
-                    normalized_name: parsed_name.normalized_name,
-                    name_key: parsed_name.base_name,
-                    generic_name: parsed_name.generic,
-                    copy_suffixes: parsed_name.copy_suffixes,
-                    suffix_limit_reached: parsed_name.suffix_limit_reached,
-                    frame_container_ids: frame_container_ids.to_vec(),
-                    group_path: group_path.to_vec(),
-                    source_order: *source_order,
+                    source_order: *state.source_order,
                     x: i32::from(x),
                     y: i32::from(y),
-                    width: pixels.width,
-                    height: pixels.height,
-                    pixels: pixels.data.clone(),
                 });
+                *state.next_observation_id += 1;
             }
-            *source_order += 1;
+            *state.source_order += 1;
         }
     }
     Ok(())
 }
 
 /// Associates copy-name families across all frames before residual matching.
-fn associate_families_globally(
-    frames: &[Vec<Observation>],
+fn associate_families_globally<'doc>(
+    frames: &[Vec<Observation<'doc>>],
     anchor_frame: usize,
-    tracks: &mut Vec<TrackBuilder>,
+    tracks: &mut Vec<TrackBuilder<'doc>>,
     frame_count: usize,
     selectors: &HashMap<u32, FrameContainerInfo>,
     decisions: &mut Vec<AssociationDecision>,
@@ -944,12 +1064,14 @@ fn associate_families_globally(
                 .or_else(|| selected.get(&(frame_index, observation_index)).copied());
             let Some(track_id) = selected_track else {
                 create_family_new_track(
+                    &mut FamilyAssignmentContext {
+                        tracks,
+                        frame_count,
+                        selectors,
+                        decisions,
+                        preassigned,
+                    },
                     observation,
-                    tracks,
-                    frame_count,
-                    selectors,
-                    decisions,
-                    preassigned,
                     &candidates,
                     false,
                     instance_count,
@@ -967,7 +1089,7 @@ fn associate_families_globally(
                 .filter(|(candidate, _)| *candidate != track_id)
                 .map(|(_, score)| *score)
                 .max()
-                .unwrap_or(if is_locked { 0 } else { 0 });
+                .unwrap_or(0);
             let exact_name = candidates
                 .iter()
                 .filter(|(candidate, _)| {
@@ -1002,11 +1124,15 @@ fn associate_families_globally(
                     AssociationDecisionStatus::Inferred
                 };
                 record_family_assignment(
+                    &mut FamilyAssignmentContext {
+                        tracks,
+                        frame_count,
+                        selectors,
+                        decisions,
+                        preassigned,
+                    },
                     observation,
                     track_id,
-                    tracks,
-                    decisions,
-                    preassigned,
                     AssignmentMetadata {
                         score,
                         margin: score.saturating_sub(second),
@@ -1015,17 +1141,18 @@ fn associate_families_globally(
                     },
                     status,
                     &candidates,
-                    selectors,
                     instance_count,
                 );
             } else {
                 create_family_new_track(
+                    &mut FamilyAssignmentContext {
+                        tracks,
+                        frame_count,
+                        selectors,
+                        decisions,
+                        preassigned,
+                    },
                     observation,
-                    tracks,
-                    frame_count,
-                    selectors,
-                    decisions,
-                    preassigned,
                     &candidates,
                     tied,
                     instance_count,
@@ -1036,20 +1163,17 @@ fn associate_families_globally(
     }
 }
 
-fn record_family_assignment(
-    observation: &Observation,
+fn record_family_assignment<'doc>(
+    context: &mut FamilyAssignmentContext<'_, 'doc>,
+    observation: &Observation<'doc>,
     track_id: usize,
-    tracks: &mut [TrackBuilder],
-    decisions: &mut Vec<AssociationDecision>,
-    preassigned: &mut HashMap<(usize, u32), usize>,
     metadata: AssignmentMetadata,
     status: AssociationDecisionStatus,
     candidates: &[(usize, u16)],
-    selectors: &HashMap<u32, FrameContainerInfo>,
     instance_count: usize,
 ) {
     record_assignment(
-        &mut tracks[track_id],
+        &mut context.tracks[track_id],
         observation,
         PlannedCel {
             source_layer_id: observation.source_layer_id,
@@ -1057,7 +1181,7 @@ fn record_family_assignment(
             z_index: 0,
         },
     );
-    preassigned.insert(
+    context.preassigned.insert(
         (observation.frame_index, observation.source_layer_id),
         track_id,
     );
@@ -1067,35 +1191,34 @@ fn record_family_assignment(
         status,
         metadata.score,
         metadata.margin,
-        evidence_for(observation, &tracks[track_id], metadata.score, selectors),
-        candidate_names(candidates, tracks, track_id),
+        evidence_for(
+            observation,
+            &context.tracks[track_id],
+            metadata.score,
+            context.selectors,
+        ),
+        candidate_names(candidates, context.tracks, track_id),
     );
     association_decision.association_phase = metadata.phase;
     association_decision.same_frame_instance_count = instance_count;
     association_decision.matching_tie = metadata.matching_tie;
     association_decision.exclusion_evidence =
-        exclusion_evidence(observation, &tracks[track_id], selectors);
-    association_decision.same_frame_conflict =
-        association_decision.exclusion_evidence == AssociationExclusionKind::CoVisible;
-    association_decision.order_evidence_ignored = association_decision.exclusion_evidence
-        == AssociationExclusionKind::StructuralMutualExclusion;
-    decisions.push(association_decision);
+        exclusion_evidence(observation, &context.tracks[track_id], context.selectors);
+    context.decisions.push(association_decision);
 }
 
-fn create_family_new_track(
-    observation: &Observation,
-    tracks: &mut Vec<TrackBuilder>,
-    frame_count: usize,
-    selectors: &HashMap<u32, FrameContainerInfo>,
-    decisions: &mut Vec<AssociationDecision>,
-    preassigned: &mut HashMap<(usize, u32), usize>,
+fn create_family_new_track<'doc>(
+    context: &mut FamilyAssignmentContext<'_, 'doc>,
+    observation: &Observation<'doc>,
     candidates: &[(usize, u16)],
     matching_tie: bool,
     instance_count: usize,
     conservative_multi_instance: bool,
 ) {
-    let track_id = tracks.len();
-    tracks.push(new_track(track_id, observation, frame_count));
+    let track_id = context.tracks.len();
+    context
+        .tracks
+        .push(new_track(track_id, observation, context.frame_count));
     let mut association_decision = decision(
         observation,
         track_id,
@@ -1110,7 +1233,7 @@ fn create_family_new_track(
             .zip(candidates.get(1))
             .map_or(0, |((_, best), (_, second))| best.saturating_sub(*second)),
         vec!["family association created a separate track".to_string()],
-        candidate_names(candidates, tracks, track_id),
+        candidate_names(candidates, context.tracks, track_id),
     );
     association_decision.association_phase = AssociationPhase::NewTrack;
     association_decision.same_frame_instance_count = instance_count;
@@ -1127,10 +1250,10 @@ fn create_family_new_track(
             .push("multi-instance family lacked exact identity evidence".to_string());
     }
     association_decision.exclusion_evidence =
-        exclusion_evidence(observation, &tracks[track_id], selectors);
-    decisions.push(association_decision);
+        exclusion_evidence(observation, &context.tracks[track_id], context.selectors);
+    context.decisions.push(association_decision);
     record_assignment(
-        &mut tracks[track_id],
+        &mut context.tracks[track_id],
         observation,
         PlannedCel {
             source_layer_id: observation.source_layer_id,
@@ -1138,16 +1261,16 @@ fn create_family_new_track(
             z_index: 0,
         },
     );
-    preassigned.insert(
+    context.preassigned.insert(
         (observation.frame_index, observation.source_layer_id),
         track_id,
     );
 }
 
 /// Associates one frame using the compact baseline algorithm from 651eb65.
-fn associate_frame_compact(
-    observations: &[Observation],
-    tracks: &mut Vec<TrackBuilder>,
+fn associate_frame_compact<'doc>(
+    observations: &[Observation<'doc>],
+    tracks: &mut Vec<TrackBuilder<'doc>>,
     frame_count: usize,
     decisions: &mut Vec<AssociationDecision>,
 ) {
@@ -1419,9 +1542,9 @@ fn compact_evidence_for(
     evidence
 }
 
-fn associate_frame(
-    observations: &[Observation],
-    tracks: &mut Vec<TrackBuilder>,
+fn associate_frame<'doc>(
+    observations: &[Observation<'doc>],
+    tracks: &mut Vec<TrackBuilder<'doc>>,
     frame_count: usize,
     selectors: &HashMap<u32, FrameContainerInfo>,
     decisions: &mut Vec<AssociationDecision>,
@@ -1741,10 +1864,6 @@ fn associate_frame(
                 association_decision.same_frame_instance_count,
             );
             association_decision.exclusion_evidence = exclusion;
-            association_decision.same_frame_conflict =
-                exclusion == AssociationExclusionKind::CoVisible;
-            association_decision.order_evidence_ignored =
-                exclusion == AssociationExclusionKind::StructuralMutualExclusion;
             decisions.push(association_decision);
             track_id
         } else {
@@ -1866,114 +1985,10 @@ fn find_best_family_matching(
     observations: &[usize],
     candidates: &HashMap<usize, Vec<(usize, u16)>>,
 ) -> FamilyMatching {
-    fn visit(
-        position: usize,
-        observations: &[usize],
-        candidates: &HashMap<usize, Vec<(usize, u16)>>,
-        used_tracks: &mut HashSet<usize>,
-        current: &mut Vec<(usize, usize)>,
-        current_score: u32,
-        best_score: &mut Option<u32>,
-        best_solutions: &mut Vec<Vec<(usize, usize)>>,
-        states: &mut usize,
-    ) {
-        if *states >= MAX_FAMILY_MATCHING_STATES {
-            return;
-        }
-        *states += 1;
-        if position == observations.len() {
-            match best_score {
-                Some(score) if current_score > *score => {
-                    *score = current_score;
-                    best_solutions.clear();
-                    best_solutions.push(current.clone());
-                }
-                Some(score) if current_score == *score => {
-                    if best_solutions.len() < 2
-                        && !best_solutions.iter().any(|solution| solution == current)
-                    {
-                        best_solutions.push(current.clone());
-                    }
-                }
-                None => {
-                    *best_score = Some(current_score);
-                    best_solutions.push(current.clone());
-                }
-                _ => {}
-            }
-            return;
-        }
-
-        let observation = observations[position];
-        if let Some(edges) = candidates.get(&observation) {
-            for (track_id, score) in edges {
-                if used_tracks.insert(*track_id) {
-                    current.push((observation, *track_id));
-                    visit(
-                        position + 1,
-                        observations,
-                        candidates,
-                        used_tracks,
-                        current,
-                        current_score + FAMILY_MATCH_ASSIGNMENT_BONUS + u32::from(*score),
-                        best_score,
-                        best_solutions,
-                        states,
-                    );
-                    current.pop();
-                    used_tracks.remove(track_id);
-                }
-            }
-        }
-        // An unassigned observation is a valid outcome: the caller will make
-        // a new track when no safe one-to-one family assignment exists.
-        visit(
-            position + 1,
-            observations,
-            candidates,
-            used_tracks,
-            current,
-            current_score,
-            best_score,
-            best_solutions,
-            states,
-        );
-    }
-
-    let mut best_score = None;
-    let mut best_solutions = Vec::new();
-    let mut states = 0;
-    visit(
-        0,
-        observations,
-        candidates,
-        &mut HashSet::new(),
-        &mut Vec::new(),
-        0,
-        &mut best_score,
-        &mut best_solutions,
-        &mut states,
-    );
-    let chosen = best_solutions.first().cloned().unwrap_or_default();
-    let mut tied_observations = HashSet::new();
-    if best_solutions.len() > 1 {
-        for observation in observations {
-            let assignments = best_solutions
-                .iter()
-                .map(|solution| {
-                    solution
-                        .iter()
-                        .find(|(candidate, _)| candidate == observation)
-                        .map(|(_, track)| *track)
-                })
-                .collect::<HashSet<_>>();
-            if assignments.len() > 1 {
-                tied_observations.insert(*observation);
-            }
-        }
-    }
+    let (assignments, tied_observations) =
+        find_best_weighted_matching(observations, candidates, |_, track| track);
     FamilyMatching {
-        assignments: chosen,
+        assignments,
         tied_observations,
     }
 }
@@ -1984,108 +1999,10 @@ fn find_best_global_family_matching(
     observations: &[(usize, usize)],
     candidates: &HashMap<(usize, usize), Vec<(usize, u16)>>,
 ) -> GlobalFamilyMatching {
-    fn visit(
-        position: usize,
-        observations: &[(usize, usize)],
-        candidates: &HashMap<(usize, usize), Vec<(usize, u16)>>,
-        used: &mut HashSet<(usize, usize)>,
-        current: &mut Vec<((usize, usize), usize)>,
-        score: u32,
-        best_score: &mut Option<u32>,
-        solutions: &mut Vec<Vec<((usize, usize), usize)>>,
-        states: &mut usize,
-    ) {
-        if *states >= MAX_FAMILY_MATCHING_STATES {
-            return;
-        }
-        *states += 1;
-        if position == observations.len() {
-            match best_score {
-                Some(best) if score > *best => {
-                    *best = score;
-                    solutions.clear();
-                    solutions.push(current.clone());
-                }
-                Some(best) if score == *best && solutions.len() < 2 => {
-                    if !solutions.iter().any(|solution| solution == current) {
-                        solutions.push(current.clone());
-                    }
-                }
-                None => {
-                    *best_score = Some(score);
-                    solutions.push(current.clone());
-                }
-                _ => {}
-            }
-            return;
-        }
-        let observation = observations[position];
-        if let Some(edges) = candidates.get(&observation) {
-            for (track_id, edge_score) in edges {
-                let key = (observation.0, *track_id);
-                if used.insert(key) {
-                    current.push((observation, *track_id));
-                    visit(
-                        position + 1,
-                        observations,
-                        candidates,
-                        used,
-                        current,
-                        score + FAMILY_MATCH_ASSIGNMENT_BONUS + u32::from(*edge_score),
-                        best_score,
-                        solutions,
-                        states,
-                    );
-                    current.pop();
-                    used.remove(&key);
-                }
-            }
-        }
-        visit(
-            position + 1,
-            observations,
-            candidates,
-            used,
-            current,
-            score,
-            best_score,
-            solutions,
-            states,
-        );
-    }
-
-    let mut best_score = None;
-    let mut solutions = Vec::new();
-    let mut states = 0;
-    visit(
-        0,
-        observations,
-        candidates,
-        &mut HashSet::new(),
-        &mut Vec::new(),
-        0,
-        &mut best_score,
-        &mut solutions,
-        &mut states,
-    );
-    let assignments = solutions.first().cloned().unwrap_or_default();
-    let mut tied_observations = HashSet::new();
-    if solutions.len() > 1 {
-        for observation in observations {
-            let variants = solutions
-                .iter()
-                .map(|solution| {
-                    solution
-                        .iter()
-                        .find(|(candidate, _)| candidate == observation)
-                        .map(|(_, track)| *track)
-                })
-                .collect::<HashSet<_>>();
-            if variants.len() > 1 {
-                tied_observations.insert(*observation);
-            }
-        }
-    }
+    let (assignments, tied_observations) =
+        find_best_weighted_matching(observations, candidates, |observation, track| {
+            (observation.0, track)
+        });
     GlobalFamilyMatching {
         assignments,
         tied_observations,
@@ -2254,9 +2171,7 @@ fn group_similarity(left: &[GroupSegment], right: &[GroupSegment]) -> u16 {
         .zip(right)
         .take_while(|(a, b)| a.key == b.key)
         .count();
-    if left.is_empty() && right.is_empty() {
-        20
-    } else if common == left.len() && common == right.len() {
+    if common == left.len() && common == right.len() {
         20
     } else if common > 0 {
         12
@@ -2472,7 +2387,7 @@ fn stable_track_order(
     ))
 }
 
-fn track_name(tracks: &[TrackBuilder], track_id: usize) -> &str {
+fn track_name<'tracks>(tracks: &'tracks [TrackBuilder<'_>], track_id: usize) -> &'tracks str {
     tracks
         .get(track_id)
         .map(|track| track.name.as_str())
@@ -2513,9 +2428,13 @@ fn candidate_names(
         .collect()
 }
 
-fn new_track(track_id: usize, observation: &Observation, frame_count: usize) -> TrackBuilder {
+fn new_track<'doc>(
+    track_id: usize,
+    observation: &Observation<'doc>,
+    frame_count: usize,
+) -> TrackBuilder<'doc> {
     TrackBuilder {
-        id: track_id,
+        id: TrackId(track_id).index(),
         name: observation.name.clone(),
         normalized_name: observation.normalized_name.clone(),
         name_key: observation.name_key.clone(),
@@ -2523,23 +2442,28 @@ fn new_track(track_id: usize, observation: &Observation, frame_count: usize) -> 
         copy_suffixes: observation.copy_suffixes.clone(),
         representative_source_layer_id: observation.source_layer_id,
         cels: vec![None; frame_count],
+        observation_ids: Vec::new(),
         observations: Vec::new(),
         group_paths: Vec::new(),
     }
 }
 
-fn record_assignment(track: &mut TrackBuilder, observation: &Observation, cel: PlannedCel) {
+fn record_assignment<'doc>(
+    track: &mut TrackBuilder<'doc>,
+    observation: &Observation<'doc>,
+    cel: PlannedCel,
+) {
     track.cels[observation.frame_index] = Some(cel);
+    track.observation_ids.push(observation.id);
     track.group_paths.push(observation.group_path.clone());
     track.observations.push(ObservationSummary {
+        evidence: Rc::clone(&observation.evidence),
         frame_index: observation.frame_index,
         source_order: observation.source_order,
         x: observation.x,
         y: observation.y,
         width: observation.width,
         height: observation.height,
-        pixels: observation.pixels.clone(),
-        frame_container_ids: observation.frame_container_ids.clone(),
     });
 }
 
@@ -2559,7 +2483,6 @@ fn decision(
         original_name: observation.name.clone(),
         normalized_name: observation.normalized_name.clone(),
         normalized_base_name: observation.name_key.clone(),
-        family_key: observation.name_key.clone(),
         copy_suffixes: observation.copy_suffixes.clone(),
         suffix_limit_reached: observation.suffix_limit_reached,
         name_evidence_weight: name_evidence_weight(observation),
@@ -2568,8 +2491,6 @@ fn decision(
         matching_tie: false,
         rejection_reasons: Vec::new(),
         exclusion_evidence: AssociationExclusionKind::None,
-        same_frame_conflict: false,
-        order_evidence_ignored: false,
         track_id,
         status,
         score,
@@ -2615,9 +2536,8 @@ fn parse_layer_name(name: &str) -> ParsedLayerName {
     CopySuffixCatalog.parse(name)
 }
 
-fn canonical_name(name: &str) -> (String, bool) {
-    let parsed = parse_layer_name(name);
-    (parsed.base_name, parsed.generic)
+fn canonical_name(name: &str) -> String {
+    parse_layer_name(name).base_name
 }
 
 fn name_evidence_weight(observation: &Observation) -> u16 {
@@ -2630,133 +2550,6 @@ fn name_evidence_weight(observation: &Observation) -> u16 {
     }
 }
 
-fn format_copy_suffixes(suffixes: &[CopySuffixMatch]) -> String {
-    suffixes
-        .iter()
-        .map(|suffix| {
-            suffix.ordinal.map_or_else(
-                || suffix.token.clone(),
-                |ordinal| format!("{} {ordinal}", suffix.token),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" + ")
-}
-
-fn collect_name_diagnostics(decisions: &[AssociationDecision]) -> Vec<String> {
-    decisions
-        .iter()
-        .filter(|decision| {
-            decision.suffix_limit_reached
-                || matches!(
-                    decision.status,
-                    AssociationDecisionStatus::Ambiguous | AssociationDecisionStatus::NewTrack
-                )
-        })
-        .map(|decision| {
-            let suffix = if decision.copy_suffixes.is_empty() {
-                "no recognized copy suffix".to_string()
-            } else {
-                format!(
-                    "recognized copy suffixes: {}",
-                    format_copy_suffixes(&decision.copy_suffixes)
-                )
-            };
-            format!(
-                "frame {} source {} name {:?} family {:?} -> track {} ({suffix})",
-                decision.frame_index,
-                decision.source_layer_id,
-                decision.original_name,
-                decision.family_key,
-                decision.track_id
-            )
-        })
-        .collect()
-}
-
-fn collect_family_diagnostics(decisions: &[AssociationDecision]) -> Vec<String> {
-    let mut families = BTreeMap::<String, Vec<&AssociationDecision>>::new();
-    for decision in decisions {
-        if !decision.family_key.is_empty() {
-            families
-                .entry(decision.family_key.clone())
-                .or_default()
-                .push(decision);
-        }
-    }
-    families
-        .into_iter()
-        .filter(|(_, decisions)| {
-            decisions
-                .iter()
-                .any(|decision| !decision.copy_suffixes.is_empty())
-        })
-        .map(|(family_key, decisions)| {
-            let mut variants = decisions
-                .iter()
-                .map(|decision| decision.original_name.clone())
-                .collect::<Vec<_>>();
-            variants.sort();
-            variants.dedup();
-            let mut tracks = decisions
-                .iter()
-                .map(|decision| decision.track_id)
-                .collect::<Vec<_>>();
-            tracks.sort_unstable();
-            tracks.dedup();
-            let mut mappings = decisions
-                .iter()
-                .map(|decision| {
-                    format!(
-                        "{}->{}",
-                        decision.original_name, decision.track_id
-                    )
-                })
-                .collect::<Vec<_>>();
-            mappings.sort();
-            mappings.dedup();
-            let ambiguous = decisions
-                .iter()
-                .filter(|decision| {
-                    decision.status == AssociationDecisionStatus::Ambiguous
-                        || decision.matching_tie
-                })
-                .count();
-            format!(
-                "family {:?}: {} observations -> {} tracks; variants={:?}; mappings={:?}; ambiguous={ambiguous}",
-                family_key,
-                decisions.len(),
-                tracks.len(),
-                variants,
-                mappings,
-            )
-        })
-        .collect()
-}
-
-fn collect_exclusion_diagnostics(decisions: &[AssociationDecision]) -> Vec<String> {
-    decisions
-        .iter()
-        .filter(|decision| {
-            decision.exclusion_evidence != AssociationExclusionKind::None
-                || decision.same_frame_conflict
-                || decision.order_evidence_ignored
-        })
-        .map(|decision| {
-            format!(
-                "frame {} source {} name {:?} -> track {} exclusion={:?}, same_frame_conflict={}, order_ignored={}",
-                decision.frame_index,
-                decision.source_layer_id,
-                decision.original_name,
-                decision.track_id,
-                decision.exclusion_evidence,
-                decision.same_frame_conflict,
-                decision.order_evidence_ignored,
-            )
-        })
-        .collect()
-}
-
 fn choose_group_paths(
     tracks: &mut [TrackBuilder],
     document: &NormalizedDocument,
@@ -2766,8 +2559,8 @@ fn choose_group_paths(
     tracks
         .iter()
         .map(|track| {
-            let mut counts = HashMap::<Vec<String>, usize>::new();
-            let mut representatives = HashMap::<Vec<String>, Vec<GroupSegment>>::new();
+            let mut counts = HashMap::<Vec<GroupKey>, usize>::new();
+            let mut representatives = HashMap::<Vec<GroupKey>, Vec<GroupSegment>>::new();
             for path in &track.group_paths {
                 let keys = path.iter().map(|segment| segment.key.clone()).collect::<Vec<_>>();
                 *counts.entry(keys.clone()).or_default() += 1;
@@ -2806,7 +2599,8 @@ fn choose_group_paths(
             let path = representatives[&keys]
                 .iter()
                 .filter(|segment| {
-                    find_layer(document, segment.id).is_some_and(|layer| {
+                    segment.source_layer_id.is_some_and(|source_layer_id| {
+                        document.find_layer(source_layer_id).is_some_and(|layer| {
                         let transparent = layer
                             .blend_mode
                             .as_deref()
@@ -2818,7 +2612,8 @@ fn choose_group_paths(
                                 layer.id
                             ));
                         }
-                        transparent && opaque
+                            transparent && opaque
+                        })
                     })
                 })
                 .cloned()
@@ -3021,13 +2816,12 @@ fn plan_candidate_groups(
         };
         let emitted = rejection_reason.is_none() && mode == UncertainLayerMode::Group;
         if emitted {
-            let key = format!("__candidate__{anchor_id}");
             for member in &members {
                 paths.insert(
                     *member,
                     CandidateGroupPath {
                         name: name.clone(),
-                        key: key.clone(),
+                        anchor_track_id: anchor_id,
                     },
                 );
             }
@@ -3297,9 +3091,9 @@ fn build_nodes(
         let mut path = Vec::new();
         if let Some(candidate_path) = candidate_group_paths.get(&track_id) {
             path.push(GroupSegment {
-                id: CANDIDATE_GROUP_ID,
+                source_layer_id: None,
                 name: candidate_path.name.clone(),
-                key: candidate_path.key.clone(),
+                key: GroupKey::Candidate(candidate_path.anchor_track_id),
             });
         }
         path.extend(group_paths[track_id].iter().cloned());
@@ -3323,7 +3117,7 @@ fn insert_track(nodes: &mut Vec<PlannedNodeBuilder>, path: &[GroupSegment], trac
             nodes.push(PlannedNodeBuilder::Group {
                 key: segment.key.clone(),
                 name: segment.name.clone(),
-                source_layer_id: (segment.id != CANDIDATE_GROUP_ID).then_some(segment.id),
+                source_layer_id: segment.source_layer_id,
                 children: Vec::new(),
             });
             nodes.len() - 1
@@ -3438,7 +3232,10 @@ fn flatten_redundant_common_root(
     {
         return;
     }
-    let Some(layer) = find_layer(document, common.id) else {
+    let Some(layer) = common
+        .source_layer_id
+        .and_then(|source_layer_id| document.find_layer(source_layer_id))
+    else {
         return;
     };
     let transparent = layer
@@ -3532,10 +3329,10 @@ fn assign_z_indices(
                     "frame {} track {} has a potential source-order change requiring z-index {}",
                     frame_index, track_id, z
                 ));
-                if mode == LayerZOrderMode::Auto {
-                    if let Some(cel_slot) = plan.tracks[*track_id].cels[frame_index].as_mut() {
-                        cel_slot.z_index = z;
-                    }
+                if mode == LayerZOrderMode::Auto
+                    && let Some(cel_slot) = plan.tracks[*track_id].cels[frame_index].as_mut()
+                {
+                    cel_slot.z_index = z;
                 }
             }
         }
@@ -3596,9 +3393,8 @@ fn stable_id_order(
 }
 
 fn alpha_overlap(left: &Observation, right: &Observation) -> bool {
-    let left_pixels = left.pixels.chunks_exact(4);
-    for (index, pixel) in left_pixels.enumerate() {
-        if pixel[3] == 0 {
+    for index in 0..left.pixels.len() / 4 {
+        if left.pixels[index * 4 + 3] == 0 {
             continue;
         }
         let x = left.x + (index as i32 % left.width as i32);
@@ -3693,45 +3489,30 @@ fn has_visible_pixel(layer: &NormalizedLayer, frame_index: usize, ancestors_visi
     }
 }
 
-fn find_layer(document: &NormalizedDocument, id: u32) -> Option<&NormalizedLayer> {
-    fn find(layers: &[NormalizedLayer], id: u32) -> Option<&NormalizedLayer> {
-        for layer in layers {
-            if layer.id == id {
-                return Some(layer);
-            }
-            if let Some(found) = find(&layer.children, id) {
-                return Some(found);
-            }
-        }
-        None
-    }
-    find(&document.root_layers, id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn build_layer_write_plan(document: &NormalizedDocument) -> Result<LayerWritePlan, String> {
-        super::build_layer_write_plan_with_strategy_and_layout_modes(
+        super::build_layer_write_plan(
             document,
-            LayerAssociationStrategy::Conservative,
-            LayerZOrderMode::Stable,
-            StableOrderMode::Consensus,
-            UncertainLayerMode::Group,
+            AutoAssociationOptions {
+                strategy: AssociationStrategy::Conservative {
+                    uncertain_layers: UncertainLayerMode::Group,
+                },
+                ..AutoAssociationOptions::default()
+            },
         )
     }
 
     #[test]
     fn default_plan_uses_compact_strategy_without_candidate_folders() {
-        let plan = super::build_layer_write_plan(&document(vec![pixel(
-            1,
-            "rear foot",
-            0,
-            [1, 2, 3, 255],
-        )]))
+        let plan = super::build_layer_write_plan(
+            &document(vec![pixel(1, "rear foot", 0, [1, 2, 3, 255])]),
+            AutoAssociationOptions::default(),
+        )
         .expect("compact association should succeed");
-        assert_eq!(plan.report.strategy, LayerAssociationStrategy::Compact);
+        assert_eq!(plan.report.strategy, AssociationStrategy::Compact);
         assert!(plan.report.candidate_groups.is_empty());
     }
     use crate::{NormalizedBounds, NormalizedFrame, NormalizedLayerFrameState, NormalizedPixels};
@@ -3844,7 +3625,7 @@ mod tests {
         document.frames = (0..3)
             .map(|index| NormalizedFrame {
                 index,
-                source_id: Some(index as u32),
+                source_id: Some(index),
                 duration_ms: Some(100),
                 dispose: None,
             })
@@ -4092,7 +3873,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
-        assert!(plan.report.family_diagnostics.iter().any(|diagnostic| {
+        assert!(plan.report.family_diagnostics().iter().any(|diagnostic| {
             diagnostic.contains("前翅膀") && diagnostic.contains("3 observations")
         }));
     }
@@ -4167,7 +3948,7 @@ mod tests {
             decision.exclusion_evidence,
             AssociationExclusionKind::StructuralMutualExclusion
         );
-        assert!(decision.order_evidence_ignored);
+        assert!(decision.order_evidence_ignored());
     }
 
     #[test]
@@ -4297,14 +4078,14 @@ mod tests {
                 0,
                 CandidateGroupPath {
                     name: "候选 - wing".to_string(),
-                    key: "__candidate__0".to_string(),
+                    anchor_track_id: 0,
                 },
             ),
             (
                 1,
                 CandidateGroupPath {
                     name: "候选 - wing".to_string(),
-                    key: "__candidate__1".to_string(),
+                    anchor_track_id: 1,
                 },
             ),
         ]);
@@ -4373,11 +4154,17 @@ mod tests {
     #[test]
     fn any_co_visible_member_rejects_the_whole_candidate_folder() {
         let mut anchor = overlapping_observation(0, 1, "rear foot", 0);
-        anchor.frame_container_ids = vec![10];
+        Rc::get_mut(&mut anchor.evidence)
+            .expect("test observation evidence should be unique")
+            .frame_container_ids = vec![10];
         let mut first_candidate = overlapping_observation(1, 2, "Layer 5", 1);
-        first_candidate.frame_container_ids = vec![11];
+        Rc::get_mut(&mut first_candidate.evidence)
+            .expect("test observation evidence should be unique")
+            .frame_container_ids = vec![11];
         let mut second_candidate = overlapping_observation(1, 3, "Layer 6", 2);
-        second_candidate.frame_container_ids = vec![11];
+        Rc::get_mut(&mut second_candidate.evidence)
+            .expect("test observation evidence should be unique")
+            .frame_container_ids = vec![11];
         let observations = [anchor, first_candidate, second_candidate];
         let mut tracks = observations
             .iter()
@@ -4473,11 +4260,14 @@ mod tests {
         let second =
             top_level_frame_container(11, "frame 2", 1, pixel(2, "Layer 5", 0, [4, 5, 6, 255]));
         let document = two_frame_document(vec![first, second]);
-        let plan = build_layer_write_plan_with_layout_modes(
+        let plan = super::build_layer_write_plan(
             &document,
-            LayerZOrderMode::Stable,
-            StableOrderMode::Consensus,
-            UncertainLayerMode::Flat,
+            AutoAssociationOptions {
+                strategy: AssociationStrategy::Conservative {
+                    uncertain_layers: UncertainLayerMode::Flat,
+                },
+                ..AutoAssociationOptions::default()
+            },
         )
         .expect("flat candidate layout should succeed");
         assert!(plan.root_nodes.iter().all(|node| {
@@ -4507,26 +4297,29 @@ mod tests {
         source_layer_id: u32,
         name: &str,
         source_order: usize,
-    ) -> Observation {
+    ) -> Observation<'_> {
         let parsed_name = parse_layer_name(name);
         Observation {
+            id: ObservationId(source_layer_id as usize),
+            evidence: Rc::new(LayerEvidence {
+                source_layer_id,
+                source_path: source_layer_id.to_string(),
+                name: name.to_string(),
+                normalized_name: parsed_name.normalized_name,
+                name_key: parsed_name.base_name,
+                generic_name: parsed_name.generic,
+                copy_suffixes: parsed_name.copy_suffixes,
+                suffix_limit_reached: parsed_name.suffix_limit_reached,
+                frame_container_ids: Vec::new(),
+                group_path: Vec::new(),
+                width: 1,
+                height: 1,
+                pixels: &[1, 2, 3, 255],
+            }),
             frame_index,
-            source_layer_id,
-            source_path: source_layer_id.to_string(),
-            name: name.to_string(),
-            normalized_name: parsed_name.normalized_name,
-            name_key: parsed_name.base_name,
-            generic_name: parsed_name.generic,
-            copy_suffixes: parsed_name.copy_suffixes,
-            suffix_limit_reached: parsed_name.suffix_limit_reached,
-            frame_container_ids: Vec::new(),
-            group_path: Vec::new(),
             source_order,
             x: 0,
             y: 0,
-            width: 1,
-            height: 1,
-            pixels: vec![1, 2, 3, 255],
         }
     }
 
@@ -4593,10 +4386,15 @@ mod tests {
 
     #[test]
     fn strict_order_rejects_an_unresolved_tie() {
-        let error = build_layer_write_plan_with_order_modes(
+        let error = super::build_layer_write_plan(
             &two_frame_order_document(false),
-            LayerZOrderMode::Stable,
-            StableOrderMode::Strict,
+            AutoAssociationOptions {
+                strategy: AssociationStrategy::Conservative {
+                    uncertain_layers: UncertainLayerMode::Group,
+                },
+                stable_order: StableOrderMode::Strict,
+                ..AutoAssociationOptions::default()
+            },
         )
         .expect_err("strict mode must reject a one-to-one order tie");
         assert!(error.contains("stable order unresolved"));
@@ -4604,9 +4402,15 @@ mod tests {
 
     #[test]
     fn overlapping_order_changes_use_per_frame_z_indices() {
-        let plan = build_layer_write_plan_with_z_order(
+        let plan = super::build_layer_write_plan(
             &two_frame_order_document(false),
-            LayerZOrderMode::Auto,
+            AutoAssociationOptions {
+                strategy: AssociationStrategy::Conservative {
+                    uncertain_layers: UncertainLayerMode::Group,
+                },
+                z_order: LayerZOrderMode::Auto,
+                ..AutoAssociationOptions::default()
+            },
         )
         .expect("association should succeed");
         let track_a = plan
@@ -4625,9 +4429,15 @@ mod tests {
 
     #[test]
     fn non_overlapping_order_changes_do_not_add_z_indices() {
-        let plan = build_layer_write_plan_with_z_order(
+        let plan = super::build_layer_write_plan(
             &two_frame_order_document(true),
-            LayerZOrderMode::Auto,
+            AutoAssociationOptions {
+                strategy: AssociationStrategy::Conservative {
+                    uncertain_layers: UncertainLayerMode::Group,
+                },
+                z_order: LayerZOrderMode::Auto,
+                ..AutoAssociationOptions::default()
+            },
         )
         .expect("association should succeed");
         assert!(

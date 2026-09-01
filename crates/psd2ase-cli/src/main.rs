@@ -3,11 +3,20 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use psd2ase_core::{
-    AssociationDecisionStatus, ConvertOptions, LayerAssociationMode, LayerAssociationStrategy,
-    LayerZOrderMode, StableOrderMode, UncertainLayerMode, VERSION, convert, inspect,
+    AssociationDecisionStatus, AssociationStrategy, AutoAssociationOptions, ConvertOptions,
+    LayerAssociation, LayerZOrderMode, StableOrderMode, UncertainLayerMode, VERSION, convert,
+    inspect,
 };
 
 const CONVERT_USAGE: &str = "usage: psd2ase convert INPUT [-o OUTPUT] [--overwrite] [--layer-association preserve|auto] [--association-strategy compact|conservative] [--z-order stable|auto] [--stable-order consensus|anchor|strict] [--uncertain-layers group|flat]";
+
+#[derive(Debug, PartialEq, Eq)]
+struct ConvertCommand {
+    input: PathBuf,
+    output: PathBuf,
+    overwrite: bool,
+    layer_association: LayerAssociation,
+}
 
 /// Runs the command-line entry point and returns its stable process result.
 fn main() -> ExitCode {
@@ -50,54 +59,13 @@ fn run_inspect(arguments: &[String]) -> Result<(), CliError> {
 
 /// Executes the conversion command with an optional output path and overwrite flag.
 fn run_convert(arguments: &[String]) -> Result<(), CliError> {
-    let (
-        input,
-        output,
-        overwrite,
-        layer_association,
-        association_strategy,
-        association_strategy_explicit,
-        z_order,
-        stable_order,
-        stable_order_explicit,
-        uncertain_layers,
-        uncertain_layers_explicit,
-    ) = convert_arguments(arguments)?;
-    if layer_association == LayerAssociationMode::Preserve && z_order == LayerZOrderMode::Auto {
-        return Err(CliError::Usage(
-            "--z-order auto requires --layer-association auto".to_string(),
-        ));
-    }
-    if layer_association == LayerAssociationMode::Preserve && stable_order_explicit {
-        return Err(CliError::Usage(
-            "--stable-order requires --layer-association auto".to_string(),
-        ));
-    }
-    if layer_association == LayerAssociationMode::Preserve && uncertain_layers_explicit {
-        return Err(CliError::Usage(
-            "--uncertain-layers requires --layer-association auto".to_string(),
-        ));
-    }
-    if layer_association == LayerAssociationMode::Preserve && association_strategy_explicit {
-        return Err(CliError::Usage(
-            "--association-strategy requires --layer-association auto".to_string(),
-        ));
-    }
-    if association_strategy == LayerAssociationStrategy::Compact && uncertain_layers_explicit {
-        return Err(CliError::Usage(
-            "--uncertain-layers requires --association-strategy conservative".to_string(),
-        ));
-    }
+    let command = convert_arguments(arguments)?;
     let report = convert(
-        &input,
-        &output,
+        &command.input,
+        &command.output,
         &ConvertOptions {
-            overwrite,
-            layer_association,
-            association_strategy,
-            z_order,
-            stable_order,
-            uncertain_layers,
+            overwrite: command.overwrite,
+            layer_association: command.layer_association,
         },
     )
     .map_err(|error| CliError::Conversion(error.to_string()))?;
@@ -106,12 +74,18 @@ fn run_convert(arguments: &[String]) -> Result<(), CliError> {
         println!("warning: {warning}");
     }
     if let Some(association) = report.association {
+        let exclusion_diagnostics = association.exclusion_diagnostics();
+        let family_diagnostics = association.family_diagnostics();
+        let name_diagnostics = association.name_diagnostics();
         println!(
             "layer association: {} observations -> {} logical tracks",
             association.observation_count, association.track_count
         );
         println!("layer-association z-order: {:?}", association.z_order_mode);
-        println!("layer-association strategy: {:?}", association.strategy);
+        println!(
+            "layer-association strategy: {}",
+            association.strategy.name()
+        );
         println!(
             "layer-association stable-order: {:?}",
             association.stable_order_mode
@@ -139,13 +113,13 @@ fn run_convert(arguments: &[String]) -> Result<(), CliError> {
         for diagnostic in association.stable_order_diagnostics {
             println!("layer-association stable-order diagnostic: {diagnostic}");
         }
-        for diagnostic in association.exclusion_diagnostics {
+        for diagnostic in exclusion_diagnostics {
             println!("layer-association exclusion diagnostic: {diagnostic}");
         }
-        for diagnostic in association.family_diagnostics {
+        for diagnostic in family_diagnostics {
             println!("layer-association family diagnostic: {diagnostic}");
         }
-        for diagnostic in association.name_diagnostics {
+        for diagnostic in name_diagnostics {
             println!("layer-association name diagnostic: {diagnostic}");
         }
         for candidate_group in association.candidate_groups {
@@ -218,32 +192,15 @@ fn run_convert(arguments: &[String]) -> Result<(), CliError> {
 }
 
 /// Parses the conversion input, output, and overwrite options.
-fn convert_arguments(
-    arguments: &[String],
-) -> Result<
-    (
-        PathBuf,
-        PathBuf,
-        bool,
-        LayerAssociationMode,
-        LayerAssociationStrategy,
-        bool,
-        LayerZOrderMode,
-        StableOrderMode,
-        bool,
-        UncertainLayerMode,
-        bool,
-    ),
-    CliError,
-> {
+fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
     if arguments.is_empty() {
         return Err(CliError::Usage(CONVERT_USAGE.to_string()));
     }
     let mut input = None;
     let mut output = None;
     let mut overwrite = false;
-    let mut layer_association = LayerAssociationMode::Preserve;
-    let mut association_strategy = LayerAssociationStrategy::Compact;
+    let mut automatic = false;
+    let mut conservative = false;
     let mut association_strategy_explicit = false;
     let mut z_order = LayerZOrderMode::Stable;
     let mut stable_order = StableOrderMode::Consensus;
@@ -259,9 +216,9 @@ fn convert_arguments(
                 let value = arguments
                     .get(index)
                     .ok_or_else(|| CliError::Usage(CONVERT_USAGE.to_string()))?;
-                layer_association = match value.as_str() {
-                    "preserve" => LayerAssociationMode::Preserve,
-                    "auto" => LayerAssociationMode::Auto,
+                automatic = match value.as_str() {
+                    "preserve" => false,
+                    "auto" => true,
                     _ => {
                         return Err(CliError::Usage(format!(
                             "invalid --layer-association value: {value:?}"
@@ -289,9 +246,9 @@ fn convert_arguments(
                 let value = arguments
                     .get(index)
                     .ok_or_else(|| CliError::Usage(CONVERT_USAGE.to_string()))?;
-                association_strategy = match value.as_str() {
-                    "compact" => LayerAssociationStrategy::Compact,
-                    "conservative" => LayerAssociationStrategy::Conservative,
+                conservative = match value.as_str() {
+                    "compact" => false,
+                    "conservative" => true,
                     _ => {
                         return Err(CliError::Usage(format!(
                             "invalid --association-strategy value: {value:?}"
@@ -354,19 +311,51 @@ fn convert_arguments(
     }
     let input = input.ok_or_else(|| CliError::Usage(CONVERT_USAGE.to_string()))?;
     let output = output.unwrap_or_else(|| input.with_extension("aseprite"));
-    Ok((
+    if !automatic && z_order == LayerZOrderMode::Auto {
+        return Err(CliError::Usage(
+            "--z-order auto requires --layer-association auto".to_string(),
+        ));
+    }
+    if !automatic && stable_order_explicit {
+        return Err(CliError::Usage(
+            "--stable-order requires --layer-association auto".to_string(),
+        ));
+    }
+    if !automatic && uncertain_layers_explicit {
+        return Err(CliError::Usage(
+            "--uncertain-layers requires --layer-association auto".to_string(),
+        ));
+    }
+    if !automatic && association_strategy_explicit {
+        return Err(CliError::Usage(
+            "--association-strategy requires --layer-association auto".to_string(),
+        ));
+    }
+    if !conservative && uncertain_layers_explicit {
+        return Err(CliError::Usage(
+            "--uncertain-layers requires --association-strategy conservative".to_string(),
+        ));
+    }
+    let layer_association = if automatic {
+        let strategy = if conservative {
+            AssociationStrategy::Conservative { uncertain_layers }
+        } else {
+            AssociationStrategy::Compact
+        };
+        LayerAssociation::Auto(AutoAssociationOptions {
+            strategy,
+            z_order,
+            stable_order,
+        })
+    } else {
+        LayerAssociation::Preserve
+    };
+    Ok(ConvertCommand {
         input,
         output,
         overwrite,
         layer_association,
-        association_strategy,
-        association_strategy_explicit,
-        z_order,
-        stable_order,
-        stable_order_explicit,
-        uncertain_layers,
-        uncertain_layers_explicit,
-    ))
+    })
 }
 
 /// Extracts the single positional path accepted by a phase-one command.
@@ -416,3 +405,133 @@ impl std::fmt::Display for CliError {
 }
 
 impl std::error::Error for CliError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn arguments(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn extension_preserve_arguments_use_the_preserve_configuration() {
+        let command = convert_arguments(&arguments(&["input.psd", "--output", "output.aseprite"]))
+            .expect("extension preserve arguments should parse");
+
+        assert_eq!(command.layer_association, LayerAssociation::Preserve);
+        assert_eq!(command.output, PathBuf::from("output.aseprite"));
+    }
+
+    #[test]
+    fn extension_compact_arguments_use_the_requested_ordering() {
+        let command = convert_arguments(&arguments(&[
+            "input.psd",
+            "--output",
+            "output.aseprite",
+            "--overwrite",
+            "--layer-association",
+            "auto",
+            "--association-strategy",
+            "compact",
+            "--z-order",
+            "auto",
+            "--stable-order",
+            "anchor",
+        ]))
+        .expect("extension compact arguments should parse");
+
+        assert!(command.overwrite);
+        assert_eq!(
+            command.layer_association,
+            LayerAssociation::Auto(AutoAssociationOptions {
+                strategy: AssociationStrategy::Compact,
+                z_order: LayerZOrderMode::Auto,
+                stable_order: StableOrderMode::Anchor,
+            })
+        );
+    }
+
+    #[test]
+    fn extension_conservative_arguments_encode_group_and_flat_policies() {
+        for uncertain_layers in [UncertainLayerMode::Group, UncertainLayerMode::Flat] {
+            let value = match uncertain_layers {
+                UncertainLayerMode::Group => "group",
+                UncertainLayerMode::Flat => "flat",
+            };
+            let command = convert_arguments(&arguments(&[
+                "input.psd",
+                "--output",
+                "output.aseprite",
+                "--layer-association",
+                "auto",
+                "--association-strategy",
+                "conservative",
+                "--z-order",
+                "stable",
+                "--stable-order",
+                "strict",
+                "--uncertain-layers",
+                value,
+            ]))
+            .expect("extension conservative arguments should parse");
+
+            assert_eq!(
+                command.layer_association,
+                LayerAssociation::Auto(AutoAssociationOptions {
+                    strategy: AssociationStrategy::Conservative { uncertain_layers },
+                    z_order: LayerZOrderMode::Stable,
+                    stable_order: StableOrderMode::Strict,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn preserve_rejects_auto_only_options_with_stable_messages() {
+        let cases = [
+            (
+                &["input.psd", "--z-order", "auto"][..],
+                "--z-order auto requires --layer-association auto",
+            ),
+            (
+                &["input.psd", "--stable-order", "anchor"][..],
+                "--stable-order requires --layer-association auto",
+            ),
+            (
+                &["input.psd", "--uncertain-layers", "flat"][..],
+                "--uncertain-layers requires --layer-association auto",
+            ),
+            (
+                &["input.psd", "--association-strategy", "conservative"][..],
+                "--association-strategy requires --layer-association auto",
+            ),
+        ];
+
+        for (values, expected) in cases {
+            let error =
+                convert_arguments(&arguments(values)).expect_err("options must be rejected");
+            assert_eq!(error.to_string(), expected);
+            assert_eq!(error.exit_code(), 64);
+        }
+    }
+
+    #[test]
+    fn compact_rejects_uncertain_layer_policy() {
+        let error = convert_arguments(&arguments(&[
+            "input.psd",
+            "--layer-association",
+            "auto",
+            "--association-strategy",
+            "compact",
+            "--uncertain-layers",
+            "flat",
+        ]))
+        .expect_err("compact uncertain-layer policy must be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "--uncertain-layers requires --association-strategy conservative"
+        );
+    }
+}

@@ -19,12 +19,10 @@ pub use layer_names::{
 };
 pub use logical_layers::{
     AssociationDecision, AssociationDecisionStatus, AssociationExclusionKind, AssociationPhase,
-    AssociationReport, CandidateGroupReport, CandidateTrackRelation, CandidateTrackRelationReport,
-    LayerAssociationMode, LayerAssociationStrategy, LayerWritePlan, LayerZOrderMode,
-    LogicalLayerTrack, PlannedCel, PlannedNode, StableOrderMode, UncertainLayerMode,
-    build_layer_write_plan, build_layer_write_plan_with_layout_modes,
-    build_layer_write_plan_with_order_modes, build_layer_write_plan_with_strategy_and_layout_modes,
-    build_layer_write_plan_with_z_order,
+    AssociationReport, AssociationStrategy, AutoAssociationOptions, CandidateGroupReport,
+    CandidateTrackRelation, CandidateTrackRelationReport, LayerAssociation, LayerWritePlan,
+    LayerZOrderMode, LogicalLayerTrack, PlannedCel, PlannedNode, StableOrderMode,
+    UncertainLayerMode, build_layer_write_plan,
 };
 pub use model::{
     DocumentInspection, NormalizedBounds, NormalizedDocument, NormalizedFrame, NormalizedLayer,
@@ -50,16 +48,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct ConvertOptions {
     /// Allow replacing an existing output path after successful validation.
     pub overwrite: bool,
-    /// Selects the source-preserving or experimental logical-layer output plan.
-    pub layer_association: LayerAssociationMode,
-    /// Selects compact baseline or conservative automatic identity matching.
-    pub association_strategy: LayerAssociationStrategy,
-    /// Selects stable track order or experimental per-cel Z-Index adjustments.
-    pub z_order: LayerZOrderMode,
-    /// Selects the stable logical-track ordering strategy.
-    pub stable_order: StableOrderMode,
-    /// Selects whether uncertain automatic tracks are grouped for review.
-    pub uncertain_layers: UncertainLayerMode,
+    /// Selects source-preserving output or a valid automatic association configuration.
+    pub layer_association: LayerAssociation,
 }
 
 /// Summary produced after a conversion has committed its output.
@@ -470,133 +460,6 @@ fn normalize_enum_name(value: &str) -> String {
     spaced.replace('_', " ").to_ascii_lowercase()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn state(frame_index: u32, enabled: bool) -> NormalizedLayerFrameState {
-        NormalizedLayerFrameState {
-            frame_index,
-            record_present: false,
-            enabled,
-            explicit_enable: false,
-            offset: None,
-            reference_point: None,
-            opacity: None,
-        }
-    }
-
-    fn layer(
-        id: u32,
-        kind: NormalizedLayerKind,
-        hidden: Option<bool>,
-        children: Vec<NormalizedLayer>,
-        frame_states: Vec<NormalizedLayerFrameState>,
-    ) -> NormalizedLayer {
-        NormalizedLayer {
-            id,
-            name: String::new(),
-            kind,
-            bounds: NormalizedBounds {
-                left: 0,
-                top: 0,
-                right: 1,
-                bottom: 1,
-            },
-            opacity: None,
-            blend_mode: None,
-            hidden,
-            pixels: None,
-            children,
-            frame_states,
-        }
-    }
-
-    #[test]
-    fn recursive_visibility_applies_ancestor_state_without_storing_a_list() {
-        let child = layer(
-            2,
-            NormalizedLayerKind::Pixel,
-            None,
-            Vec::new(),
-            vec![state(0, true)],
-        );
-        let group = layer(
-            1,
-            NormalizedLayerKind::Group,
-            Some(true),
-            vec![child],
-            vec![state(0, false)],
-        );
-        let mut visible = Vec::new();
-        group.collect_visible_pixel_layer_ids(0, true, &mut visible);
-        assert!(visible.is_empty());
-        assert!(!group.is_effectively_visible(0, true));
-    }
-
-    #[test]
-    fn static_frame_has_no_serialization_duration() {
-        let frame = NormalizedFrame {
-            index: 0,
-            source_id: None,
-            duration_ms: None,
-            dispose: None,
-        };
-        assert_eq!(frame.source_id, None);
-        assert_eq!(frame.duration_ms, None);
-    }
-
-    #[test]
-    fn pixel_data_is_owned_and_keeps_origin() {
-        let source = ag_psd::psd::PixelData {
-            width: 1,
-            height: 1,
-            data: vec![1, 2, 3, 4],
-        };
-        let normalized = copy_rgba8_pixels(
-            &source,
-            NormalizedBounds {
-                left: -4,
-                top: 7,
-                right: -3,
-                bottom: 8,
-            },
-            "test",
-        )
-        .expect("valid RGBA8 data");
-        assert_eq!(normalized.data, vec![1, 2, 3, 4]);
-        assert_eq!((normalized.left, normalized.top), (-4, 7));
-    }
-
-    #[test]
-    fn malformed_pixel_length_is_rejected() {
-        let source = ag_psd::psd::PixelData {
-            width: 1,
-            height: 1,
-            data: vec![1, 2, 3],
-        };
-        let error = copy_rgba8_pixels(
-            &source,
-            NormalizedBounds {
-                left: 0,
-                top: 0,
-                right: 1,
-                bottom: 1,
-            },
-            "test",
-        )
-        .expect_err("short pixel data must fail");
-        assert!(error.to_string().contains("pixel buffer length mismatch"));
-    }
-
-    #[test]
-    fn non_integral_and_out_of_range_bounds_are_rejected() {
-        assert!(integral_i32(Some(1.5), "left").is_err());
-        assert!(integral_i32(Some(i32::MAX as f64 + 1.0), "right").is_err());
-        assert!(integral_i32(Some(i32::MIN as f64 - 1.0), "top").is_err());
-    }
-}
-
 /// Converts a PSD into an Aseprite file after validation and mapping.
 pub fn convert(
     input: &Path,
@@ -614,16 +477,10 @@ pub fn convert(
     let document =
         normalize(input).map_err(|error| ConversionError::InputInspection(error.to_string()))?;
     let plan = match options.layer_association {
-        LayerAssociationMode::Preserve => None,
-        LayerAssociationMode::Auto => Some(
-            build_layer_write_plan_with_strategy_and_layout_modes(
-                &document,
-                options.association_strategy,
-                options.z_order,
-                options.stable_order,
-                options.uncertain_layers,
-            )
-            .map_err(|error| ConversionError::Writer(error.to_string()))?,
+        LayerAssociation::Preserve => None,
+        LayerAssociation::Auto(auto_options) => Some(
+            build_layer_write_plan(&document, auto_options)
+                .map_err(|error| ConversionError::Writer(error.to_string()))?,
         ),
     };
     let association = plan.as_ref().map(|plan| plan.report.clone());
@@ -650,12 +507,11 @@ pub fn convert(
     })
 }
 
-/// Validates an Aseprite file produced from the experimental logical plan.
-fn validate_planned_aseprite_output(
+/// Parses output bytes and validates the format-independent document header.
+fn read_and_validate_output_header(
     bytes: &[u8],
     document: &NormalizedDocument,
-    plan: &LayerWritePlan,
-) -> Result<(), ConversionError> {
+) -> Result<aseprite::AsepriteFile, ConversionError> {
     let file = aseprite::AsepriteFile::from_reader(Cursor::new(bytes))
         .map_err(|error| ConversionError::OutputValidation(error.to_string()))?;
     if file.width() != u16::try_from(document.canvas.0).unwrap_or(u16::MAX)
@@ -683,6 +539,16 @@ fn validate_planned_aseprite_output(
             )));
         }
     }
+    Ok(file)
+}
+
+/// Validates an Aseprite file produced from the experimental logical plan.
+fn validate_planned_aseprite_output(
+    bytes: &[u8],
+    document: &NormalizedDocument,
+    plan: &LayerWritePlan,
+) -> Result<(), ConversionError> {
+    let file = read_and_validate_output_header(bytes, document)?;
 
     let mut layers = Vec::new();
     flatten_planned_nodes(&plan.root_nodes, None, &mut layers);
@@ -736,13 +602,15 @@ fn validate_planned_aseprite_output(
                         )));
                     }
                     if let (Some(expected), Some(actual)) = (expected, actual) {
-                        let source = find_normalized_layer(document, expected.source_layer_id)
-                            .ok_or_else(|| {
-                                ConversionError::OutputValidation(format!(
-                                    "source layer {} is missing",
-                                    expected.source_layer_id
-                                ))
-                            })?;
+                        let source =
+                            document
+                                .find_layer(expected.source_layer_id)
+                                .ok_or_else(|| {
+                                    ConversionError::OutputValidation(format!(
+                                        "source layer {} is missing",
+                                        expected.source_layer_id
+                                    ))
+                                })?;
                         validate_cel(actual, source, frame_index)?;
                         if actual.z_index != expected.z_index {
                             return Err(ConversionError::OutputValidation(format!(
@@ -772,54 +640,12 @@ fn flatten_planned_nodes<'a>(
     }
 }
 
-/// Finds a normalized source layer by its stable ID.
-fn find_normalized_layer(document: &NormalizedDocument, id: u32) -> Option<&NormalizedLayer> {
-    fn find(layers: &[NormalizedLayer], id: u32) -> Option<&NormalizedLayer> {
-        for layer in layers {
-            if layer.id == id {
-                return Some(layer);
-            }
-            if let Some(found) = find(&layer.children, id) {
-                return Some(found);
-            }
-        }
-        None
-    }
-    find(&document.root_layers, id)
-}
-
 /// Validates the encoded Aseprite structure against the normalized source model.
 fn validate_aseprite_output(
     bytes: &[u8],
     document: &NormalizedDocument,
 ) -> Result<(), ConversionError> {
-    let file = aseprite::AsepriteFile::from_reader(Cursor::new(bytes))
-        .map_err(|error| ConversionError::OutputValidation(error.to_string()))?;
-    if file.width() != u16::try_from(document.canvas.0).unwrap_or(u16::MAX)
-        || file.height() != u16::try_from(document.canvas.1).unwrap_or(u16::MAX)
-    {
-        return Err(ConversionError::OutputValidation(
-            "canvas dimensions differ from normalized document".to_string(),
-        ));
-    }
-    if file.frames().len() != document.frames.len() {
-        return Err(ConversionError::OutputValidation(format!(
-            "frame count differs: expected {}, got {}",
-            document.frames.len(),
-            file.frames().len()
-        )));
-    }
-    for (index, frame) in document.frames.iter().enumerate() {
-        let expected = frame
-            .duration_ms
-            .unwrap_or(u32::from(DEFAULT_FRAME_DURATION_MS));
-        if u32::from(file.frames()[index].duration_ms) != expected {
-            return Err(ConversionError::OutputValidation(format!(
-                "frame {index} duration differs: expected {expected}, got {}",
-                file.frames()[index].duration_ms
-            )));
-        }
-    }
+    let file = read_and_validate_output_header(bytes, document)?;
 
     let mut layers = Vec::new();
     flatten_layers(&document.root_layers, None, &mut layers);
@@ -995,3 +821,6 @@ fn commit_output(output: &Path, bytes: &[u8], overwrite: bool) -> Result<(), Con
     }
     result
 }
+
+#[cfg(test)]
+mod tests;

@@ -391,7 +391,7 @@ struct NormalizedLayerFrameSnapshot {
     opacity: Option<f64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 struct AnimationSummary {
     resource_ids: Vec<u16>,
     frames: Vec<AnimationFrameSnapshot>,
@@ -445,18 +445,4 @@ struct AnimationFlagsSnapshot {
     unify_layer_position: bool,
     unify_layer_style: bool,
     unify_layer_visibility: bool,
-}
-
-impl Default for AnimationSummary {
-    fn default() -> Self {
-        Self {
-            resource_ids: Vec::new(),
-            frames: Vec::new(),
-            loop_mode: None,
-            active_frame: None,
-            layer_states: Vec::new(),
-            visible_pixel_layers: Vec::new(),
-            frame_flags: None,
-        }
-    }
 }
