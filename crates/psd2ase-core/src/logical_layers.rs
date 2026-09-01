@@ -543,4 +543,5 @@ pub fn build_layer_write_plan(
     Ok(plan)
 }
 #[cfg(test)]
+#[path = "tests/logical_layers.rs"]
 mod tests;

@@ -27,6 +27,17 @@ pwsh -File tools/probe.ps1
 Use a real PSD supplied outside the repository for compatibility testing. Do
 not add customer artwork or private fixtures to Git.
 
+## Test layout
+
+Unit tests are centralized under each crate's `src/tests/` directory and are
+split by the production owner (`core`, `layer_names`, `aseprite_writer`,
+`logical_layers`, and `photoshop_animation`). Production modules only declare
+their test module with `#[cfg(test)]` and a `#[path = "tests/..."]` attribute;
+the tests therefore retain private access without scattering test bodies beside
+production code. The CLI follows the same convention under
+`crates/psd2ase-cli/src/tests/`. Crate-level `tests/` directories are reserved
+for future black-box integration tests that exercise only public APIs.
+
 The probe runner reads `path\to\fixture.psd` by default. Set
 `PSD2ASE_FIXTURE` or pass `-InputPath` to select another local fixture. It
 writes only ignored JSON snapshots under `.probe/`, verifies the source file's

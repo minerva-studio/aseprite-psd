@@ -823,4 +823,5 @@ fn commit_output(output: &Path, bytes: &[u8], overwrite: bool) -> Result<(), Con
 }
 
 #[cfg(test)]
+#[path = "tests/core.rs"]
 mod tests;

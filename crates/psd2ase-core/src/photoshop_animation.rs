@@ -1015,4 +1015,5 @@ impl<'a> Cursor<'a> {
 
 #[cfg(test)]
 #[cfg(test)]
+#[path = "tests/photoshop_animation.rs"]
 mod tests;
