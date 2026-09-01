@@ -29,7 +29,10 @@ below.
 To export, choose **File > Save As...** and select `.psd` or `.psb`. The
 extension snapshots isolated original and flattened copies, runs the bundled
 converter, validates the Photoshop document, and only then writes it through
-Aseprite's custom-format save stream. Ctrl+S reuses the selected format.
+Aseprite's custom-format save stream. The save options let you choose whether
+the current frame is written as Photoshop's active frame; Ctrl+S reuses the
+selected format and options, including channel compression (`ZIP`, `ZIP
+prediction`, `RLE`, or `Raw`).
 
 ## Command line
 
@@ -38,6 +41,9 @@ Build the native CLI with Rust 1.88 or newer:
 ```text
 cargo build --release --locked -p psd2ase
 ```
+
+The export command accepts `--compression raw|rle|zip|zip-prediction`; omitted
+means the existing ZIP-without-prediction default.
 
 Build the Windows x64 Aseprite extension in one step (the script builds the
 release converter and embeds it in the package):

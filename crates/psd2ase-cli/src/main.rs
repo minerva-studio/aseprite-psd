@@ -4,13 +4,13 @@ use std::process::ExitCode;
 
 use psd2ase_core::{
     AssociationDecisionStatus, AssociationStrategy, AutoAssociationOptions, ConvertOptions,
-    ExportOptions, JitterKind, JitterMode, JitterOptions, JitterProfile, LayerAssociation,
-    LayerZOrderMode, LinkedCelMode, StableOrderMode, UncertainLayerMode, VERSION, convert, export,
-    inspect, write_report_with_active_frame,
+    ExportCompression, ExportOptions, JitterKind, JitterMode, JitterOptions, JitterProfile,
+    LayerAssociation, LayerZOrderMode, LinkedCelMode, StableOrderMode, UncertainLayerMode, VERSION,
+    convert, export, inspect, write_report_with_active_frame,
 };
 
 const CONVERT_USAGE: &str = "usage: psd2ase convert INPUT [-o OUTPUT] [--report PATH] [--overwrite] [--preserve-photoshop-metadata] [--linked-cels off|identical] [--layer-association preserve|auto] [--association-strategy compact|conservative] [--z-order stable|auto] [--stable-order consensus|anchor|strict] [--uncertain-layers group|flat] [--jitter-mode off|report|assist|repair] [--jitter-kind alpha|color|all] [--jitter-profile conservative|balanced] [--jitter-alpha-threshold N] [--jitter-max-speck-area N] [--jitter-max-changed-ratio N] [--jitter-max-channel-delta N]";
-const EXPORT_USAGE: &str = "usage: psd2ase export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite [--active-frame-index N] [--report PATH] [--overwrite]";
+const EXPORT_USAGE: &str = "usage: psd2ase export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite [--active-frame-index N] [--compression raw|rle|zip|zip-prediction] [--report PATH] [--overwrite]";
 
 #[derive(Debug, PartialEq, Eq)]
 struct ConvertCommand {
@@ -32,6 +32,7 @@ struct ExportCommand {
     report: Option<PathBuf>,
     overwrite: bool,
     active_frame_index: Option<u32>,
+    compression: Option<ExportCompression>,
 }
 
 /// Runs the command-line entry point and returns its stable process result.
@@ -73,6 +74,7 @@ fn run_export(arguments: &[String]) -> Result<(), CliError> {
         &ExportOptions {
             overwrite: command.overwrite,
             active_frame_index: command.active_frame_index,
+            compression: command.compression,
         },
     )
     .map_err(|error| CliError::Conversion(error.to_string()))?;
@@ -614,6 +616,7 @@ fn export_arguments(arguments: &[String]) -> Result<ExportCommand, CliError> {
     let mut report = None;
     let mut overwrite = false;
     let mut active_frame_index = None;
+    let mut compression = None;
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
@@ -655,6 +658,17 @@ fn export_arguments(arguments: &[String]) -> Result<ExportCommand, CliError> {
                         })?,
                 );
             }
+            "--compression" => {
+                index += 1;
+                let value = arguments
+                    .get(index)
+                    .ok_or_else(|| CliError::Usage(EXPORT_USAGE.to_string()))?;
+                compression = Some(ExportCompression::parse(value).ok_or_else(|| {
+                    CliError::Usage(
+                        "--compression expects raw, rle, zip, or zip-prediction".to_string(),
+                    )
+                })?);
+            }
             "--overwrite" => overwrite = true,
             value if value.starts_with('-') => {
                 return Err(CliError::Usage(format!("unknown export option: {value}")));
@@ -674,6 +688,7 @@ fn export_arguments(arguments: &[String]) -> Result<ExportCommand, CliError> {
         report,
         overwrite,
         active_frame_index,
+        compression,
     })
 }
 

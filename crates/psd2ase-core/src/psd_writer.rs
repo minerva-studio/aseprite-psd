@@ -10,8 +10,8 @@ use ag_psd::descriptor::{
 };
 use ag_psd::psd::{
     AnimationDispose, AnimationFrame, AnimationFrameFlags, AnimationFrameInfo, AnimationInfo,
-    Animations, BlendMode, ColorMode, ImageResources, Layer, LayerAdditionalInfo, PixelData,
-    PointF, Psd, ReadOptions, WriteOptions,
+    Animations, BlendMode, ColorMode, Compression, ImageResources, Layer, LayerAdditionalInfo,
+    PixelData, PointF, Psd, ReadOptions, WriteOptions,
 };
 use ag_psd::reader::PsdReader;
 use ag_psd::writer::{
@@ -33,6 +33,59 @@ pub struct ExportOptions {
     pub overwrite: bool,
     /// Current Aseprite frame to write as Photoshop's zero-based active frame.
     pub active_frame_index: Option<u32>,
+    /// Channel compression policy; `None` preserves the existing ZIP default.
+    pub compression: Option<ExportCompression>,
+}
+
+/// Compression modes supported by the PSD/PSB writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportCompression {
+    /// Store channel bytes without compression.
+    Raw,
+    /// Pack channel rows with PackBits RLE.
+    Rle,
+    /// ZIP-compress channel bytes without prediction.
+    Zip,
+    /// ZIP-compress channel bytes after horizontal prediction.
+    ZipPrediction,
+}
+
+impl Default for ExportCompression {
+    fn default() -> Self {
+        Self::Zip
+    }
+}
+
+impl ExportCompression {
+    /// Returns the stable CLI token for this compression mode.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Rle => "rle",
+            Self::Zip => "zip",
+            Self::ZipPrediction => "zip-prediction",
+        }
+    }
+
+    /// Parses the stable CLI token.
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "raw" => Self::Raw,
+            "rle" => Self::Rle,
+            "zip" => Self::Zip,
+            "zip-prediction" => Self::ZipPrediction,
+            _ => return None,
+        })
+    }
+
+    fn ag_psd(self) -> Compression {
+        match self {
+            Self::Raw => Compression::RawData,
+            Self::Rle => Compression::RleCompressed,
+            Self::Zip => Compression::ZipWithoutPrediction,
+            Self::ZipPrediction => Compression::ZipWithPrediction,
+        }
+    }
 }
 
 /// Result of one committed Aseprite-to-Photoshop export.
@@ -89,7 +142,8 @@ pub fn export(
     let write_options = WriteOptions {
         no_background: Some(true),
         psb: Some(psb),
-        compress: Some(true),
+        compress: (options.compression.is_none()).then_some(true),
+        compression: options.compression.map(ExportCompression::ag_psd),
         trim_image_data: Some(false),
         ..Default::default()
     };
@@ -101,7 +155,13 @@ pub fn export(
     if options.active_frame_index.is_none() {
         encoded = omit_active_frame_descriptor(encoded)?;
     }
-    validate_output(&encoded, &source.document, &source.composites, psb)?;
+    validate_output(
+        &encoded,
+        &source.document,
+        &source.composites,
+        psb,
+        options.compression,
+    )?;
     commit_bytes(output, &encoded, options.overwrite).map_err(ExportError::OutputIo)?;
 
     Ok(ExportReport {
@@ -803,6 +863,7 @@ struct LayerRecordLayout {
     layer_info_length_offset: usize,
     layer_info_length: usize,
     records: Vec<LayerRecord>,
+    channel_compressions: Vec<(u16, usize)>,
 }
 
 #[derive(Debug)]
@@ -832,11 +893,18 @@ fn layer_record_layout(bytes: &[u8], psb: bool) -> Result<LayerRecordLayout, Exp
     let count = read_be_i16(bytes, cursor)?.unsigned_abs() as usize;
     cursor += 2;
     let mut records = Vec::with_capacity(count);
+    let mut channel_lengths_by_record = Vec::with_capacity(count);
     for _ in 0..count {
         checked_advance(bytes, &mut cursor, 16)?;
         let channels = read_be_u16(bytes, cursor)? as usize;
         cursor += 2;
-        checked_advance(bytes, &mut cursor, channels * (2 + if psb { 8 } else { 4 }))?;
+        let mut channel_lengths = Vec::with_capacity(channels);
+        for _ in 0..channels {
+            checked_advance(bytes, &mut cursor, 2)?;
+            let length = read_be_length(bytes, cursor, psb)?;
+            cursor += if psb { 8 } else { 4 };
+            channel_lengths.push(length);
+        }
         checked_advance(bytes, &mut cursor, 12)?;
         let extra_length_offset = cursor;
         let extra_length = read_be_u32(bytes, cursor)? as usize;
@@ -853,7 +921,20 @@ fn layer_record_layout(bytes: &[u8], psb: bool) -> Result<LayerRecordLayout, Exp
             extra_end,
             layer_id,
         });
+        channel_lengths_by_record.push(channel_lengths);
         cursor = extra_end;
+    }
+    let mut channel_compressions = Vec::new();
+    for channel_lengths in channel_lengths_by_record {
+        for length in channel_lengths {
+            channel_compressions.push((read_be_u16(bytes, cursor)?, length));
+            cursor = cursor
+                .checked_add(length)
+                .filter(|end| *end <= bytes.len())
+                .ok_or_else(|| {
+                    ExportError::Writer("layer channel data exceeds output".to_string())
+                })?;
+        }
     }
     Ok(LayerRecordLayout {
         layer_mask_length_offset,
@@ -861,6 +942,7 @@ fn layer_record_layout(bytes: &[u8], psb: bool) -> Result<LayerRecordLayout, Exp
         layer_info_length_offset,
         layer_info_length,
         records,
+        channel_compressions,
     })
 }
 
@@ -913,6 +995,7 @@ fn validate_output(
     expected: &NormalizedDocument,
     composites: &[Vec<u8>],
     psb: bool,
+    compression: Option<ExportCompression>,
 ) -> Result<(), ExportError> {
     let version = read_be_u16(bytes, 4)?;
     if version != if psb { 2 } else { 1 } {
@@ -943,6 +1026,9 @@ fn validate_output(
         ));
     }
     validate_layer_records(bytes, expected, psb)?;
+    if let Some(compression) = compression {
+        validate_channel_compression(bytes, psb, compression.ag_psd() as u16)?;
+    }
     let (normalized, _) = crate::normalize_bytes(bytes)
         .map_err(|error| ExportError::OutputValidation(error.to_string()))?;
     compare_normalized(expected, &normalized)?;
@@ -977,6 +1063,27 @@ fn validate_output(
                 .copied()
                 .unwrap_or_default()
         )));
+    }
+    Ok(())
+}
+
+/// Verifies that layer and composite channel headers use the requested mode.
+fn validate_channel_compression(bytes: &[u8], psb: bool, expected: u16) -> Result<(), ExportError> {
+    let layout = layer_record_layout(bytes, psb)?;
+    for (compression, length) in layout.channel_compressions {
+        // ag-psd intentionally stores an empty channel as a two-byte raw payload.
+        if compression != expected && !(compression == Compression::RawData as u16 && length == 2) {
+            return Err(ExportError::OutputValidation(format!(
+                "encoded channel compression differs: expected {expected}, got {compression}"
+            )));
+        }
+    }
+    let composite_start =
+        layout.layer_mask_length_offset + if psb { 8 } else { 4 } + layout.layer_mask_length;
+    if read_be_u16(bytes, composite_start)? != expected {
+        return Err(ExportError::OutputValidation(
+            "encoded composite compression differs from requested mode".to_string(),
+        ));
     }
     Ok(())
 }
@@ -1371,6 +1478,36 @@ mod tests {
             3
         );
 
+        for (index, compression) in [
+            ExportCompression::Raw,
+            ExportCompression::Rle,
+            ExportCompression::Zip,
+            ExportCompression::ZipPrediction,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mode_output = directory.join(format!("compression-{index}.psd"));
+            let report = export(
+                &input,
+                &composite,
+                &mode_output,
+                &ExportOptions {
+                    compression: Some(compression),
+                    ..Default::default()
+                },
+            )
+            .expect("export selected compression");
+            assert_eq!(report.output, mode_output);
+            assert_eq!(
+                crate::normalize(&mode_output)
+                    .expect("normalize selected compression")
+                    .frames
+                    .len(),
+                3
+            );
+        }
+
         let active_report = export(
             &input,
             &composite,
@@ -1568,6 +1705,22 @@ mod tests {
         assert_eq!(loss.locations[0].path, "Future blend");
         assert!(loss.visual_impact);
         assert!(loss.editability_impact);
+    }
+
+    #[test]
+    fn export_compression_tokens_are_stable_and_distinct() {
+        let modes = [
+            ExportCompression::Raw,
+            ExportCompression::Rle,
+            ExportCompression::Zip,
+            ExportCompression::ZipPrediction,
+        ];
+        let tokens = modes.map(ExportCompression::as_str);
+        assert_eq!(tokens, ["raw", "rle", "zip", "zip-prediction"]);
+        for mode in modes {
+            assert_eq!(ExportCompression::parse(mode.as_str()), Some(mode));
+        }
+        assert_eq!(ExportCompression::parse("unsupported"), None);
     }
 
     /// Returns the one visible cel contract for every round-tripped frame.

@@ -51,7 +51,7 @@ pub use photoshop_animation::{
     LayerFrameState, LoopMode, PhotoshopAnimation, PhotoshopFrame, VisibleFrameLayers,
     parse_photoshop_animation,
 };
-pub use psd_writer::{ExportOptions, ExportReport, export};
+pub use psd_writer::{ExportCompression, ExportOptions, ExportReport, export};
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};

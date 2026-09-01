@@ -153,7 +153,7 @@ local function build_arguments(binary, input, output, options)
 end
 
 --- Builds the single Rust export command used by the custom file-format saver.
-local function build_export_arguments(binary, input, output, composite, report, active_frame_index)
+local function build_export_arguments(binary, input, output, composite, report, active_frame_index, compression)
   local arguments = {
     binary,
     "export",
@@ -169,7 +169,49 @@ local function build_export_arguments(binary, input, output, composite, report, 
     table.insert(arguments, "--active-frame-index")
     table.insert(arguments, active_frame_index)
   end
+  if compression ~= nil then
+    table.insert(arguments, "--compression")
+    table.insert(arguments, compression)
+  end
   return arguments
+end
+
+--- Shows the existing export choices shared by custom Save As and the fallback menu.
+local function select_export_options()
+  local dialog = Dialog{ title="Export PSD/PSB Options" }
+  if not dialog then
+    show_error("PSD export failed", "Aseprite does not have an available UI.")
+    return nil
+  end
+  dialog:combobox{
+    id="active_frame",
+    label="Active frame",
+    option="Current frame",
+    options={"Current frame", "No active frame"},
+  }
+  dialog:newrow()
+  dialog:combobox{
+    id="compression",
+    label="Compression",
+    option="ZIP",
+    options={"ZIP", "ZIP prediction", "RLE", "Raw"},
+  }
+  dialog:newrow()
+  dialog:button{ id="export", text="Export", focus=true }
+  dialog:button{ id="cancel", text="Cancel" }
+  dialog:show()
+  if not dialog.data.export then
+    return nil
+  end
+  return {
+    use_active_frame = dialog.data.active_frame == "Current frame",
+    compression = ({
+      ["ZIP"] = "zip",
+      ["ZIP prediction"] = "zip-prediction",
+      ["RLE"] = "rle",
+      ["Raw"] = "raw",
+    })[dialog.data.compression] or "zip",
+  }
 end
 
 --- Builds an ASCII-only PowerShell launcher for Unicode Windows arguments.
@@ -255,13 +297,13 @@ local function run_conversion(binary, input, output, options)
 end
 
 --- Runs the Aseprite export subcommand through the common converter launcher.
-local function run_export_conversion(binary, input, output, composite, report, active_frame_index)
+local function run_export_conversion(binary, input, output, composite, report, active_frame_index, compression)
   if not app.fs.isFile(input) or not app.fs.isFile(composite) then
     error("Aseprite export snapshots were not created.")
   end
   return run_converter(
     binary,
-    build_export_arguments(binary, input, output, composite, report, active_frame_index),
+    build_export_arguments(binary, input, output, composite, report, active_frame_index, compression),
     output)
 end
 
@@ -739,12 +781,18 @@ local function save_photoshop_document(binary, ev)
     show_error("PSD export failed", "The destination must use a .psd or .psb extension.")
     return false
   end
+  local export_options = select_export_options()
+  if not export_options then
+    return false
+  end
   local original_filename = temporary_path("aseprite")
   local composite_filename = temporary_path("aseprite")
   local output_filename = temporary_path(extension)
   local report_filename = temporary_path("json")
   local success, result = pcall(function()
-    local active_frame_index = current_frame_index(ev.sprite)
+    local active_frame_index = export_options.use_active_frame
+      and current_frame_index(ev.sprite)
+      or nil
     create_export_snapshots(ev.sprite, original_filename, composite_filename)
     run_export_conversion(
       binary,
@@ -752,7 +800,8 @@ local function save_photoshop_document(binary, ev)
       output_filename,
       composite_filename,
       report_filename,
-      active_frame_index)
+      active_frame_index,
+      export_options.compression)
     local bytes = read_text_file(output_filename)
     if bytes == "" then
       error("The converter produced an empty Photoshop document.")
@@ -819,13 +868,19 @@ local function export_from_menu(binary)
   if not destination then
     return
   end
+  local export_options = select_export_options()
+  if not export_options then
+    return
+  end
   local extension = (app.fs.fileExtension(destination) or ""):lower()
   local original_filename = temporary_path("aseprite")
   local composite_filename = temporary_path("aseprite")
   local output_filename = temporary_path(extension)
   local report_filename = temporary_path("json")
   local success, result = pcall(function()
-    local active_frame_index = current_frame_index(app.sprite)
+    local active_frame_index = export_options.use_active_frame
+      and current_frame_index(app.sprite)
+      or nil
     create_export_snapshots(app.sprite, original_filename, composite_filename)
     run_export_conversion(
       binary,
@@ -833,7 +888,8 @@ local function export_from_menu(binary)
       output_filename,
       composite_filename,
       report_filename,
-      active_frame_index)
+      active_frame_index,
+      export_options.compression)
     local bytes = read_text_file(output_filename)
     if bytes == "" then
       error("The converter produced an empty Photoshop document.")

@@ -237,7 +237,33 @@ fn export_requires_composite_and_preserves_all_paths() {
     assert_eq!(command.composite, PathBuf::from("flattened.aseprite"));
     assert_eq!(command.report, Some(PathBuf::from("loss.json")));
     assert_eq!(command.active_frame_index, Some(8));
+    assert_eq!(command.compression, None);
     assert!(command.overwrite);
+
+    for value in ["raw", "rle", "zip", "zip-prediction"] {
+        let parsed = export_arguments(&arguments(&[
+            "source.aseprite",
+            "-o",
+            "output.psd",
+            "--composite",
+            "flattened.aseprite",
+            "--compression",
+            value,
+        ]))
+        .expect("compression should parse");
+        assert_eq!(parsed.compression.map(|mode| mode.as_str()), Some(value));
+    }
+    let error = export_arguments(&arguments(&[
+        "source.aseprite",
+        "-o",
+        "output.psd",
+        "--composite",
+        "flattened.aseprite",
+        "--compression",
+        "invalid",
+    ]))
+    .expect_err("unknown compression should be rejected");
+    assert!(error.to_string().contains("--compression expects"));
 
     let error = export_arguments(&arguments(&["source.aseprite", "-o", "output.psd"]))
         .expect_err("composite snapshot is mandatory");
