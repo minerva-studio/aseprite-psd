@@ -5,7 +5,7 @@ use aseprite::{
     LinkedCelOptions, LoopDirection, Pixels,
 };
 
-use crate::aseprite_metadata::{active_frame_user_data, reference_point_user_data};
+use crate::aseprite_metadata::reference_point_user_data;
 use crate::photoshop_metadata::has_meaningful_reference_point;
 use crate::{
     InformationLocation, InformationLossCode, LayerWritePlan, LogicalLayerTrack, LossDisposition,
@@ -181,12 +181,6 @@ fn initialize_file(
         )
         .map_err(|error| WriterError::Aseprite(error.to_string()))?;
     }
-    if let Some(user_data) =
-        active_frame_user_data(document.active_frame_index, document.frames.len())
-    {
-        file.set_sprite_user_data(user_data);
-    }
-
     Ok((file, warnings))
 }
 

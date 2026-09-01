@@ -153,8 +153,8 @@ local function build_arguments(binary, input, output, options)
 end
 
 --- Builds the single Rust export command used by the custom file-format saver.
-local function build_export_arguments(binary, input, output, composite, report)
-  return {
+local function build_export_arguments(binary, input, output, composite, report, active_frame_index)
+  local arguments = {
     binary,
     "export",
     input,
@@ -165,6 +165,11 @@ local function build_export_arguments(binary, input, output, composite, report)
     "--report",
     report,
   }
+  if active_frame_index ~= nil then
+    table.insert(arguments, "--active-frame-index")
+    table.insert(arguments, active_frame_index)
+  end
+  return arguments
 end
 
 --- Builds an ASCII-only PowerShell launcher for Unicode Windows arguments.
@@ -250,13 +255,13 @@ local function run_conversion(binary, input, output, options)
 end
 
 --- Runs the Aseprite export subcommand through the common converter launcher.
-local function run_export_conversion(binary, input, output, composite, report)
+local function run_export_conversion(binary, input, output, composite, report, active_frame_index)
   if not app.fs.isFile(input) or not app.fs.isFile(composite) then
     error("Aseprite export snapshots were not created.")
   end
   return run_converter(
     binary,
-    build_export_arguments(binary, input, output, composite, report),
+    build_export_arguments(binary, input, output, composite, report, active_frame_index),
     output)
 end
 
@@ -299,7 +304,7 @@ local function show_information_loss(report_filename, operation)
   if raw == "" then return end
   local ok, report, losses = pcall(function()
     local decoded = json.decode(raw)
-    if decoded.schema_version ~= 1 then
+    if decoded.schema_version ~= 1 and decoded.schema_version ~= 2 and decoded.schema_version ~= 3 then
       return nil, nil
     end
     local decoded_losses = decoded.losses or {}
@@ -596,13 +601,26 @@ local function suggested_output_path(input)
   return app.fs.joinPath(app.fs.filePath(input), app.fs.fileTitle(input) .. ".aseprite")
 end
 
---- Applies the imported Photoshop active frame to the Aseprite UI.
-local function apply_imported_active_frame(sprite)
-  local frame_index
-  local read_ok = pcall(function()
-    frame_index = sprite.properties.psd2ase_active_frame_index
-  end)
-  if not read_ok or type(frame_index) ~= "number" then
+--- Reads the optional source active frame from a temporary conversion report.
+local function read_imported_active_frame(report_filename)
+  local raw = read_text_file(report_filename)
+  if raw == "" then
+    return
+  end
+  local ok, report = pcall(json.decode, raw)
+  if not ok or type(report) ~= "table" then
+    return
+  end
+  local frame_index = report.active_frame_index
+  if type(frame_index) ~= "number" or frame_index < 0 or frame_index % 1 ~= 0 then
+    return
+  end
+  return frame_index
+end
+
+--- Applies a temporary imported Photoshop active frame to the Aseprite UI.
+local function apply_imported_active_frame(sprite, frame_index)
+  if type(frame_index) ~= "number" then
     return
   end
   if frame_index < 0 or frame_index >= #sprite.frames then
@@ -612,8 +630,24 @@ local function apply_imported_active_frame(sprite)
   app.frame = frame_index + 1
 end
 
+--- Returns the current sprite frame as a zero-based export index.
+local function current_frame_index(sprite)
+  if not sprite or app.sprite ~= sprite then
+    error("The PSD export source is not the active Aseprite sprite.")
+  end
+  local frame = app.frame
+  if type(frame) ~= "number" or frame % 1 ~= 0 then
+    error("Aseprite did not provide a numeric current frame.")
+  end
+  local frame_index = frame - 1
+  if frame_index < 0 or frame_index >= #sprite.frames then
+    error("The current Aseprite frame is outside the sprite timeline.")
+  end
+  return frame_index
+end
+
 --- Opens and duplicates a converted file as an unassociated, modified document.
-local function open_as_unsaved_document(filename, suggested_filename)
+local function open_as_unsaved_document(filename, suggested_filename, active_frame_index)
   local temporary_sprite = app.open(filename)
   if not temporary_sprite then
     error("Aseprite could not open the generated temporary file: " .. filename)
@@ -626,7 +660,7 @@ local function open_as_unsaved_document(filename, suggested_filename)
       error("Aseprite could not duplicate the generated temporary document.")
     end
     sprite.filename = suggested_filename
-    apply_imported_active_frame(sprite)
+    apply_imported_active_frame(sprite, active_frame_index)
     app.transaction("Mark imported PSD as modified", function()
       local marker_layer = sprite:newLayer()
       sprite:deleteLayer(marker_layer)
@@ -684,6 +718,16 @@ local function create_export_snapshots(source, original_filename, composite_file
   end
 end
 
+--- Writes binary export bytes to a user-selected destination.
+local function write_binary_file(filename, bytes)
+  local file = io.open(filename, "wb")
+  if not file then
+    error("Could not open the PSD export destination for writing: " .. filename)
+  end
+  file:write(bytes)
+  file:close()
+end
+
 --- Exports one sprite into a verified temporary PSD/PSB and commits it to ev.file.
 local function save_photoshop_document(binary, ev)
   if not binary then
@@ -700,13 +744,15 @@ local function save_photoshop_document(binary, ev)
   local output_filename = temporary_path(extension)
   local report_filename = temporary_path("json")
   local success, result = pcall(function()
+    local active_frame_index = current_frame_index(ev.sprite)
     create_export_snapshots(ev.sprite, original_filename, composite_filename)
     run_export_conversion(
       binary,
       original_filename,
       output_filename,
       composite_filename,
-      report_filename)
+      report_filename,
+      active_frame_index)
     local bytes = read_text_file(output_filename)
     if bytes == "" then
       error("The converter produced an empty Photoshop document.")
@@ -726,6 +772,84 @@ local function save_photoshop_document(binary, ev)
   return true
 end
 
+--- Shows the fallback PSD/PSB destination picker for hosts without file-format registration.
+local function select_export_destination()
+  local dialog = Dialog{ title="Export PSD/PSB" }
+  if not dialog then
+    show_error("PSD export failed", "Aseprite does not have an available UI.")
+    return nil
+  end
+  dialog:file{
+    id="destination",
+    label="PSD/PSB",
+    title="Select Photoshop export destination",
+    save=true,
+    entry=true,
+    filetypes={"psd", "psb"},
+  }
+  dialog:button{ id="export", text="Export", focus=true }
+  dialog:button{ id="cancel", text="Cancel" }
+  dialog:show()
+  if not dialog.data.export then
+    return nil
+  end
+  local destination = dialog.data.destination
+  if not destination or destination == "" then
+    return nil
+  end
+  local extension = (app.fs.fileExtension(destination) or ""):lower()
+  if extension ~= "psd" and extension ~= "psb" then
+    show_error("PSD export failed", "The destination must use a .psd or .psb extension.")
+    return nil
+  end
+  return destination
+end
+
+--- Exports the active sprite through the fallback PSD/PSB menu command.
+local function export_from_menu(binary)
+  if not binary then
+    show_error("PSD export failed", "This extension has no converter for the current platform.")
+    return
+  end
+  if not app.sprite then
+    show_error("PSD export failed", "There is no active Aseprite sprite to export.")
+    return
+  end
+  local destination = select_export_destination()
+  if not destination then
+    return
+  end
+  local extension = (app.fs.fileExtension(destination) or ""):lower()
+  local original_filename = temporary_path("aseprite")
+  local composite_filename = temporary_path("aseprite")
+  local output_filename = temporary_path(extension)
+  local report_filename = temporary_path("json")
+  local success, result = pcall(function()
+    local active_frame_index = current_frame_index(app.sprite)
+    create_export_snapshots(app.sprite, original_filename, composite_filename)
+    run_export_conversion(
+      binary,
+      original_filename,
+      output_filename,
+      composite_filename,
+      report_filename,
+      active_frame_index)
+    local bytes = read_text_file(output_filename)
+    if bytes == "" then
+      error("The converter produced an empty Photoshop document.")
+    end
+    write_binary_file(destination, bytes)
+    show_information_loss(report_filename, "export")
+  end)
+  remove_file(original_filename)
+  remove_file(composite_filename)
+  remove_file(output_filename)
+  remove_file(report_filename)
+  if not success then
+    show_error("PSD export failed", tostring(result))
+  end
+end
+
 --- Executes the menu-driven import workflow through a temporary output file.
 local function import_from_menu(binary)
   local options = select_import_options()
@@ -736,7 +860,10 @@ local function import_from_menu(binary)
   options.report = temporary_path("json")
   local success, result = pcall(function()
     run_conversion(binary, options.input, temporary_output, options)
-    open_as_unsaved_document(temporary_output, suggested_output_path(options.input))
+    open_as_unsaved_document(
+      temporary_output,
+      suggested_output_path(options.input),
+      read_imported_active_frame(options.report))
     show_information_loss(options.report)
   end)
   remove_file(temporary_output)
@@ -761,6 +888,14 @@ function init(plugin)
       import_from_menu(binary)
     end,
   }
+  plugin:newCommand{
+    id="Psd2aseExport",
+    title="Export PSD/PSB...",
+    group="file_export",
+    onclick=function()
+      export_from_menu(binary)
+    end,
+  }
   plugin:newFileFormat{
     name="Photoshop Document (PSD/PSB)",
     extensions={"psd", "psb"},
@@ -783,7 +918,8 @@ function init(plugin)
         run_conversion(binary, ev.filename, temporary_output, options)
         return open_as_unsaved_document(
           temporary_output,
-          suggested_output_path(ev.filename))
+          suggested_output_path(ev.filename),
+          read_imported_active_frame(report_filename))
       end)
       if success then show_information_loss(report_filename) end
       remove_file(temporary_output)

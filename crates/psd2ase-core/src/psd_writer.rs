@@ -5,19 +5,21 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 
 use ag_psd::descriptor::{
-    Descriptor, DescriptorValue, UnitDoubleValue, write_version_and_descriptor,
+    Descriptor, DescriptorValue, UnitDoubleValue, read_version_and_descriptor,
+    write_version_and_descriptor,
 };
 use ag_psd::psd::{
     AnimationDispose, AnimationFrame, AnimationFrameFlags, AnimationFrameInfo, AnimationInfo,
     Animations, BlendMode, ColorMode, ImageResources, Layer, LayerAdditionalInfo, PixelData,
     PointF, Psd, ReadOptions, WriteOptions,
 };
+use ag_psd::reader::PsdReader;
 use ag_psd::writer::{
     PsdWriter, create_writer_default, get_writer_buffer, write_bytes, write_section,
     write_signature, write_uint8, write_uint16, write_uint32, write_zeros,
 };
 
-use crate::aseprite_reader::read_aseprite_export;
+use crate::aseprite_reader::read_aseprite_export_with_active_frame;
 use crate::atomic_output::commit_bytes;
 use crate::{
     ExportError, InformationLossReport, NormalizedDocument, NormalizedLayer, NormalizedLayerKind,
@@ -29,6 +31,8 @@ use crate::{
 pub struct ExportOptions {
     /// Allow replacing an existing output only after the new bytes validate.
     pub overwrite: bool,
+    /// Current Aseprite frame to write as Photoshop's zero-based active frame.
+    pub active_frame_index: Option<u32>,
 }
 
 /// Result of one committed Aseprite-to-Photoshop export.
@@ -42,6 +46,8 @@ pub struct ExportReport {
     pub output: PathBuf,
     /// Structured compatibility losses from the export mapping.
     pub information_loss: InformationLossReport,
+    /// Active frame index written to the Photoshop document, when supplied.
+    pub active_frame_index: Option<u32>,
 }
 
 /// Exports one original/composite Aseprite snapshot pair to a validated PSD or PSB.
@@ -76,7 +82,8 @@ pub fn export(
         }
     };
 
-    let source = read_aseprite_export(input, composite)?;
+    let source =
+        read_aseprite_export_with_active_frame(input, composite, options.active_frame_index)?;
     let model = build_psd(&source.document, &source.composites)?;
     let write_options = WriteOptions {
         no_background: Some(true),
@@ -89,7 +96,10 @@ pub fn export(
         ag_psd::write_psd(&model, &write_options)
     }))
     .map_err(|_| ExportError::Writer("ag-psd panicked while encoding the document".to_string()))?;
-    let encoded = inject_animation_metadata(encoded, &source.document, psb)?;
+    let mut encoded = inject_animation_metadata(encoded, &source.document, psb)?;
+    if options.active_frame_index.is_none() {
+        encoded = omit_active_frame_descriptor(encoded)?;
+    }
     validate_output(&encoded, &source.document, &source.composites, psb)?;
     commit_bytes(output, &encoded, options.overwrite).map_err(ExportError::OutputIo)?;
 
@@ -98,6 +108,7 @@ pub fn export(
         composite: composite.to_path_buf(),
         output: output.to_path_buf(),
         information_loss: source.information_loss,
+        active_frame_index: source.document.active_frame_index,
     })
 }
 
@@ -309,6 +320,244 @@ fn inject_animation_metadata(
         bytes.splice(offset..offset, block);
     }
     Ok(bytes)
+}
+
+/// Removes ag-psd's implicit AFrm=0 when the caller did not request an active frame.
+fn omit_active_frame_descriptor(mut bytes: Vec<u8>) -> Result<Vec<u8>, ExportError> {
+    let color_data_length = read_be_u32(&bytes, 26)? as usize;
+    let resources_length_offset = 30;
+    let resources_start = 34usize
+        .checked_add(color_data_length)
+        .ok_or_else(|| ExportError::Writer("PSD resource offset overflow".to_string()))?;
+    let resources_length = read_be_u32(&bytes, resources_length_offset)? as usize;
+    let resources_end = resources_start
+        .checked_add(resources_length)
+        .ok_or_else(|| ExportError::Writer("PSD resource length overflow".to_string()))?;
+    if resources_end > bytes.len() {
+        return Err(ExportError::Writer(
+            "PSD image resources are truncated".to_string(),
+        ));
+    }
+
+    let resources = &bytes[resources_start..resources_end];
+    let rewritten = rewrite_image_resources_without_active_frame(resources)?;
+    if rewritten.len() == resources.len() {
+        return Ok(bytes);
+    }
+
+    bytes.splice(resources_start..resources_end, rewritten.iter().copied());
+    write_be_u32(
+        &mut bytes,
+        resources_length_offset,
+        u32::try_from(rewritten.len())
+            .map_err(|_| ExportError::Writer("PSD image resources exceed 4 GiB".to_string()))?,
+    )?;
+    Ok(bytes)
+}
+
+/// Rewrites animation image resources after removing the optional active-frame field.
+fn rewrite_image_resources_without_active_frame(resources: &[u8]) -> Result<Vec<u8>, ExportError> {
+    let mut cursor = 0usize;
+    let mut rewritten = Vec::with_capacity(resources.len());
+    let mut changed = false;
+
+    while cursor < resources.len() {
+        let entry_start = cursor;
+        if resources.get(cursor..cursor + 4) != Some(b"8BIM") {
+            return Err(ExportError::Writer(
+                "invalid image resource signature while removing AFrm".to_string(),
+            ));
+        }
+        cursor += 4;
+        let id = read_be_u16(resources, cursor)?;
+        cursor += 2;
+        let name_length = *resources.get(cursor).ok_or_else(|| {
+            ExportError::Writer("truncated image resource name length".to_string())
+        })? as usize;
+        cursor += 1;
+        cursor = cursor
+            .checked_add(name_length)
+            .ok_or_else(|| ExportError::Writer("image resource name overflow".to_string()))?;
+        if !(1 + name_length).is_multiple_of(2) {
+            cursor = cursor
+                .checked_add(1)
+                .ok_or_else(|| ExportError::Writer("image resource name overflow".to_string()))?;
+        }
+        let data_length_offset = cursor;
+        let data_length = read_be_u32(resources, cursor)? as usize;
+        cursor += 4;
+        let data_start = cursor;
+        let data_end = data_start
+            .checked_add(data_length)
+            .ok_or_else(|| ExportError::Writer("image resource data overflow".to_string()))?;
+        let data = resources
+            .get(data_start..data_end)
+            .ok_or_else(|| ExportError::Writer("truncated image resource data".to_string()))?;
+        cursor = data_end;
+        if !data_length.is_multiple_of(2) {
+            cursor = cursor.checked_add(1).ok_or_else(|| {
+                ExportError::Writer("image resource padding overflow".to_string())
+            })?;
+        }
+        if cursor > resources.len() {
+            return Err(ExportError::Writer(
+                "truncated image resource padding".to_string(),
+            ));
+        }
+        let entry_end = cursor;
+
+        let replacement = if id == 4000 || id == 4003 {
+            rewrite_animation_resource_without_active_frame(data)?
+        } else {
+            None
+        };
+        let Some(data) = replacement else {
+            rewritten.extend_from_slice(&resources[entry_start..entry_end]);
+            continue;
+        };
+
+        changed = true;
+        rewritten.extend_from_slice(&resources[entry_start..data_length_offset]);
+        rewritten.extend_from_slice(
+            &u32::try_from(data.len())
+                .map_err(|_| ExportError::Writer("animation resource exceeds 4 GiB".to_string()))?
+                .to_be_bytes(),
+        );
+        rewritten.extend_from_slice(&data);
+        if !data.len().is_multiple_of(2) {
+            rewritten.push(0);
+        }
+    }
+
+    if changed {
+        Ok(rewritten)
+    } else {
+        Ok(resources.to_vec())
+    }
+}
+
+/// Removes AFrm from every animation set in one `mani` image resource.
+fn rewrite_animation_resource_without_active_frame(
+    data: &[u8],
+) -> Result<Option<Vec<u8>>, ExportError> {
+    if data.len() < 12 || &data[..8] != b"maniIRFR" {
+        return Ok(None);
+    }
+    let section_length = read_be_u32(data, 8)? as usize;
+    let section_start = 12usize;
+    let section_end = section_start
+        .checked_add(section_length)
+        .ok_or_else(|| ExportError::Writer("animation resource section overflow".to_string()))?;
+    let section = data.get(section_start..section_end).ok_or_else(|| {
+        ExportError::Writer("animation resource section is truncated".to_string())
+    })?;
+
+    let mut cursor = 0usize;
+    let mut rewritten_section = Vec::with_capacity(section.len());
+    let mut changed = false;
+    while cursor < section.len() {
+        let entry_start = cursor;
+        if section.get(cursor..cursor + 4) != Some(b"8BIM") {
+            return Err(ExportError::Writer(
+                "invalid animation subresource signature".to_string(),
+            ));
+        }
+        cursor += 4;
+        let key = section.get(cursor..cursor + 4).ok_or_else(|| {
+            ExportError::Writer("truncated animation subresource key".to_string())
+        })?;
+        cursor += 4;
+        let payload_length_offset = cursor;
+        let payload_length = read_be_u32(section, cursor)? as usize;
+        cursor += 4;
+        let payload_start = cursor;
+        let payload_end = payload_start
+            .checked_add(payload_length)
+            .ok_or_else(|| ExportError::Writer("animation descriptor overflow".to_string()))?;
+        let payload = section
+            .get(payload_start..payload_end)
+            .ok_or_else(|| ExportError::Writer("animation descriptor is truncated".to_string()))?;
+        cursor = payload_end;
+        if !payload_length.is_multiple_of(2) {
+            cursor = cursor.checked_add(1).ok_or_else(|| {
+                ExportError::Writer("animation descriptor padding overflow".to_string())
+            })?;
+        }
+        if cursor > section.len() {
+            return Err(ExportError::Writer(
+                "truncated animation descriptor padding".to_string(),
+            ));
+        }
+        let entry_end = cursor;
+
+        let replacement = if key == b"AnDs" {
+            rewrite_animation_descriptor_without_active_frame(payload)?
+        } else {
+            None
+        };
+        let Some(payload) = replacement else {
+            rewritten_section.extend_from_slice(&section[entry_start..entry_end]);
+            continue;
+        };
+
+        changed = true;
+        rewritten_section.extend_from_slice(&section[entry_start..payload_length_offset]);
+        rewritten_section.extend_from_slice(
+            &u32::try_from(payload.len())
+                .map_err(|_| ExportError::Writer("animation descriptor exceeds 4 GiB".to_string()))?
+                .to_be_bytes(),
+        );
+        rewritten_section.extend_from_slice(&payload);
+        if !payload.len().is_multiple_of(2) {
+            rewritten_section.push(0);
+        }
+    }
+
+    if !changed {
+        return Ok(None);
+    }
+    let mut rewritten = Vec::with_capacity(data.len());
+    rewritten.extend_from_slice(b"maniIRFR");
+    rewritten.extend_from_slice(
+        &u32::try_from(rewritten_section.len())
+            .map_err(|_| ExportError::Writer("animation resource exceeds 4 GiB".to_string()))?
+            .to_be_bytes(),
+    );
+    rewritten.extend_from_slice(&rewritten_section);
+    rewritten.extend_from_slice(&data[section_end..]);
+    Ok(Some(rewritten))
+}
+
+/// Removes AFrm fields from an encoded animation descriptor.
+fn rewrite_animation_descriptor_without_active_frame(
+    payload: &[u8],
+) -> Result<Option<Vec<u8>>, ExportError> {
+    let mut reader = PsdReader::new(payload, None, None);
+    let mut descriptor = read_version_and_descriptor(&mut reader).map_err(|error| {
+        ExportError::Writer(format!("cannot read animation descriptor: {error}"))
+    })?;
+    let mut changed = false;
+    if let Some(DescriptorValue::List(sets)) = descriptor
+        .items
+        .iter_mut()
+        .find_map(|(key, value)| (key == "FSts").then_some(value))
+    {
+        for value in sets {
+            let DescriptorValue::Descriptor(set) = value else {
+                continue;
+            };
+            let before = set.items.len();
+            set.items.retain(|(key, _)| key != "AFrm");
+            changed |= set.items.len() != before;
+        }
+    }
+    if !changed {
+        return Ok(None);
+    }
+
+    let mut writer = create_writer_default();
+    write_version_and_descriptor(&mut writer, &descriptor);
+    Ok(Some(get_writer_buffer(&writer)))
 }
 
 #[derive(Debug)]
@@ -832,6 +1081,7 @@ mod tests {
         let input = directory.join("source.aseprite");
         let composite = directory.join("composite.aseprite");
         let output = directory.join("output.psd");
+        let active_output = directory.join("active-output.psd");
         let roundtrip = directory.join("roundtrip.aseprite");
         let psb_output = directory.join("output.psb");
 
@@ -909,6 +1159,7 @@ mod tests {
         assert_eq!(normalized.frames[0].duration_ms, Some(120));
         assert_eq!(normalized.frames[1].duration_ms, Some(80));
         assert_eq!(normalized.frames[2].duration_ms, Some(60));
+        assert_eq!(normalized.active_frame_index, None);
         assert_eq!(normalized.root_layers[0].children.len(), 2);
         assert_eq!(normalized.root_layers[1].kind, NormalizedLayerKind::Pixel);
         assert_eq!(
@@ -954,6 +1205,37 @@ mod tests {
             3
         );
 
+        let active_report = export(
+            &input,
+            &composite,
+            &active_output,
+            &ExportOptions {
+                active_frame_index: Some(1),
+                ..Default::default()
+            },
+        )
+        .expect("export PSD with active frame");
+        assert_eq!(active_report.active_frame_index, Some(1));
+        assert_eq!(
+            crate::normalize(&active_output)
+                .expect("normalize active-frame PSD")
+                .active_frame_index,
+            Some(1)
+        );
+
+        let invalid_output = directory.join("invalid-active-output.psd");
+        let error = export(
+            &input,
+            &composite,
+            &invalid_output,
+            &ExportOptions {
+                active_frame_index: Some(3),
+                ..Default::default()
+            },
+        )
+        .expect_err("out-of-range active frame must be rejected");
+        assert!(matches!(error, ExportError::AsepriteRead(_)));
+
         let original = bytes.clone();
         let error = export(&input, &composite, &output, &ExportOptions::default())
             .expect_err("existing output must be rejected");
@@ -969,7 +1251,10 @@ mod tests {
             &input,
             &bad_composite,
             &output,
-            &ExportOptions { overwrite: true },
+            &ExportOptions {
+                overwrite: true,
+                ..Default::default()
+            },
         )
         .expect_err("invalid replacement must fail before commit");
         assert!(matches!(error, ExportError::AsepriteRead(_)));

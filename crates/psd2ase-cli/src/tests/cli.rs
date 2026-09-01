@@ -222,6 +222,8 @@ fn export_requires_composite_and_preserves_all_paths() {
         "flattened.aseprite",
         "--report",
         "loss.json",
+        "--active-frame-index",
+        "8",
         "--overwrite",
     ]))
     .expect("export arguments should parse");
@@ -229,6 +231,7 @@ fn export_requires_composite_and_preserves_all_paths() {
     assert_eq!(command.output, PathBuf::from("output.psb"));
     assert_eq!(command.composite, PathBuf::from("flattened.aseprite"));
     assert_eq!(command.report, Some(PathBuf::from("loss.json")));
+    assert_eq!(command.active_frame_index, Some(8));
     assert!(command.overwrite);
 
     let error = export_arguments(&arguments(&["source.aseprite", "-o", "output.psd"]))

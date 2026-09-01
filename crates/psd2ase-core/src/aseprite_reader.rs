@@ -5,7 +5,7 @@ use std::path::Path;
 
 use aseprite::{AsepriteFile, CelKind, ColorMode, LayerKind, LoopDirection, Pixels};
 
-use crate::aseprite_metadata::{read_active_frame_user_data, read_reference_point_user_data};
+use crate::aseprite_metadata::read_reference_point_user_data;
 use crate::{
     AnimationPoint, ExportError, InformationLocation, InformationLossCode, InformationLossReport,
     LossDisposition, NormalizedBounds, NormalizedDocument, NormalizedFrame, NormalizedLayer,
@@ -39,6 +39,15 @@ pub fn read_aseprite_export(
     input: &Path,
     composite: &Path,
 ) -> Result<AsepriteExportSource, ExportError> {
+    read_aseprite_export_with_active_frame(input, composite, None)
+}
+
+/// Reads export snapshots while applying an active frame supplied by the caller.
+pub fn read_aseprite_export_with_active_frame(
+    input: &Path,
+    composite: &Path,
+    active_frame_index: Option<u32>,
+) -> Result<AsepriteExportSource, ExportError> {
     let file = read_file(input)?;
     let flattened = read_file(composite)?;
     if file.width() != flattened.width()
@@ -67,12 +76,21 @@ pub fn read_aseprite_export(
         .layers()
         .iter()
         .any(|layer| matches!(layer.kind, LayerKind::Tilemap { .. }));
-    let document = if has_tilemap {
+    let mut document = if has_tilemap {
         record_tilemap_losses(&file, &mut information_loss);
         composite_document(&file, &sequence, &composites, loop_mode)
     } else {
         normalized_document(&file, &sequence, loop_mode, &mut information_loss)?
     };
+    if let Some(active_frame_index) = active_frame_index {
+        if active_frame_index as usize >= document.frames.len() {
+            return Err(ExportError::AsepriteRead(format!(
+                "active frame index {active_frame_index} is outside the {}-frame export",
+                document.frames.len()
+            )));
+        }
+        document.active_frame_index = Some(active_frame_index);
+    }
     Ok(AsepriteExportSource {
         document,
         composites,
@@ -683,8 +701,7 @@ fn document_header(
             })
             .collect(),
         loop_mode: Some(loop_mode),
-        active_frame_index: read_active_frame_user_data(file.sprite_user_data().as_ref())
-            .filter(|frame_index| (*frame_index as usize) < sequence.len()),
+        active_frame_index: None,
         animation_resource_ids: vec![4000],
         animation_frame_flags: Some(crate::AnimationFlags {
             propagate_frame_one: false,

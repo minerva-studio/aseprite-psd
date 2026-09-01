@@ -24,7 +24,8 @@ pub use aseprite_writer::{
 pub use error::{ConversionError, ExportError, InspectionError};
 pub use information_loss::{
     InformationLocation, InformationLoss, InformationLossCode, InformationLossReport,
-    LossDisposition, report_json, write_report,
+    LossDisposition, report_json, report_json_with_active_frame, write_report,
+    write_report_with_active_frame,
 };
 pub use jitter::{
     JitterKind, JitterMode, JitterOptions, JitterPlan, JitterProfile, JitterReport,
@@ -103,6 +104,8 @@ pub struct ConversionReport {
     pub cel_reuse: CelReuseReport,
     /// Pixel stabilization diagnostics, when enabled.
     pub jitter: Option<JitterReport>,
+    /// Source active frame index for temporary import handoff and reports.
+    pub active_frame_index: Option<u32>,
 }
 
 /// Reads PSD structure metadata without creating an output file.
@@ -750,7 +753,7 @@ pub fn convert(
                 auto_options,
                 options.preserve_photoshop_metadata,
             )
-                .map_err(|error| ConversionError::Writer(error.to_string()))?,
+            .map_err(|error| ConversionError::Writer(error.to_string()))?,
         ),
     };
     let initial_jitter_plan = build_jitter_plan(&document, initial_plan.as_ref(), options.jitter)
@@ -770,7 +773,7 @@ pub fn convert(
                     auto_options,
                     options.preserve_photoshop_metadata,
                 )
-                    .map_err(|error| ConversionError::Writer(error.to_string()))?,
+                .map_err(|error| ConversionError::Writer(error.to_string()))?,
             )
         } else {
             initial_plan
@@ -840,6 +843,7 @@ pub fn convert(
         association,
         cel_reuse: encoded.cel_reuse,
         jitter,
+        active_frame_index: document.active_frame_index,
     })
 }
 

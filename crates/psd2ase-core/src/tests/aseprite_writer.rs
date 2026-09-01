@@ -479,12 +479,6 @@ fn reports_nested_layer_and_frame_locations_for_loss_warnings() {
             .iter()
             .any(|warning| warning.code == InformationLossCode::ActiveFrame)
     );
-    let file = AsepriteFile::from_reader(&encoded.bytes[..]).expect("valid Aseprite bytes");
-    assert_eq!(
-        crate::aseprite_metadata::read_active_frame_user_data(file.sprite_user_data().as_ref()),
-        Some(1)
-    );
-
     let preserved = super::encode_with_linked_cels_and_jitter_and_metadata(
         &document,
         crate::LinkedCelMode::Off,

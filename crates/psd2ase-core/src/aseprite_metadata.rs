@@ -4,7 +4,6 @@ use aseprite::{PropertiesMap, PropertyValue, UserData};
 
 use crate::{AnimationPoint, NormalizedLayer, photoshop_metadata};
 
-pub(crate) const ACTIVE_FRAME_PROPERTY: &str = "psd2ase_active_frame_index";
 pub(crate) const REFERENCE_POINTS_PROPERTY: &str = "psd2ase_reference_points";
 
 /// Builds layer user data containing the meaningful Photoshop reference points.
@@ -45,30 +44,6 @@ pub(crate) fn reference_point_user_data(
         }],
         ..Default::default()
     })
-}
-
-/// Builds sprite user data containing the normalized active frame index.
-pub(crate) fn active_frame_user_data(
-    frame_index: Option<u32>,
-    frame_count: usize,
-) -> Option<UserData> {
-    let frame_index = frame_index.filter(|value| (*value as usize) < frame_count)?;
-    Some(UserData {
-        properties: vec![PropertiesMap {
-            key: 0,
-            entries: vec![(
-                ACTIVE_FRAME_PROPERTY.to_string(),
-                PropertyValue::UInt32(frame_index),
-            )],
-        }],
-        ..Default::default()
-    })
-}
-
-/// Reads a normalized active frame index from Aseprite sprite user data.
-pub(crate) fn read_active_frame_user_data(user_data: Option<&UserData>) -> Option<u32> {
-    let value = find_property(user_data?, ACTIVE_FRAME_PROPERTY)?;
-    property_u32(value)
 }
 
 /// Reads per-frame Photoshop reference points from Aseprite layer user data.
@@ -167,7 +142,7 @@ mod tests {
     use crate::{NormalizedBounds, NormalizedLayerFrameState, NormalizedPixels};
 
     #[test]
-    fn metadata_properties_round_trip_per_frame_and_active_frame() {
+    fn metadata_properties_round_trip_per_frame() {
         let mut layer = NormalizedLayer {
             id: 4,
             name: "layer".to_string(),
@@ -208,9 +183,5 @@ mod tests {
         assert_eq!(points[0], None);
         assert_eq!(points[1], Some(AnimationPoint { x: 5.5, y: -2.0 }));
         assert_eq!(points[2], None);
-        assert_eq!(
-            read_active_frame_user_data(active_frame_user_data(Some(2), 3).as_ref()),
-            Some(2)
-        );
     }
 }

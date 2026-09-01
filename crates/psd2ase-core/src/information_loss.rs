@@ -120,6 +120,8 @@ struct JsonReport<'a> {
     tool_version: &'static str,
     input: String,
     output: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_frame_index: Option<u32>,
     summary: JsonSummary,
     losses: &'a [InformationLoss],
 }
@@ -135,11 +137,22 @@ pub fn report_json(
     output: &Path,
     report: &InformationLossReport,
 ) -> Result<Vec<u8>, serde_json::Error> {
+    report_json_with_active_frame(input, output, report, None)
+}
+
+/// Serializes a compatibility report with an optional source active frame.
+pub fn report_json_with_active_frame(
+    input: &Path,
+    output: &Path,
+    report: &InformationLossReport,
+    active_frame_index: Option<u32>,
+) -> Result<Vec<u8>, serde_json::Error> {
     serde_json::to_vec_pretty(&JsonReport {
-        schema_version: 1,
+        schema_version: 3,
         tool_version: crate::VERSION,
         input: input.display().to_string(),
         output: output.display().to_string(),
+        active_frame_index,
         summary: JsonSummary {
             total: report.entries.len(),
         },
@@ -154,7 +167,19 @@ pub fn write_report(
     output: &Path,
     report: &InformationLossReport,
 ) -> io::Result<()> {
-    let payload = report_json(input, output, report).map_err(io::Error::other)?;
+    write_report_with_active_frame(path, input, output, report, None)
+}
+
+/// Atomically writes a compatibility report with an optional active frame.
+pub fn write_report_with_active_frame(
+    path: &Path,
+    input: &Path,
+    output: &Path,
+    report: &InformationLossReport,
+    active_frame_index: Option<u32>,
+) -> io::Result<()> {
+    let payload = report_json_with_active_frame(input, output, report, active_frame_index)
+        .map_err(io::Error::other)?;
     commit_bytes(path, &payload, true)
 }
 
@@ -230,7 +255,7 @@ mod tests {
     }
 
     #[test]
-    fn report_json_uses_v1_and_omits_unset_frame_indices() {
+    fn report_json_uses_v3_and_omits_unset_frame_indices() {
         let mut report = InformationLossReport::default();
         report.add(
             InformationLossCode::ReferencePoint,
@@ -266,12 +291,30 @@ mod tests {
             .expect("report JSON should serialize"),
         )
         .expect("report JSON should decode");
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], 3);
+        assert!(value.get("active_frame_index").is_none());
         assert_eq!(value["losses"][0]["locations"][0]["frame_index"], 2);
         assert!(
             value["losses"][1]["locations"][0]
                 .get("frame_index")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn report_json_includes_optional_active_frame_index() {
+        let report = InformationLossReport::default();
+        let value: serde_json::Value = serde_json::from_slice(
+            &report_json_with_active_frame(
+                Path::new("input.psd"),
+                Path::new("output.aseprite"),
+                &report,
+                Some(8),
+            )
+            .expect("report JSON should serialize"),
+        )
+        .expect("report JSON should decode");
+        assert_eq!(value["schema_version"], 3);
+        assert_eq!(value["active_frame_index"], 8);
     }
 }
