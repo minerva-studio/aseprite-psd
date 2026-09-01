@@ -5,9 +5,10 @@ use std::path::Path;
 
 use aseprite::{AsepriteFile, CelKind, ColorMode, LayerKind, LoopDirection, Pixels};
 
+use crate::aseprite_metadata::{read_active_frame_user_data, read_reference_point_user_data};
 use crate::{
-    ExportError, InformationLocation, InformationLossCode, InformationLossReport, LossDisposition,
-    NormalizedBounds, NormalizedDocument, NormalizedFrame, NormalizedLayer,
+    AnimationPoint, ExportError, InformationLocation, InformationLossCode, InformationLossReport,
+    LossDisposition, NormalizedBounds, NormalizedDocument, NormalizedFrame, NormalizedLayer,
     NormalizedLayerFrameState, NormalizedLayerKind, NormalizedLoopMode, NormalizedPixels,
 };
 
@@ -298,7 +299,19 @@ fn build_layer(
                     children.push(build_layer(file, child_index, sequence, report, next_id)?);
                 }
             }
-            Ok(group_layer(id, layer, sequence.len(), children))
+            let source_points =
+                read_reference_point_user_data(layer.user_data.as_ref(), file.frames().len());
+            let reference_points = sequence
+                .iter()
+                .map(|source_frame| source_points.get(*source_frame).copied().flatten())
+                .collect::<Vec<_>>();
+            Ok(group_layer(
+                id,
+                layer,
+                sequence.len(),
+                children,
+                Some(&reference_points),
+            ))
         }
         LayerKind::Normal => build_cel_layers(file, layer_index, sequence, report, next_id),
         LayerKind::Tilemap { .. } => Err(ExportError::AsepriteRead(
@@ -323,6 +336,12 @@ fn build_cel_layers(
     let layer_ref = file
         .layer_ref(layer_index)
         .ok_or_else(|| ExportError::AsepriteRead("normal layer has no layer handle".to_string()))?;
+    let source_points =
+        read_reference_point_user_data(layer.user_data.as_ref(), file.frames().len());
+    let reference_points = sequence
+        .iter()
+        .map(|source_frame| source_points.get(*source_frame).copied().flatten())
+        .collect::<Vec<_>>();
     let mut variants: Vec<CelSample> = Vec::new();
     let mut occurrences = Vec::with_capacity(sequence.len());
     for (frame_index, source_frame) in sequence.iter().enumerate() {
@@ -389,6 +408,7 @@ fn build_cel_layers(
             Some(layer.opacity),
             blend_mode_name(layer.blend_mode),
             layer.visible,
+            None,
         ));
     }
     if variants.len() == 1 {
@@ -401,6 +421,7 @@ fn build_cel_layers(
             Some(layer.opacity),
             blend_mode_name(layer.blend_mode),
             layer.visible,
+            Some(&reference_points),
         ));
     }
 
@@ -415,6 +436,7 @@ fn build_cel_layers(
             Some(255),
             "normal".to_string(),
             true,
+            None,
         ));
     }
     Ok(group_layer(
@@ -422,6 +444,7 @@ fn build_cel_layers(
         layer,
         sequence.len(),
         children,
+        Some(&reference_points),
     ))
 }
 
@@ -436,6 +459,7 @@ fn static_cel_layer(
     layer_opacity: Option<u8>,
     blend_mode: String,
     visible: bool,
+    reference_points: Option<&[Option<AnimationPoint>]>,
 ) -> NormalizedLayer {
     let states = occurrences
         .iter()
@@ -453,7 +477,9 @@ fn static_cel_layer(
                     x: f64::from(*x - variant.x),
                     y: f64::from(*y - variant.y),
                 }),
-                reference_point: None,
+                reference_point: reference_points
+                    .and_then(|points| points.get(frame_index).copied())
+                    .flatten(),
                 opacity: matching.map(|(_, _, _, opacity)| f64::from(*opacity) / 255.0),
             }
         })
@@ -489,6 +515,7 @@ fn group_layer(
     layer: &aseprite::Layer,
     frame_count: usize,
     children: Vec<NormalizedLayer>,
+    reference_points: Option<&[Option<AnimationPoint>]>,
 ) -> NormalizedLayer {
     NormalizedLayer {
         id,
@@ -512,7 +539,9 @@ fn group_layer(
                 enabled: layer.visible,
                 explicit_enable: true,
                 offset: None,
-                reference_point: None,
+                reference_point: reference_points
+                    .and_then(|points| points.get(frame_index).copied())
+                    .flatten(),
                 opacity: None,
             })
             .collect(),
@@ -654,7 +683,8 @@ fn document_header(
             })
             .collect(),
         loop_mode: Some(loop_mode),
-        active_frame_index: Some(0),
+        active_frame_index: read_active_frame_user_data(file.sprite_user_data().as_ref())
+            .filter(|frame_index| (*frame_index as usize) < sequence.len()),
         animation_resource_ids: vec![4000],
         animation_frame_flags: Some(crate::AnimationFlags {
             propagate_frame_one: false,
@@ -723,6 +753,7 @@ fn composite_document(
             Some(255),
             "normal".to_string(),
             true,
+            None,
         ));
     }
     let synthetic = aseprite::Layer {
@@ -743,7 +774,7 @@ fn composite_document(
     document_header(
         file,
         sequence,
-        vec![group_layer(1, &synthetic, sequence.len(), children)],
+        vec![group_layer(1, &synthetic, sequence.len(), children, None)],
         loop_mode,
     )
 }

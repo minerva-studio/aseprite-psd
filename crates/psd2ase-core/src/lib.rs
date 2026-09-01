@@ -4,6 +4,7 @@
 //! Aseprite writer. Coordinate mapping remains provisional until visual review
 //! of a generated file is complete.
 
+mod aseprite_metadata;
 pub mod aseprite_reader;
 pub mod aseprite_writer;
 mod atomic_output;
@@ -14,6 +15,7 @@ pub mod layer_names;
 pub mod logical_layers;
 mod model;
 pub mod photoshop_animation;
+mod photoshop_metadata;
 pub mod psd_writer;
 
 pub use aseprite_writer::{
@@ -69,6 +71,8 @@ pub struct ConvertOptions {
     pub linked_cels: LinkedCelMode,
     /// Selects conservative pixel stabilization before cel emission.
     pub jitter: JitterOptions,
+    /// Preserve meaningful Photoshop-only metadata for a later PSD round trip.
+    pub preserve_photoshop_metadata: bool,
 }
 
 /// Selects whether identical cels are emitted as links to an earlier cel.
@@ -544,8 +548,12 @@ pub fn convert(
     let initial_plan = match options.layer_association {
         LayerAssociation::Preserve => None,
         LayerAssociation::Auto(auto_options) => Some(
-            build_layer_write_plan(&document, auto_options)
-                .map_err(|error| ConversionError::Writer(error.to_string()))?,
+            logical_layers::build_layer_write_plan_with_metadata(
+                &document,
+                auto_options,
+                options.preserve_photoshop_metadata,
+            )
+            .map_err(|error| ConversionError::Writer(error.to_string()))?,
         ),
     };
     let initial_jitter_plan = build_jitter_plan(&document, initial_plan.as_ref(), options.jitter)
@@ -560,8 +568,12 @@ pub fn convert(
         ) {
             let stabilized = stabilized_document(&document, &initial_jitter_plan);
             Some(
-                build_layer_write_plan(&stabilized, auto_options)
-                    .map_err(|error| ConversionError::Writer(error.to_string()))?,
+                logical_layers::build_layer_write_plan_with_metadata(
+                    &stabilized,
+                    auto_options,
+                    options.preserve_photoshop_metadata,
+                )
+                .map_err(|error| ConversionError::Writer(error.to_string()))?,
             )
         } else {
             initial_plan
@@ -581,16 +593,18 @@ pub fn convert(
         (options.jitter.mode != crate::JitterMode::Off).then(|| jitter_plan.report.clone());
     let association = plan.as_ref().map(|plan| plan.report.clone());
     let encoded = match plan.as_ref() {
-        None => aseprite_writer::encode_with_linked_cels_and_jitter(
+        None => aseprite_writer::encode_with_linked_cels_and_jitter_and_metadata(
             &document,
             options.linked_cels,
             &jitter_plan,
+            options.preserve_photoshop_metadata,
         ),
-        Some(plan) => aseprite_writer::encode_with_plan_and_linked_cels_and_jitter(
+        Some(plan) => aseprite_writer::encode_with_plan_and_linked_cels_and_jitter_and_metadata(
             &document,
             plan,
             options.linked_cels,
             &jitter_plan,
+            options.preserve_photoshop_metadata,
         ),
     }
     .map_err(|error| ConversionError::Writer(error.to_string()))?;

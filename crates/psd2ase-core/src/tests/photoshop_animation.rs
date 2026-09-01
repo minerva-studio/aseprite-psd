@@ -4,6 +4,16 @@ use ag_psd::descriptor::{Descriptor, DescriptorValue, write_version_and_descript
 use ag_psd::writer::{create_writer, get_writer_buffer};
 
 #[test]
+fn empty_reference_point_descriptor_is_treated_as_nop() {
+    let mut descriptor = Descriptor::new("", "frame");
+    descriptor.set(
+        "FXRf",
+        DescriptorValue::Descriptor(Descriptor::new("", "point")),
+    );
+    assert_eq!(descriptor_point(&descriptor, "FXRf"), Ok(None));
+}
+
+#[test]
 fn cursor_rejects_truncated_section() {
     let mut cursor = Cursor::new(&[0, 1]);
     let error = cursor.u32("test").expect_err("truncated input must fail");

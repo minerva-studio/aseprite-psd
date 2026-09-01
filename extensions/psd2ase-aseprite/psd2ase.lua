@@ -116,6 +116,10 @@ local function build_arguments(binary, input, output, options)
     table.insert(arguments, "--overwrite")
   end
 
+  if options.preserve_photoshop_metadata then
+    table.insert(arguments, "--preserve-photoshop-metadata")
+  end
+
   if options.link_identical_cels and options.layer_association == "auto" then
     table.insert(arguments, "--linked-cels")
     table.insert(arguments, "identical")
@@ -311,6 +315,13 @@ local function show_information_loss(report_filename, operation)
     show_error("PSD " .. operation .. " report", "The converter produced an unreadable or unsupported report.")
     return
   end
+  local visible_losses = {}
+  for _, loss in ipairs(losses) do
+    if loss.disposition ~= "informational" then
+      table.insert(visible_losses, loss)
+    end
+  end
+  losses = visible_losses
   local loss_count = #losses
   if loss_count == 0 then return end
   local lines = {"Some PSD information could not be preserved:"}
@@ -445,6 +456,7 @@ local function default_import_options()
     jitter_mode = "off",
     jitter_kind = "alpha",
     jitter_profile = "conservative",
+    preserve_photoshop_metadata = false,
     association_strategy = "compact",
     z_order = "stable",
     stable_order = "consensus",
@@ -510,6 +522,12 @@ local function select_import_options(input_filename)
     text="Link identical cels",
     selected=defaults.link_identical_cels,
     enabled=false,
+  }
+  dialog:check{
+    id="preserve_photoshop_metadata",
+    label="Photoshop metadata",
+    text="Preserve metadata for PSD round-trip",
+    selected=defaults.preserve_photoshop_metadata,
   }
   dialog:combobox{
     id="association_strategy",
@@ -580,6 +598,22 @@ local function suggested_output_path(input)
   return app.fs.joinPath(app.fs.filePath(input), app.fs.fileTitle(input) .. ".aseprite")
 end
 
+--- Applies the imported Photoshop active frame to the Aseprite UI.
+local function apply_imported_active_frame(sprite)
+  local frame_index
+  local read_ok = pcall(function()
+    frame_index = sprite.properties.psd2ase_active_frame_index
+  end)
+  if not read_ok or type(frame_index) ~= "number" then
+    return
+  end
+  if frame_index < 0 or frame_index >= #sprite.frames then
+    return
+  end
+  app.sprite = sprite
+  app.frame = frame_index + 1
+end
+
 --- Opens and duplicates a converted file as an unassociated, modified document.
 local function open_as_unsaved_document(filename, suggested_filename)
   local temporary_sprite = app.open(filename)
@@ -594,6 +628,7 @@ local function open_as_unsaved_document(filename, suggested_filename)
       error("Aseprite could not duplicate the generated temporary document.")
     end
     sprite.filename = suggested_filename
+    apply_imported_active_frame(sprite)
     app.transaction("Mark imported PSD as modified", function()
       local marker_layer = sprite:newLayer()
       sprite:deleteLayer(marker_layer)

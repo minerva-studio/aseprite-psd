@@ -381,6 +381,15 @@ pub fn build_layer_write_plan(
     document: &NormalizedDocument,
     options: AutoAssociationOptions,
 ) -> Result<LayerWritePlan, String> {
+    build_layer_write_plan_with_metadata(document, options, false)
+}
+
+/// Builds an automatic plan while isolating layers carrying Photoshop metadata.
+pub(crate) fn build_layer_write_plan_with_metadata(
+    document: &NormalizedDocument,
+    options: AutoAssociationOptions,
+    preserve_photoshop_metadata: bool,
+) -> Result<LayerWritePlan, String> {
     let strategy = options.strategy;
     let z_order_mode = options.z_order;
     let stable_order_mode = options.stable_order;
@@ -395,6 +404,7 @@ pub fn build_layer_write_plan(
             source_order: &mut source_order,
             next_observation_id: &mut next_observation_id,
             store: &mut observation_store,
+            preserve_photoshop_metadata,
         };
         for (root_index, layer) in document.root_layers.iter().enumerate() {
             collect_observations(
@@ -403,6 +413,7 @@ pub fn build_layer_write_plan(
                 &[],
                 &[],
                 &[],
+                false,
                 &mut collection,
             )?;
         }

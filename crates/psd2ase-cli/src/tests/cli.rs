@@ -12,6 +12,14 @@ fn extension_preserve_arguments_use_the_preserve_configuration() {
     assert_eq!(command.layer_association, LayerAssociation::Preserve);
     assert_eq!(command.linked_cels, LinkedCelMode::Off);
     assert_eq!(command.output, PathBuf::from("output.aseprite"));
+    assert!(!command.preserve_photoshop_metadata);
+}
+
+#[test]
+fn photoshop_metadata_flag_is_opt_in() {
+    let command = convert_arguments(&arguments(&["input.psd", "--preserve-photoshop-metadata"]))
+        .expect("metadata flag should parse");
+    assert!(command.preserve_photoshop_metadata);
 }
 
 #[test]

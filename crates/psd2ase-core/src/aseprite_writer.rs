@@ -5,6 +5,8 @@ use aseprite::{
     LinkedCelOptions, LoopDirection, Pixels,
 };
 
+use crate::aseprite_metadata::{active_frame_user_data, reference_point_user_data};
+use crate::photoshop_metadata::has_meaningful_reference_point;
 use crate::{
     InformationLocation, InformationLossCode, LayerWritePlan, LogicalLayerTrack, LossDisposition,
     NormalizedDocument, NormalizedLayer, NormalizedLayerFrameState, NormalizedLayerKind,
@@ -141,12 +143,13 @@ impl std::error::Error for WriterError {}
 /// Initializes the shared canvas, timeline, loop tag, and warning collection.
 fn initialize_file(
     document: &NormalizedDocument,
+    preserve_photoshop_metadata: bool,
 ) -> Result<(AsepriteFile, WarningCollector), WriterError> {
     let width = u16_value("canvas width", document.canvas.0)?;
     let height = u16_value("canvas height", document.canvas.1)?;
     let mut file = AsepriteFile::new(width, height, ColorMode::Rgba);
     let mut warnings = WarningCollector::default();
-    collect_unmapped_animation_warnings(document, &mut warnings);
+    collect_unmapped_animation_warnings(document, &mut warnings, preserve_photoshop_metadata);
 
     if document.frames.is_empty() {
         return Err(WriterError::Aseprite(
@@ -178,6 +181,11 @@ fn initialize_file(
         )
         .map_err(|error| WriterError::Aseprite(error.to_string()))?;
     }
+    if let Some(user_data) =
+        active_frame_user_data(document.active_frame_index, document.frames.len())
+    {
+        file.set_sprite_user_data(user_data);
+    }
 
     Ok((file, warnings))
 }
@@ -201,12 +209,30 @@ pub fn encode_with_linked_cels_and_jitter(
     linked_cels: crate::LinkedCelMode,
     jitter: &JitterPlan,
 ) -> Result<EncodedAseprite, WriterError> {
-    let (mut file, mut warnings) = initialize_file(document)?;
+    encode_with_linked_cels_and_jitter_and_metadata(document, linked_cels, jitter, false)
+}
+
+/// Encodes normalized layers with optional Photoshop round-trip metadata.
+pub(crate) fn encode_with_linked_cels_and_jitter_and_metadata(
+    document: &NormalizedDocument,
+    linked_cels: crate::LinkedCelMode,
+    jitter: &JitterPlan,
+    preserve_photoshop_metadata: bool,
+) -> Result<EncodedAseprite, WriterError> {
+    let (mut file, mut warnings) = initialize_file(document, preserve_photoshop_metadata)?;
 
     let mut bindings = Vec::new();
     for layer in &document.root_layers {
         let path = layer_path(None, layer);
-        create_layer_tree(&mut file, layer, None, path, &mut bindings, &mut warnings)?;
+        create_layer_tree(
+            &mut file,
+            layer,
+            None,
+            path,
+            &mut bindings,
+            &mut warnings,
+            preserve_photoshop_metadata,
+        )?;
     }
 
     let mut reuse = (0..bindings.len())
@@ -302,7 +328,24 @@ pub fn encode_with_plan_and_linked_cels_and_jitter(
     linked_cels: crate::LinkedCelMode,
     jitter: &JitterPlan,
 ) -> Result<EncodedAseprite, WriterError> {
-    let (mut file, mut warnings) = initialize_file(document)?;
+    encode_with_plan_and_linked_cels_and_jitter_and_metadata(
+        document,
+        plan,
+        linked_cels,
+        jitter,
+        false,
+    )
+}
+
+/// Encodes a logical-layer plan with optional Photoshop round-trip metadata.
+pub(crate) fn encode_with_plan_and_linked_cels_and_jitter_and_metadata(
+    document: &NormalizedDocument,
+    plan: &LayerWritePlan,
+    linked_cels: crate::LinkedCelMode,
+    jitter: &JitterPlan,
+    preserve_photoshop_metadata: bool,
+) -> Result<EncodedAseprite, WriterError> {
+    let (mut file, mut warnings) = initialize_file(document, preserve_photoshop_metadata)?;
 
     let mut bindings = Vec::new();
     for node in &plan.root_nodes {
@@ -314,6 +357,7 @@ pub fn encode_with_plan_and_linked_cels_and_jitter(
             plan,
             &mut bindings,
             &mut warnings,
+            preserve_photoshop_metadata,
         )?;
     }
     let mut reuse = (0..bindings.len())
@@ -533,6 +577,7 @@ fn create_layer_tree<'a>(
     path: String,
     bindings: &mut Vec<PixelBinding<'a>>,
     warnings: &mut WarningCollector,
+    preserve_photoshop_metadata: bool,
 ) -> Result<(), WriterError> {
     let location = layer_location(&path, layer.id);
     let options = layer_options(layer, &location, warnings)?;
@@ -542,6 +587,12 @@ fn create_layer_tree<'a>(
                 Some(parent) => file.add_group_in_with(&layer.name, parent, options),
                 None => file.add_group_with(&layer.name, options),
             };
+            if preserve_photoshop_metadata {
+                if let Some(user_data) = reference_point_user_data(layer, layer.frame_states.len())
+                {
+                    file.set_group_user_data(group, user_data);
+                }
+            }
             for child in &layer.children {
                 create_layer_tree(
                     file,
@@ -550,6 +601,7 @@ fn create_layer_tree<'a>(
                     layer_path(Some(&path), child),
                     bindings,
                     warnings,
+                    preserve_photoshop_metadata,
                 )?;
             }
         }
@@ -558,6 +610,12 @@ fn create_layer_tree<'a>(
                 Some(parent) => file.add_layer_in_with(&layer.name, parent, options),
                 None => file.add_layer_with(&layer.name, options),
             };
+            if preserve_photoshop_metadata {
+                if let Some(user_data) = reference_point_user_data(layer, layer.frame_states.len())
+                {
+                    file.set_layer_user_data(handle, user_data);
+                }
+            }
             bindings.push(PixelBinding {
                 layer,
                 handle,
@@ -604,6 +662,7 @@ fn create_planned_tree<'a>(
     plan: &'a LayerWritePlan,
     bindings: &mut Vec<PlannedBinding<'a>>,
     warnings: &mut WarningCollector,
+    preserve_photoshop_metadata: bool,
 ) -> Result<(), WriterError> {
     match node {
         PlannedNode::Group {
@@ -623,8 +682,26 @@ fn create_planned_tree<'a>(
                 Some(parent) => file.add_group_in_with(name, parent, options),
                 None => file.add_group_with(name, options),
             };
+            if preserve_photoshop_metadata {
+                if let Some(source) = source {
+                    if let Some(user_data) =
+                        reference_point_user_data(source, document.frames.len())
+                    {
+                        file.set_group_user_data(group, user_data);
+                    }
+                }
+            }
             for child in children {
-                create_planned_tree(file, child, Some(group), document, plan, bindings, warnings)?;
+                create_planned_tree(
+                    file,
+                    child,
+                    Some(group),
+                    document,
+                    plan,
+                    bindings,
+                    warnings,
+                    preserve_photoshop_metadata,
+                )?;
             }
         }
         PlannedNode::Track { track_id } => {
@@ -644,6 +721,11 @@ fn create_planned_tree<'a>(
                 Some(parent) => file.add_layer_in_with(&track.name, parent, options),
                 None => file.add_layer_with(&track.name, options),
             };
+            if preserve_photoshop_metadata {
+                if let Some(user_data) = reference_point_user_data(source, document.frames.len()) {
+                    file.set_layer_user_data(handle, user_data);
+                }
+            }
             bindings.push(PlannedBinding {
                 track,
                 handle,
@@ -827,20 +909,12 @@ fn i16_value(field: &str, value: i32) -> Result<i16, WriterError> {
 fn collect_unmapped_animation_warnings(
     document: &NormalizedDocument,
     warnings: &mut WarningCollector,
+    preserve_photoshop_metadata: bool,
 ) {
     for layer in &document.root_layers {
-        collect_layer_animation_warnings(layer, None, warnings);
+        collect_layer_animation_warnings(layer, None, warnings, preserve_photoshop_metadata);
     }
-    if document.active_frame_index.is_some() {
-        warnings.push(
-            InformationLossCode::ActiveFrame,
-            LossDisposition::Dropped,
-            document_location(),
-            "Photoshop active frame is not serialized as Aseprite UI state",
-            false,
-            true,
-        );
-    }
+    // Active frame is stored as sprite metadata and applied by the Lua adapter.
 }
 
 /// Counts unsupported frame-local properties recursively.
@@ -848,14 +922,18 @@ fn collect_layer_animation_warnings(
     layer: &NormalizedLayer,
     parent_path: Option<&str>,
     warnings: &mut WarningCollector,
+    preserve_photoshop_metadata: bool,
 ) {
     let path = layer_path(parent_path, layer);
     let location = layer_location(&path, layer.id);
     for state in &layer.frame_states {
-        if state.reference_point.is_some() {
+        if !preserve_photoshop_metadata
+            && state.reference_point.is_some()
+            && has_meaningful_reference_point(layer, state.frame_index as usize)
+        {
             warnings.push(
                 InformationLossCode::ReferencePoint,
-                LossDisposition::Dropped,
+                LossDisposition::Informational,
                 with_frame(&location, state.frame_index),
                 format!(
                     "layer {} frame {} reference point was not serialized",
@@ -880,7 +958,7 @@ fn collect_layer_animation_warnings(
         }
     }
     for child in &layer.children {
-        collect_layer_animation_warnings(child, Some(&path), warnings);
+        collect_layer_animation_warnings(child, Some(&path), warnings, preserve_photoshop_metadata);
     }
 }
 
@@ -902,15 +980,6 @@ fn layer_location(path: &str, layer_id: u32) -> InformationLocation {
     InformationLocation {
         layer_id: Some(layer_id),
         path: path.to_string(),
-        frame_index: None,
-    }
-}
-
-/// Builds the document-level location used for unscoped metadata losses.
-fn document_location() -> InformationLocation {
-    InformationLocation {
-        layer_id: None,
-        path: String::new(),
         frame_index: None,
     }
 }

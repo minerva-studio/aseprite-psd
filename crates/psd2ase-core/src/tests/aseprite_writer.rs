@@ -453,14 +453,39 @@ fn reports_nested_layer_and_frame_locations_for_loss_warnings() {
             && warning.location.frame_index == Some(1)
     }));
 
-    let active_frame = encoded
-        .warning_details
-        .iter()
-        .find(|warning| warning.code == InformationLossCode::ActiveFrame)
-        .expect("active frame warning");
-    assert_eq!(active_frame.location.path, "");
-    assert_eq!(active_frame.location.layer_id, None);
-    assert_eq!(active_frame.location.frame_index, None);
+    assert!(
+        !encoded
+            .warning_details
+            .iter()
+            .any(|warning| warning.code == InformationLossCode::ActiveFrame)
+    );
+    let file = AsepriteFile::from_reader(&encoded.bytes[..]).expect("valid Aseprite bytes");
+    assert_eq!(
+        crate::aseprite_metadata::read_active_frame_user_data(file.sprite_user_data().as_ref()),
+        Some(1)
+    );
+
+    let preserved = super::encode_with_linked_cels_and_jitter_and_metadata(
+        &document,
+        crate::LinkedCelMode::Off,
+        &JitterPlan::default(),
+        true,
+    )
+    .expect("metadata-preserving document should encode");
+    let preserved_file =
+        AsepriteFile::from_reader(&preserved.bytes[..]).expect("valid preserved Aseprite bytes");
+    let points = crate::aseprite_metadata::read_reference_point_user_data(
+        preserved_file.layers()[1].user_data.as_ref(),
+        document.frames.len(),
+    );
+    assert_eq!(points[0], None);
+    assert_eq!(points[1], Some(AnimationPoint { x: 1.0, y: 2.0 }));
+    assert!(
+        !preserved
+            .warning_details
+            .iter()
+            .any(|warning| warning.code == InformationLossCode::ReferencePoint)
+    );
 }
 
 #[test]

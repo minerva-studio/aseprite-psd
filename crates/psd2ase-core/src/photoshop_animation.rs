@@ -938,13 +938,18 @@ fn descriptor_point(
         return Ok(None);
     };
     let point = item_descriptor(value, key)?;
-    let x = descriptor_number(point, "Hrzn")?.ok_or_else(|| {
-        AnimationParseError::InvalidData(format!("{key} point has no Hrzn value"))
-    })?;
-    let y = descriptor_number(point, "Vrtc")?.ok_or_else(|| {
-        AnimationParseError::InvalidData(format!("{key} point has no Vrtc value"))
-    })?;
-    Ok(Some(AnimationPoint { x, y }))
+    let x = descriptor_number(point, "Hrzn")?;
+    let y = descriptor_number(point, "Vrtc")?;
+    match (x, y) {
+        (None, None) => Ok(None),
+        (Some(x), Some(y)) => Ok(Some(AnimationPoint { x, y })),
+        (None, Some(_)) => Err(AnimationParseError::InvalidData(format!(
+            "{key} point has no Hrzn value"
+        ))),
+        (Some(_), None) => Err(AnimationParseError::InvalidData(format!(
+            "{key} point has no Vrtc value"
+        ))),
+    }
 }
 
 /// Converts a PSD number into a checked normalized u32.

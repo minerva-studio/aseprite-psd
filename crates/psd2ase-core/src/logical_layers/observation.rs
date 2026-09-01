@@ -6,6 +6,7 @@ use super::association::{canonical_name, parse_layer_name};
 use super::{GroupKey, GroupSegment};
 use crate::aseprite_writer::cel_position;
 use crate::layer_names::CopySuffixMatch;
+use crate::photoshop_metadata::layer_has_meaningful_reference_point;
 use crate::{NormalizedLayer, NormalizedLayerKind};
 
 #[derive(Debug)]
@@ -23,6 +24,8 @@ pub(super) struct LayerEvidence<'doc> {
     pub(super) width: u32,
     pub(super) height: u32,
     pub(super) pixels: &'doc [u8],
+    /// Whether this source layer must remain separate for Photoshop metadata.
+    pub(super) metadata_locked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +57,8 @@ pub(super) struct ObservationCollectionState<'state, 'doc> {
     pub(super) source_order: &'state mut usize,
     pub(super) next_observation_id: &'state mut usize,
     pub(super) store: &'state mut ObservationStore<'doc>,
+    /// Whether meaningful Photoshop metadata is being preserved in the output.
+    pub(super) preserve_photoshop_metadata: bool,
 }
 
 impl ObservationStore<'_> {
@@ -86,6 +91,7 @@ pub(super) fn collect_observations<'doc>(
     group_path: &[GroupSegment],
     ancestors: &[&NormalizedLayer],
     frame_container_ids: &[u32],
+    metadata_locked: bool,
     state: &mut ObservationCollectionState<'_, 'doc>,
 ) -> Result<(), String> {
     let is_visible = |frame_index: usize| {
@@ -101,6 +107,9 @@ pub(super) fn collect_observations<'doc>(
     };
     match layer.kind {
         NormalizedLayerKind::Group => {
+            let next_metadata_locked = metadata_locked
+                || (state.preserve_photoshop_metadata
+                    && layer_has_meaningful_reference_point(layer));
             let mut next_path = group_path.to_vec();
             let mut next_frame_container_ids = frame_container_ids.to_vec();
             if state.selectors.contains_key(&layer.id) {
@@ -123,6 +132,7 @@ pub(super) fn collect_observations<'doc>(
                     &next_path,
                     &next_ancestors,
                     &next_frame_container_ids,
+                    next_metadata_locked,
                     state,
                 )?;
             }
@@ -147,6 +157,9 @@ pub(super) fn collect_observations<'doc>(
                 width: pixels.width,
                 height: pixels.height,
                 pixels: &pixels.data,
+                metadata_locked: metadata_locked
+                    || (state.preserve_photoshop_metadata
+                        && layer_has_meaningful_reference_point(layer)),
             });
             state.store.evidence.push(Rc::clone(&evidence));
             for (frame_index, frame) in state.store.frames.iter_mut().enumerate() {

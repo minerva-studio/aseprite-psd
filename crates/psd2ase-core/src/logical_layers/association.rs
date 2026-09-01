@@ -34,6 +34,8 @@ pub(super) struct TrackBuilder<'doc> {
     pub(super) observation_ids: Vec<ObservationId>,
     pub(super) observations: Vec<ObservationSummary<'doc>>,
     pub(super) group_paths: Vec<Vec<GroupSegment>>,
+    /// Whether this track is tied to one source layer for metadata preservation.
+    pub(super) metadata_locked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -294,6 +296,7 @@ fn associate_families_globally<'doc>(
             let mut candidates = family_tracks
                 .iter()
                 .filter(|track_id| tracks[**track_id].cels[*frame_index].is_none())
+                .filter(|track_id| identity_allowed(observation, &tracks[**track_id]))
                 .map(|track_id| {
                     (
                         *track_id,
@@ -584,7 +587,9 @@ fn associate_frame_compact<'doc>(
         let candidates = tracks
             .iter()
             .filter(|track| {
-                !used_tracks.contains(&track.id) && track.name_key == observation.name_key
+                !used_tracks.contains(&track.id)
+                    && track.name_key == observation.name_key
+                    && identity_allowed(observation, track)
             })
             .map(|track| track.id)
             .collect::<Vec<_>>();
@@ -609,6 +614,7 @@ fn associate_frame_compact<'doc>(
                             && previous.height == observation.height
                             && previous.pixels == observation.pixels
                     })
+                    && identity_allowed(observation, track)
             })
             .map(|track| track.id)
             .collect::<Vec<_>>();
@@ -639,6 +645,7 @@ fn associate_frame_compact<'doc>(
         let observation = &observations[*observation_index];
         let mut candidates = residual_tracks
             .iter()
+            .filter(|track_id| identity_allowed(observation, &tracks[**track_id]))
             .map(|track_id| {
                 (
                     *track_id,
@@ -650,7 +657,12 @@ fn associate_frame_compact<'doc>(
         candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         candidate_map.insert(*observation_index, candidates);
     }
-    let solutions = if residual_observations.len() == 1 && residual_tracks.len() == 1 {
+    let solutions = if residual_observations.len() == 1
+        && residual_tracks.len() == 1
+        && candidate_map
+            .get(&residual_observations[0])
+            .is_some_and(|candidates| !candidates.is_empty())
+    {
         vec![vec![(residual_observations[0], residual_tracks[0])]]
     } else {
         find_unique_matchings(&residual_observations, &candidate_map, 2)
@@ -877,6 +889,7 @@ fn associate_frame<'doc>(
                     && track.cels[observation.frame_index].is_none()
                     && !track.generic_name
                     && observation.normalized_name == track.normalized_name
+                    && identity_allowed(observation, track)
             })
             .map(|track| track.id)
             .collect::<Vec<_>>();
@@ -912,6 +925,7 @@ fn associate_frame<'doc>(
                             && previous.height == observation.height
                             && previous.pixels == observation.pixels
                     })
+                    && identity_allowed(observation, track)
             })
             .map(|track| track.id)
             .collect::<Vec<_>>();
@@ -952,6 +966,7 @@ fn associate_frame<'doc>(
                     && !track.generic_name
                     && track.name_key == family_key
                     && track.cels[observations[family_observations[0]].frame_index].is_none()
+                    && identity_allowed(&observations[family_observations[0]], track)
             })
             .map(|track| track.id)
             .collect::<Vec<_>>();
@@ -1364,6 +1379,9 @@ fn candidate_score(
 }
 
 fn copy_family_candidate_allowed(observation: &Observation, track: &TrackBuilder) -> bool {
+    if !identity_allowed(observation, track) {
+        return false;
+    }
     if observation.generic_name || track.generic_name {
         // Generic names may bridge an accidental rename only when both sides
         // retain a persistent structural parent.  A bare top-level generic
@@ -1376,6 +1394,14 @@ fn copy_family_candidate_allowed(observation: &Observation, track: &TrackBuilder
                 .any(|path| path == &observation.group_path);
     }
     observation.name_key == track.name_key
+}
+
+/// Prevents automatic association from merging unrelated Photoshop metadata sources.
+fn identity_allowed(observation: &Observation, track: &TrackBuilder) -> bool {
+    (!observation.metadata_locked && !track.metadata_locked)
+        || (observation.metadata_locked
+            && track.metadata_locked
+            && observation.source_layer_id == track.representative_source_layer_id)
 }
 
 fn name_match_score(observation: &Observation, track: &TrackBuilder) -> u16 {
@@ -1562,6 +1588,7 @@ pub(super) fn new_track<'doc>(
         observation_ids: Vec::new(),
         observations: Vec::new(),
         group_paths: Vec::new(),
+        metadata_locked: observation.metadata_locked,
     }
 }
 

@@ -72,6 +72,7 @@ pub enum LossDisposition {
     Rasterized,
     Degraded,
     Dropped,
+    Informational,
     Unknown,
 }
 
@@ -82,6 +83,7 @@ impl LossDisposition {
             Self::Rasterized => "rasterized",
             Self::Degraded => "degraded",
             Self::Dropped => "dropped",
+            Self::Informational => "informational",
             Self::Unknown => "unknown",
         }
     }

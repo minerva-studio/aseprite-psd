@@ -9,7 +9,7 @@ use psd2ase_core::{
     inspect, write_report,
 };
 
-const CONVERT_USAGE: &str = "usage: psd2ase convert INPUT [-o OUTPUT] [--report PATH] [--overwrite] [--linked-cels off|identical] [--layer-association preserve|auto] [--association-strategy compact|conservative] [--z-order stable|auto] [--stable-order consensus|anchor|strict] [--uncertain-layers group|flat] [--jitter-mode off|report|assist|repair] [--jitter-kind alpha|color|all] [--jitter-profile conservative|balanced] [--jitter-alpha-threshold N] [--jitter-max-speck-area N] [--jitter-max-changed-ratio N] [--jitter-max-channel-delta N]";
+const CONVERT_USAGE: &str = "usage: psd2ase convert INPUT [-o OUTPUT] [--report PATH] [--overwrite] [--preserve-photoshop-metadata] [--linked-cels off|identical] [--layer-association preserve|auto] [--association-strategy compact|conservative] [--z-order stable|auto] [--stable-order consensus|anchor|strict] [--uncertain-layers group|flat] [--jitter-mode off|report|assist|repair] [--jitter-kind alpha|color|all] [--jitter-profile conservative|balanced] [--jitter-alpha-threshold N] [--jitter-max-speck-area N] [--jitter-max-changed-ratio N] [--jitter-max-channel-delta N]";
 const EXPORT_USAGE: &str = "usage: psd2ase export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite [--report PATH] [--overwrite]";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -17,6 +17,7 @@ struct ConvertCommand {
     input: PathBuf,
     output: PathBuf,
     overwrite: bool,
+    preserve_photoshop_metadata: bool,
     linked_cels: LinkedCelMode,
     layer_association: LayerAssociation,
     jitter: JitterOptions,
@@ -119,6 +120,7 @@ fn run_convert(arguments: &[String]) -> Result<(), CliError> {
         &command.output,
         &ConvertOptions {
             overwrite: command.overwrite,
+            preserve_photoshop_metadata: command.preserve_photoshop_metadata,
             linked_cels: command.linked_cels,
             layer_association: command.layer_association,
             jitter: command.jitter,
@@ -296,6 +298,7 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
     let mut output = None;
     let mut report = None;
     let mut overwrite = false;
+    let mut preserve_photoshop_metadata = false;
     let mut linked_cels = LinkedCelMode::Off;
     let mut automatic = false;
     let mut conservative = false;
@@ -313,6 +316,7 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
     while index < arguments.len() {
         match arguments[index].as_str() {
             "--overwrite" => overwrite = true,
+            "--preserve-photoshop-metadata" => preserve_photoshop_metadata = true,
             "--linked-cels" => {
                 index += 1;
                 let value = arguments
@@ -587,6 +591,7 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
         input,
         output,
         overwrite,
+        preserve_photoshop_metadata,
         linked_cels,
         layer_association,
         jitter,
