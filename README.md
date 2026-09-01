@@ -31,8 +31,9 @@ extension snapshots isolated original and flattened copies, runs the bundled
 converter, validates the Photoshop document, and only then writes it through
 Aseprite's custom-format save stream. The save options let you choose whether
 the current frame is written as Photoshop's active frame; Ctrl+S reuses the
-selected format and options, including channel compression (`ZIP`, `ZIP
-prediction`, `RLE`, or `Raw`).
+selected format and options. Export always records the currently selected frame
+as Photoshop's active frame. Channel compression can be selected as `ZIP`,
+`ZIP prediction`, `RLE`, or `Raw`.
 
 ## Command line
 

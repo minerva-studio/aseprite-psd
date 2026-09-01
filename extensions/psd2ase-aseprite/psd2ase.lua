@@ -176,20 +176,13 @@ local function build_export_arguments(binary, input, output, composite, report, 
   return arguments
 end
 
---- Shows the existing export choices shared by custom Save As and the fallback menu.
+--- Shows the export choices shared by custom Save As and the fallback menu.
 local function select_export_options()
   local dialog = Dialog{ title="Export PSD/PSB Options" }
   if not dialog then
     show_error("PSD export failed", "Aseprite does not have an available UI.")
     return nil
   end
-  dialog:combobox{
-    id="active_frame",
-    label="Active frame",
-    option="Current frame",
-    options={"Current frame", "No active frame"},
-  }
-  dialog:newrow()
   dialog:combobox{
     id="compression",
     label="Compression",
@@ -204,7 +197,6 @@ local function select_export_options()
     return nil
   end
   return {
-    use_active_frame = dialog.data.active_frame == "Current frame",
     compression = ({
       ["ZIP"] = "zip",
       ["ZIP prediction"] = "zip-prediction",
@@ -220,9 +212,13 @@ local function build_windows_command(arguments, log_filename)
   for index = 2, #arguments do
     table.insert(invocation, quote_powershell_literal(arguments[index]))
   end
-  local script = table.concat(invocation, " ")
-    .. " *> " .. quote_powershell_literal(log_filename)
-    .. "; if ($null -eq $LASTEXITCODE) { exit 1 } else { exit $LASTEXITCODE }"
+  local command = table.concat(invocation, " ")
+  local script = "$captured = @(" .. command .. " 2>&1); "
+    .. "$exitCode = $LASTEXITCODE; "
+    .. "$text = ($captured | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine; "
+    .. "[IO.File]::WriteAllText(" .. quote_powershell_literal(log_filename)
+    .. ", $text, [Text.UTF8Encoding]::new($false)); "
+    .. "if ($null -eq $exitCode) { exit 1 } else { exit $exitCode }"
   local payload = encode_base64(script)
   return "powershell.exe -NoLogo -NoProfile -NonInteractive -Command "
     .. quote_argument("$s=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('"
@@ -278,7 +274,7 @@ local function run_converter(binary, arguments, output)
       "psd2ase conversion failed (%s).\n\n%s",
       format_exit_status(result, reason, code),
       detail
-    ))
+    ), 0)
   end
   if not app.fs.isFile(output) then
     remove_file(log_filename)
@@ -308,9 +304,26 @@ local function run_export_conversion(binary, input, output, composite, report, a
 end
 
 --- Shows a single alert containing an operation failure.
+local function split_message_lines(message)
+  local normalized = tostring(message):gsub("\r\n", "\n"):gsub("\r", "\n")
+  local lines = {}
+  for line in (normalized .. "\n"):gmatch("(.-)\n") do
+    table.insert(lines, line)
+  end
+  if #lines == 0 then
+    table.insert(lines, "")
+  end
+  return lines
+end
+
+--- Shows an operation failure with one Aseprite alert label per line.
 local function show_error(title, message)
-  print(title .. ": " .. tostring(message))
-  app.alert{ title=title, text=message }
+  local lines = split_message_lines(message)
+  print(title .. ":")
+  for _, line in ipairs(lines) do
+    print(line)
+  end
+  app.alert{ title=title, text=lines }
 end
 
 --- Saves one structured compatibility report after an explicit export choice.
@@ -678,10 +691,21 @@ local function current_frame_index(sprite)
     error("The PSD export source is not the active Aseprite sprite.")
   end
   local frame = app.frame
-  if type(frame) ~= "number" or frame % 1 ~= 0 then
+  local frame_number
+  if type(frame) == "number" then
+    frame_number = frame
+  elseif frame ~= nil then
+    local ok, value = pcall(function()
+      return frame.frameNumber
+    end)
+    if ok then
+      frame_number = value
+    end
+  end
+  if type(frame_number) ~= "number" or frame_number % 1 ~= 0 then
     error("Aseprite did not provide a numeric current frame.")
   end
-  local frame_index = frame - 1
+  local frame_index = frame_number - 1
   if frame_index < 0 or frame_index >= #sprite.frames then
     error("The current Aseprite frame is outside the sprite timeline.")
   end
@@ -790,9 +814,7 @@ local function save_photoshop_document(binary, ev)
   local output_filename = temporary_path(extension)
   local report_filename = temporary_path("json")
   local success, result = pcall(function()
-    local active_frame_index = export_options.use_active_frame
-      and current_frame_index(ev.sprite)
-      or nil
+    local active_frame_index = current_frame_index(ev.sprite)
     create_export_snapshots(ev.sprite, original_filename, composite_filename)
     run_export_conversion(
       binary,
@@ -878,9 +900,7 @@ local function export_from_menu(binary)
   local output_filename = temporary_path(extension)
   local report_filename = temporary_path("json")
   local success, result = pcall(function()
-    local active_frame_index = export_options.use_active_frame
-      and current_frame_index(app.sprite)
-      or nil
+    local active_frame_index = current_frame_index(app.sprite)
     create_export_snapshots(app.sprite, original_filename, composite_filename)
     run_export_conversion(
       binary,

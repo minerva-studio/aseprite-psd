@@ -26,8 +26,8 @@ Save As 选择最终 `.aseprite` 路径；Aseprite 会默认建议 PSD 所在目
 导出时选择 **File > Save As...**，并指定 `.psd` 或 `.psb`。扩展会分别创建
 隔离的原始副本与扁平副本，调用内附 converter 并验证 Photoshop 文档，最后
 才通过 Aseprite 自定义格式的保存流写入。保存选项可以选择是否把当前帧写成
-Photoshop 的 active frame，以及选择通道压缩（`ZIP`、`ZIP prediction`、`RLE`
-或 `Raw`）；此后 Ctrl+S 会继续使用所选格式和选项。
+Photoshop 的 active frame（导出始终使用当前帧），以及选择通道压缩（`ZIP`、
+`ZIP prediction`、`RLE` 或 `Raw`）；此后 Ctrl+S 会继续使用所选格式和选项。
 
 ## 命令行
 
