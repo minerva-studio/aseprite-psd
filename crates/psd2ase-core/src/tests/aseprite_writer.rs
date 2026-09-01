@@ -64,6 +64,26 @@ fn encodes_static_frame_with_serialization_default() {
 }
 
 #[test]
+fn empty_pixel_layer_is_preserved_without_a_cel() {
+    let mut document = pixel_document(8, 8, 0, 0);
+    let layer = &mut document.root_layers[0];
+    layer.bounds.right = layer.bounds.left;
+    layer.bounds.bottom = layer.bounds.top;
+    layer.pixels = Some(NormalizedPixels {
+        width: 0,
+        height: 0,
+        left: layer.bounds.left,
+        top: layer.bounds.top,
+        data: Vec::new(),
+    });
+
+    let encoded = encode(&document).expect("empty layer should encode");
+    let file = AsepriteFile::from_reader(&encoded.bytes[..]).expect("valid Aseprite bytes");
+    let layer = file.layer_ref(0).expect("empty pixel layer");
+    assert!(file.cel(layer, 0).is_none());
+}
+
+#[test]
 fn resolved_jitter_pixels_are_written_and_valid_for_linking() {
     let document = pixel_document(8, 8, 0, 0);
     let mut jitter = JitterPlan::default();

@@ -107,6 +107,10 @@ local function build_arguments(binary, input, output, options)
     "--output",
     output,
   }
+  if options.report then
+    table.insert(arguments, "--report")
+    table.insert(arguments, options.report)
+  end
 
   if options.overwrite then
     table.insert(arguments, "--overwrite")
@@ -223,6 +227,40 @@ end
 --- Shows a single alert containing an operation failure.
 local function show_error(title, message)
   app.alert{ title=title, text=message }
+end
+
+--- Shows structured compatibility losses and optionally saves the original JSON.
+local function show_information_loss(report_filename)
+  local raw = read_text_file(report_filename)
+  if raw == "" then return end
+  local ok, report = pcall(function() return json.decode(raw) end)
+  if not ok or type(report) ~= "table" or report.schema_version ~= 1 then
+    show_error("PSD import report", "The converter produced an unreadable or unsupported report.")
+    return
+  end
+  local losses = report.losses or {}
+  if #losses == 0 then return end
+  local lines = {"Some PSD information could not be preserved:"}
+  for index, loss in ipairs(losses) do
+    if index > 8 then
+      table.insert(lines, string.format("... and %d more entries", #losses - 8))
+      break
+    end
+    table.insert(lines, string.format("%s: %s (%d)", loss.code or "unknown", loss.disposition or "unknown", loss.count or 0))
+  end
+  local dialog = Dialog{ title="PSD Import Information Loss" }
+  dialog:label{ id="summary", text=table.concat(lines, "\n") }
+  dialog:file{ id="destination", label="Report", save=true, entry=true, filetypes={"json"} }
+  dialog:button{ id="save", text="Save Full Report..." }
+  dialog:button{ id="ok", text="OK", focus=true }
+  dialog:show()
+  if dialog.data.save then
+    local saved = dialog.data.destination
+    if saved and saved ~= "" then
+      local file = io.open(saved, "wb")
+      if file then file:write(raw); file:close() else show_error("PSD import report", "Could not save the report.") end
+    end
+  end
 end
 
 --- Returns the compact label shown for the current jitter settings.
@@ -473,11 +511,14 @@ local function import_from_menu(binary)
     return
   end
   local temporary_output = temporary_path("aseprite")
+  options.report = temporary_path("json")
   local success, result = pcall(function()
     run_conversion(binary, options.input, temporary_output, options)
     open_as_unsaved_document(temporary_output, suggested_output_path(options.input))
+    show_information_loss(options.report)
   end)
   remove_file(temporary_output)
+  remove_file(options.report)
   if not success then
     show_error("PSD import failed", tostring(result))
   end
@@ -507,13 +548,18 @@ function init(plugin)
         error("This extension has no converter for the current platform.")
       end
       local temporary_output = temporary_path("aseprite")
+      local report_filename = temporary_path("json")
+      local options = default_import_options()
+      options.report = report_filename
       local success, result = pcall(function()
-        run_conversion(binary, ev.filename, temporary_output, default_import_options())
+        run_conversion(binary, ev.filename, temporary_output, options)
         return open_as_unsaved_document(
           temporary_output,
           suggested_output_path(ev.filename))
       end)
+      if success then show_information_loss(report_filename) end
       remove_file(temporary_output)
+      remove_file(report_filename)
       if not success then
         error(result, 0)
       end

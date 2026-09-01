@@ -6,6 +6,7 @@
 
 pub mod aseprite_writer;
 mod error;
+pub mod information_loss;
 pub mod jitter;
 pub mod layer_names;
 pub mod logical_layers;
@@ -16,6 +17,10 @@ pub use aseprite_writer::{
     CelReuseReport, DEFAULT_FRAME_DURATION_MS, EncodedAseprite, WriterError,
 };
 pub use error::{ConversionError, InspectionError};
+pub use information_loss::{
+    InformationLocation, InformationLoss, InformationLossCode, InformationLossReport,
+    LossDisposition,
+};
 pub use jitter::{
     JitterKind, JitterMode, JitterOptions, JitterPlan, JitterProfile, JitterReport,
     JitterThresholds, build_jitter_plan, resolved_pixels, stabilized_document,
@@ -82,6 +87,8 @@ pub struct ConversionReport {
     pub output: PathBuf,
     /// Warnings produced while mapping or validating the document.
     pub warnings: Vec<String>,
+    /// Structured source and output compatibility losses.
+    pub information_loss: InformationLossReport,
     /// Automatic layer-association diagnostics, when auto mode was selected.
     pub association: Option<AssociationReport>,
     /// Counts of ordinary and linked cels in the committed output.
@@ -114,11 +121,13 @@ pub fn inspect(input: &Path) -> Result<DocumentInspection, InspectionError> {
 /// Reads a PSD and converts it into the format-neutral intermediate model.
 pub fn normalize(input: &Path) -> Result<NormalizedDocument, InspectionError> {
     let bytes = fs::read(input).map_err(InspectionError::InputIo)?;
-    normalize_bytes(&bytes)
+    normalize_bytes(&bytes).map(|(document, _)| document)
 }
 
 /// Converts one parser buffer without exposing ag-psd types to callers.
-fn normalize_bytes(bytes: &[u8]) -> Result<NormalizedDocument, InspectionError> {
+fn normalize_bytes(
+    bytes: &[u8],
+) -> Result<(NormalizedDocument, InformationLossReport), InspectionError> {
     let options = ag_psd::psd::ReadOptions {
         use_image_data: Some(true),
         skip_thumbnail: Some(true),
@@ -126,6 +135,9 @@ fn normalize_bytes(bytes: &[u8]) -> Result<NormalizedDocument, InspectionError> 
     };
     let psd = ag_psd::read_psd(bytes, &options)
         .map_err(|error| InspectionError::PsdRead(error.to_string()))?;
+    validate_normalization_bit_depth(psd.bits_per_channel)?;
+    let mut information_loss = InformationLossReport::default();
+    collect_source_losses(&psd, &mut information_loss);
     let canvas = (
         integral_u32(psd.width, "document width")?,
         integral_u32(psd.height, "document height")?,
@@ -210,20 +222,173 @@ fn normalize_bytes(bytes: &[u8]) -> Result<NormalizedDocument, InspectionError> 
             )
         };
 
-    Ok(NormalizedDocument {
-        canvas,
-        channels,
-        bits_per_channel,
-        color_mode: psd
-            .color_mode
-            .map(|value| normalize_enum_name(&format!("{value:?}"))),
-        root_layers: layers,
-        frames,
-        loop_mode,
-        active_frame_index,
-        animation_resource_ids: resource_ids,
-        animation_frame_flags: frame_flags,
-    })
+    Ok((
+        NormalizedDocument {
+            canvas,
+            channels,
+            bits_per_channel,
+            color_mode: psd
+                .color_mode
+                .map(|value| normalize_enum_name(&format!("{value:?}"))),
+            root_layers: layers,
+            frames,
+            loop_mode,
+            active_frame_index,
+            animation_resource_ids: resource_ids,
+            animation_frame_flags: frame_flags,
+        },
+        information_loss,
+    ))
+}
+
+/// Records source features that the normalized model intentionally drops.
+fn collect_source_losses(psd: &ag_psd::psd::Psd, report: &mut InformationLossReport) {
+    if let Some(artboards) = &psd.artboards {
+        if artboards.count > 0.0 {
+            report.add(
+                InformationLossCode::Artboards,
+                LossDisposition::Dropped,
+                InformationLocation {
+                    layer_id: None,
+                    path: "document".to_string(),
+                },
+                "artboards are not represented in the normalized model",
+                true,
+                true,
+            );
+        }
+    }
+    if let Some(resources) = &psd.image_resources {
+        if resources
+            .slices
+            .as_ref()
+            .is_some_and(|value| !value.is_empty())
+        {
+            report.add(
+                InformationLossCode::Slices,
+                LossDisposition::Dropped,
+                InformationLocation {
+                    layer_id: None,
+                    path: "image_resources".to_string(),
+                },
+                "slices are not represented in the normalized model",
+                false,
+                true,
+            );
+        }
+        if resources.layer_comps.is_some() {
+            report.add(
+                InformationLossCode::LayerComps,
+                LossDisposition::Dropped,
+                InformationLocation {
+                    layer_id: None,
+                    path: "image_resources".to_string(),
+                },
+                "layer comps are not represented in the normalized model",
+                false,
+                true,
+            );
+        }
+    }
+    if let Some(layers) = psd.children.as_deref() {
+        for (index, layer) in layers.iter().enumerate() {
+            collect_layer_losses(layer, &[index.to_string()], report);
+        }
+    }
+}
+
+/// Recursively records layer-level features outside the normalized contract.
+fn collect_layer_losses(
+    layer: &ag_psd::psd::Layer,
+    path: &[String],
+    report: &mut InformationLossReport,
+) {
+    let path = path.join("/");
+    let location = |layer_id| InformationLocation {
+        layer_id,
+        path: path.clone(),
+    };
+    let id = layer
+        .additional_info
+        .id
+        .and_then(|value| u32::try_from(value as u64).ok());
+    if layer.additional_info.mask.is_some() || layer.additional_info.real_mask.is_some() {
+        report.add(
+            InformationLossCode::PixelMask,
+            LossDisposition::Dropped,
+            location(id),
+            "pixel mask is not represented in the normalized model",
+            true,
+            true,
+        );
+    }
+    if layer.additional_info.vector_mask.is_some() {
+        report.add(
+            InformationLossCode::VectorMask,
+            LossDisposition::Dropped,
+            location(id),
+            "vector mask is not represented in the normalized model",
+            true,
+            true,
+        );
+    }
+    if layer.clipping == Some(true) {
+        report.add(
+            InformationLossCode::Clipping,
+            LossDisposition::Dropped,
+            location(id),
+            "clipping is not represented in the normalized model",
+            true,
+            true,
+        );
+    }
+    if layer.additional_info.text.is_some() {
+        report.add(
+            InformationLossCode::TextLayer,
+            LossDisposition::Dropped,
+            location(id),
+            "text layer is rasterized or dropped to pixel data",
+            true,
+            true,
+        );
+    }
+    if layer.additional_info.adjustment.is_some() {
+        report.add(
+            InformationLossCode::AdjustmentLayer,
+            LossDisposition::Dropped,
+            location(id),
+            "adjustment layer is not represented in the normalized model",
+            true,
+            true,
+        );
+    }
+    if layer.additional_info.effects.is_some() {
+        report.add(
+            InformationLossCode::LayerEffects,
+            LossDisposition::Dropped,
+            location(id),
+            "layer effects are not represented in the normalized model",
+            true,
+            true,
+        );
+    }
+    if layer.additional_info.placed_layer.is_some() {
+        report.add(
+            InformationLossCode::SmartObject,
+            LossDisposition::Dropped,
+            location(id),
+            "smart object is not represented in the normalized model",
+            true,
+            true,
+        );
+    }
+    if let Some(children) = &layer.children {
+        for (index, child) in children.iter().enumerate() {
+            let mut child_path = path.split('/').map(str::to_string).collect::<Vec<_>>();
+            child_path.push(index.to_string());
+            collect_layer_losses(child, &child_path, report);
+        }
+    }
 }
 
 /// Collects strict layer IDs and ancestry for the Photoshop metadata scanner.
@@ -276,16 +441,17 @@ fn build_layer(
     let pixels = if is_group {
         None
     } else {
-        let pixel = layer
-            .image_data
-            .as_ref()
-            .or(layer.canvas.as_ref())
-            .ok_or_else(|| {
-                InspectionError::Normalization(format!(
-                    "pixel layer has no RGBA8 data at {path_string}"
-                ))
-            })?;
-        Some(copy_rgba8_pixels(pixel, bounds, &path_string)?)
+        match layer.image_data.as_ref().or(layer.canvas.as_ref()) {
+            Some(pixel) => Some(copy_rgba8_pixels(pixel, bounds, &path_string)?),
+            None if bounds.right == bounds.left || bounds.bottom == bounds.top => {
+                Some(empty_pixels(bounds, &path_string)?)
+            }
+            None => {
+                return Err(InspectionError::Normalization(format!(
+                    "non-empty pixel layer has no RGBA8 data at {path_string}"
+                )));
+            }
+        }
     };
     let mut children = Vec::new();
     if let Some(source_children) = &layer.children {
@@ -313,6 +479,28 @@ fn build_layer(
         pixels,
         children,
         frame_states: Vec::new(),
+    })
+}
+
+/// Creates the zero-length pixel buffer owned by a genuinely empty layer.
+fn empty_pixels(bounds: NormalizedBounds, path: &str) -> Result<NormalizedPixels, InspectionError> {
+    let width = u32::try_from(bounds.right - bounds.left)
+        .map_err(|_| InspectionError::Normalization(format!("invalid pixel width at {path}")))?;
+    let height = u32::try_from(bounds.bottom - bounds.top)
+        .map_err(|_| InspectionError::Normalization(format!("invalid pixel height at {path}")))?;
+    let byte_len = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|value| value.checked_mul(4))
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| {
+            InspectionError::Normalization(format!("pixel dimensions overflow at {path}"))
+        })?;
+    Ok(NormalizedPixels {
+        width,
+        height,
+        left: bounds.left,
+        top: bounds.top,
+        data: vec![0; byte_len],
     })
 }
 
@@ -382,12 +570,22 @@ fn normalized_loop_mode(value: &LoopMode) -> NormalizedLoopMode {
 
 /// Validates a Photoshop layer ID before it enters the normalized model.
 fn layer_id(value: Option<f64>, path: &str) -> Result<u32, InspectionError> {
-    value
+    if let Some(value) = value
         .filter(|value| {
             value.is_finite() && *value >= 1.0 && value.fract() == 0.0 && *value <= u32::MAX as f64
         })
         .map(|value| value as u32)
-        .ok_or_else(|| InspectionError::Normalization(format!("layer at {path} has an invalid ID")))
+    {
+        return Ok(value);
+    }
+    // Static PSDs may omit Photoshop's optional layer ID. A path-based
+    // identity is stable and independent of the user-facing layer name.
+    let mut hash = 0x811c9dc5_u32;
+    for byte in path.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    Ok(hash | 0x8000_0000)
 }
 
 /// Converts an integral finite PSD number to a u32 model field.
@@ -399,6 +597,16 @@ fn integral_u32(value: f64, field: &str) -> Result<u32, InspectionError> {
             "{field} must be a finite integer in the u32 range"
         )))
     }
+}
+
+/// Rejects source depths that cannot be represented faithfully by normalization.
+fn validate_normalization_bit_depth(bits_per_channel: Option<f64>) -> Result<(), InspectionError> {
+    if bits_per_channel == Some(32.0) {
+        return Err(InspectionError::Normalization(
+            "32-bit PSD input is not supported for conversion".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Converts an integral finite PSD coordinate to an i32 model field.
@@ -499,8 +707,28 @@ pub fn convert(
         return Err(ConversionError::OutputExists(output.to_path_buf()));
     }
 
-    let document =
-        normalize(input).map_err(|error| ConversionError::InputInspection(error.to_string()))?;
+    let bytes =
+        fs::read(input).map_err(|error| ConversionError::InputInspection(error.to_string()))?;
+    let (document, mut information_loss) = normalize_bytes(&bytes)
+        .map_err(|error| ConversionError::InputInspection(error.to_string()))?;
+    if document.bits_per_channel != Some(8)
+        || !matches!(document.color_mode.as_deref(), Some("rgb" | "rgba"))
+    {
+        information_loss.add(
+            InformationLossCode::UnsupportedColor,
+            LossDisposition::Degraded,
+            InformationLocation {
+                layer_id: None,
+                path: "document".to_string(),
+            },
+            format!(
+                "source color mode {:?} at {:?} bits per channel is normalized to RGBA8",
+                document.color_mode, document.bits_per_channel
+            ),
+            true,
+            true,
+        );
+    }
     let initial_plan = match options.layer_association {
         LayerAssociation::Preserve => None,
         LayerAssociation::Auto(auto_options) => Some(
@@ -558,6 +786,69 @@ pub fn convert(
         0,
         "coordinate policy: provisional pixels.left/top plus frame offset cel origin".to_string(),
     );
+    let mut retained_warnings = Vec::new();
+    for warning in encoded.warnings {
+        let (code, disposition, visual, editable) = if warning.contains("blend mode") {
+            (
+                Some(InformationLossCode::UnknownBlendMode),
+                LossDisposition::Degraded,
+                true,
+                true,
+            )
+        } else if warning.contains("opacity") && warning.contains("quantized") {
+            (
+                Some(InformationLossCode::OpacityQuantization),
+                LossDisposition::Degraded,
+                true,
+                true,
+            )
+        } else if warning.contains("reference points") {
+            (
+                Some(InformationLossCode::ReferencePoint),
+                LossDisposition::Dropped,
+                false,
+                true,
+            )
+        } else if warning.contains("group frame opacity") {
+            (
+                Some(InformationLossCode::GroupFrameOpacity),
+                LossDisposition::Dropped,
+                true,
+                true,
+            )
+        } else if warning.contains("active frame") {
+            (
+                Some(InformationLossCode::ActiveFrame),
+                LossDisposition::Dropped,
+                false,
+                true,
+            )
+        } else if warning.contains("pixel layer") && warning.contains("children") {
+            (
+                Some(InformationLossCode::PixelLayerChildren),
+                LossDisposition::Dropped,
+                true,
+                true,
+            )
+        } else {
+            (None, LossDisposition::Unknown, false, false)
+        };
+        if let Some(code) = code {
+            information_loss.add(
+                code,
+                disposition,
+                InformationLocation {
+                    layer_id: None,
+                    path: String::new(),
+                },
+                warning,
+                visual,
+                editable,
+            );
+        } else {
+            retained_warnings.push(warning);
+        }
+    }
     match plan.as_ref() {
         None => {
             validate_aseprite_output(&encoded.bytes, &document, options.linked_cels, &jitter_plan)?
@@ -575,7 +866,8 @@ pub fn convert(
     Ok(ConversionReport {
         input: input.to_path_buf(),
         output: output.to_path_buf(),
-        warnings: encoded.warnings,
+        warnings: retained_warnings,
+        information_loss,
         association,
         cel_reuse: encoded.cel_reuse,
         jitter,
@@ -778,9 +1070,14 @@ fn validate_aseprite_output(
                     )));
                 }
                 for frame_index in 0..document.frames.len() {
-                    let visible = is_visible_pixel(document, source.id, frame_index);
+                    let has_pixels = source
+                        .pixels
+                        .as_ref()
+                        .is_some_and(|pixels| pixels.width > 0 && pixels.height > 0);
+                    let should_have_cel =
+                        has_pixels && is_visible_pixel(document, source.id, frame_index);
                     let cel = file.cel(output_handle, frame_index);
-                    if visible != cel.is_some() {
+                    if should_have_cel != cel.is_some() {
                         return Err(ConversionError::OutputValidation(format!(
                             "layer {} frame {frame_index} cel visibility differs",
                             source.id

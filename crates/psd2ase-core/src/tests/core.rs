@@ -1,5 +1,60 @@
 use super::*;
 
+#[test]
+fn missing_layer_ids_use_stable_name_independent_fallbacks() {
+    let first = layer_id(None, "0/1").expect("fallback id");
+    let repeated = layer_id(None, "0/1").expect("fallback id");
+    let sibling = layer_id(None, "0/2").expect("fallback id");
+    assert_eq!(first, repeated);
+    assert_ne!(first, sibling);
+}
+
+#[test]
+fn thirty_two_bit_documents_are_rejected_before_normalization() {
+    let error = validate_normalization_bit_depth(Some(32.0))
+        .expect_err("32-bit input must remain outside the normalized contract");
+    assert!(
+        error
+            .to_string()
+            .contains("32-bit PSD input is not supported")
+    );
+    assert!(validate_normalization_bit_depth(Some(8.0)).is_ok());
+    assert!(validate_normalization_bit_depth(Some(16.0)).is_ok());
+}
+
+#[test]
+fn non_empty_layers_without_pixels_are_rejected() {
+    let layer = ag_psd::psd::Layer {
+        top: Some(0.0),
+        left: Some(0.0),
+        bottom: Some(2.0),
+        right: Some(3.0),
+        ..Default::default()
+    };
+    let error = build_layer(&layer, &["0".to_string()])
+        .expect_err("non-empty layers must not become transparent placeholders");
+    assert!(
+        error
+            .to_string()
+            .contains("non-empty pixel layer has no RGBA8 data at 0")
+    );
+}
+
+#[test]
+fn zero_area_layers_without_pixels_remain_empty() {
+    let layer = ag_psd::psd::Layer {
+        top: Some(4.0),
+        left: Some(3.0),
+        bottom: Some(4.0),
+        right: Some(3.0),
+        ..Default::default()
+    };
+    let normalized = build_layer(&layer, &["0".to_string()]).expect("empty layer");
+    let pixels = normalized.pixels.expect("empty pixel buffer");
+    assert_eq!((pixels.width, pixels.height), (0, 0));
+    assert!(pixels.data.is_empty());
+}
+
 fn state(frame_index: u32, enabled: bool) -> NormalizedLayerFrameState {
     NormalizedLayerFrameState {
         frame_index,

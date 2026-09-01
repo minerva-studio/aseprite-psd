@@ -175,6 +175,9 @@ pub fn encode_with_linked_cels_and_jitter(
                         layer_id: binding.layer.id,
                         message: "pixel layer has no owned data".to_string(),
                     })?;
+            if pixels.width == 0 || pixels.height == 0 {
+                continue;
+            }
             let position = cel_position(pixels, state)?;
             let resolved = resolved_pixels(document, jitter, binding.layer.id)
                 .unwrap_or_else(|| pixels.clone());

@@ -1,4 +1,6 @@
+use serde::Serialize;
 use std::env;
+use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -8,7 +10,7 @@ use psd2ase_core::{
     LinkedCelMode, StableOrderMode, UncertainLayerMode, VERSION, convert, inspect,
 };
 
-const CONVERT_USAGE: &str = "usage: psd2ase convert INPUT [-o OUTPUT] [--overwrite] [--linked-cels off|identical] [--layer-association preserve|auto] [--association-strategy compact|conservative] [--z-order stable|auto] [--stable-order consensus|anchor|strict] [--uncertain-layers group|flat] [--jitter-mode off|report|assist|repair] [--jitter-kind alpha|color|all] [--jitter-profile conservative|balanced] [--jitter-alpha-threshold N] [--jitter-max-speck-area N] [--jitter-max-changed-ratio N] [--jitter-max-channel-delta N]";
+const CONVERT_USAGE: &str = "usage: psd2ase convert INPUT [-o OUTPUT] [--report PATH] [--overwrite] [--linked-cels off|identical] [--layer-association preserve|auto] [--association-strategy compact|conservative] [--z-order stable|auto] [--stable-order consensus|anchor|strict] [--uncertain-layers group|flat] [--jitter-mode off|report|assist|repair] [--jitter-kind alpha|color|all] [--jitter-profile conservative|balanced] [--jitter-alpha-threshold N] [--jitter-max-speck-area N] [--jitter-max-changed-ratio N] [--jitter-max-channel-delta N]";
 
 #[derive(Debug, PartialEq, Eq)]
 struct ConvertCommand {
@@ -18,6 +20,36 @@ struct ConvertCommand {
     linked_cels: LinkedCelMode,
     layer_association: LayerAssociation,
     jitter: JitterOptions,
+    report: Option<PathBuf>,
+}
+
+#[derive(Serialize)]
+struct JsonReport<'a> {
+    schema_version: u32,
+    tool_version: &'static str,
+    input: String,
+    output: String,
+    summary: JsonSummary,
+    losses: Vec<JsonLoss<'a>>,
+}
+#[derive(Serialize)]
+struct JsonSummary {
+    total: usize,
+}
+#[derive(Serialize)]
+struct JsonLoss<'a> {
+    code: &'static str,
+    disposition: &'static str,
+    count: usize,
+    detail: &'a str,
+    visual_impact: bool,
+    editability_impact: bool,
+    locations: Vec<JsonLocation>,
+}
+#[derive(Serialize)]
+struct JsonLocation {
+    layer_id: Option<u32>,
+    path: String,
 }
 
 /// Runs the command-line entry point and returns its stable process result.
@@ -74,12 +106,73 @@ fn run_convert(arguments: &[String]) -> Result<(), CliError> {
     )
     .map_err(|error| CliError::Conversion(error.to_string()))?;
     println!("wrote {}", report.output.display());
+    if let Some(path) = command.report {
+        let losses = report
+            .information_loss
+            .entries
+            .iter()
+            .map(|loss| JsonLoss {
+                code: loss.code.as_str(),
+                disposition: loss.disposition.as_str(),
+                count: loss.count,
+                detail: &loss.detail,
+                visual_impact: loss.visual_impact,
+                editability_impact: loss.editability_impact,
+                locations: loss
+                    .locations
+                    .iter()
+                    .map(|location| JsonLocation {
+                        layer_id: location.layer_id,
+                        path: location.path.clone(),
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        let payload = serde_json::to_vec_pretty(&JsonReport {
+            schema_version: 1,
+            tool_version: VERSION,
+            input: report.input.display().to_string(),
+            output: report.output.display().to_string(),
+            summary: JsonSummary {
+                total: losses.len(),
+            },
+            losses,
+        })
+        .map_err(|error| {
+            CliError::Conversion(format!(
+                "output generated, report serialization failed: {error}"
+            ))
+        })?;
+        let temporary = path.with_extension("json.tmp");
+        fs::write(&temporary, payload).map_err(|error| {
+            CliError::Conversion(format!(
+                "output generated, report write failed for {}: {error}",
+                path.display()
+            ))
+        })?;
+        if let Err(error) = fs::rename(&temporary, &path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(CliError::Conversion(format!(
+                "output generated, report commit failed for {}: {error}",
+                path.display()
+            )));
+        }
+    }
     println!(
         "cel reuse: {} pixel cels, {} linked cels",
         report.cel_reuse.pixel_cel_count, report.cel_reuse.linked_cel_count
     );
     for warning in report.warnings {
         println!("warning: {warning}");
+    }
+    for loss in &report.information_loss.entries {
+        println!(
+            "information-loss {} {} count={} {}",
+            loss.disposition.as_str(),
+            loss.code.as_str(),
+            loss.count,
+            loss.detail
+        );
     }
     if let Some(association) = report.association {
         let exclusion_diagnostics = association.exclusion_diagnostics();
@@ -219,6 +312,7 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
     }
     let mut input = None;
     let mut output = None;
+    let mut report = None;
     let mut overwrite = false;
     let mut linked_cels = LinkedCelMode::Off;
     let mut automatic = false;
@@ -420,6 +514,13 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
                     .ok_or_else(|| CliError::Usage(CONVERT_USAGE.to_string()))?;
                 output = Some(PathBuf::from(value));
             }
+            "--report" => {
+                index += 1;
+                let value = arguments
+                    .get(index)
+                    .ok_or_else(|| CliError::Usage(CONVERT_USAGE.to_string()))?;
+                report = Some(PathBuf::from(value));
+            }
             value if value.starts_with('-') => {
                 return Err(CliError::Usage(format!("unknown convert option: {value}")));
             }
@@ -507,6 +608,7 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
         linked_cels,
         layer_association,
         jitter,
+        report,
     })
 }
 

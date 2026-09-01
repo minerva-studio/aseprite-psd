@@ -104,6 +104,9 @@ than synthesizing colors. Advanced overrides are available through
 - macOS is not packaged or tested in this release.
 - This is an import workflow extension. It does not register `.psd` with
   Aseprite's File > Open dialog.
+- `inspect` can identify 32-bit-per-channel PSD documents, but conversion of
+  those documents is explicitly unsupported and does not create an output.
+  Support for 16-bit, non-RGB color modes, and PSB remains unverified.
 - Conversion preserves the normalized layer tree, RGBA8 cels, Photoshop frame
   animation, and supported layer state. Logical-layer association and some
   coordinate mappings remain experimental, so important output should be

@@ -182,6 +182,11 @@ pub fn parse_photoshop_animation(
     if scanned.animation_descriptors.is_empty() && !has_layer_animation {
         return Ok(None);
     }
+    // Static PSDs can contain a 4000/4003-looking resource without the
+    // per-layer metadata that makes it a Photoshop Frame Animation.
+    if !has_layer_animation {
+        return Ok(None);
+    }
     validate_input_layers(layers)?;
     if scanned.animation_descriptors.is_empty() {
         return Err(AnimationParseError::InvalidData(

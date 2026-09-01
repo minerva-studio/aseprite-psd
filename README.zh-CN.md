@@ -92,6 +92,8 @@ cel 复用候选。
   Linux x64 环境验证。
 - 本版本没有打包或测试 macOS。
 - 这是导入工作流扩展，不会在 Aseprite 的 File > Open 中注册 `.psd` 后缀。
+- `inspect` 可以识别每通道 32-bit 的 PSD，但转换会明确拒绝这类文档且不会
+  生成输出。16-bit、非 RGB 色彩模式和 PSB 仍未完成项目级验证。
 - 转换会保留规范化图层树、RGBA8 cel、Photoshop 帧动画和受支持的图层状态。
   逻辑图层关联及部分坐标映射仍属实验功能，重要输出应在 Aseprite 中人工检查。
 - 仓库有意不提交 PSD 或 PSB 测试素材。
