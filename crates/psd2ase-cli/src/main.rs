@@ -1,55 +1,36 @@
-use serde::Serialize;
 use std::env;
-use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use psd2ase_core::{
     AssociationDecisionStatus, AssociationStrategy, AutoAssociationOptions, ConvertOptions,
-    JitterKind, JitterMode, JitterOptions, JitterProfile, LayerAssociation, LayerZOrderMode,
-    LinkedCelMode, StableOrderMode, UncertainLayerMode, VERSION, convert, inspect,
+    ExportOptions, JitterKind, JitterMode, JitterOptions, JitterProfile, LayerAssociation,
+    LayerZOrderMode, LinkedCelMode, StableOrderMode, UncertainLayerMode, VERSION, convert, export,
+    inspect, write_report,
 };
 
-const CONVERT_USAGE: &str = "usage: psd2ase convert INPUT [-o OUTPUT] [--report PATH] [--overwrite] [--linked-cels off|identical] [--layer-association preserve|auto] [--association-strategy compact|conservative] [--z-order stable|auto] [--stable-order consensus|anchor|strict] [--uncertain-layers group|flat] [--jitter-mode off|report|assist|repair] [--jitter-kind alpha|color|all] [--jitter-profile conservative|balanced] [--jitter-alpha-threshold N] [--jitter-max-speck-area N] [--jitter-max-changed-ratio N] [--jitter-max-channel-delta N]";
+const CONVERT_USAGE: &str = "usage: psd2ase convert INPUT [-o OUTPUT] [--report PATH] [--overwrite] [--preserve-photoshop-metadata] [--linked-cels off|identical] [--layer-association preserve|auto] [--association-strategy compact|conservative] [--z-order stable|auto] [--stable-order consensus|anchor|strict] [--uncertain-layers group|flat] [--jitter-mode off|report|assist|repair] [--jitter-kind alpha|color|all] [--jitter-profile conservative|balanced] [--jitter-alpha-threshold N] [--jitter-max-speck-area N] [--jitter-max-changed-ratio N] [--jitter-max-channel-delta N]";
+const EXPORT_USAGE: &str = "usage: psd2ase export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite [--report PATH] [--overwrite]";
 
 #[derive(Debug, PartialEq, Eq)]
 struct ConvertCommand {
     input: PathBuf,
     output: PathBuf,
     overwrite: bool,
+    preserve_photoshop_metadata: bool,
     linked_cels: LinkedCelMode,
     layer_association: LayerAssociation,
     jitter: JitterOptions,
     report: Option<PathBuf>,
 }
 
-#[derive(Serialize)]
-struct JsonReport<'a> {
-    schema_version: u32,
-    tool_version: &'static str,
-    input: String,
-    output: String,
-    summary: JsonSummary,
-    losses: Vec<JsonLoss<'a>>,
-}
-#[derive(Serialize)]
-struct JsonSummary {
-    total: usize,
-}
-#[derive(Serialize)]
-struct JsonLoss<'a> {
-    code: &'static str,
-    disposition: &'static str,
-    count: usize,
-    detail: &'a str,
-    visual_impact: bool,
-    editability_impact: bool,
-    locations: Vec<JsonLocation>,
-}
-#[derive(Serialize)]
-struct JsonLocation {
-    layer_id: Option<u32>,
-    path: String,
+#[derive(Debug, PartialEq, Eq)]
+struct ExportCommand {
+    input: PathBuf,
+    output: PathBuf,
+    composite: PathBuf,
+    report: Option<PathBuf>,
+    overwrite: bool,
 }
 
 /// Runs the command-line entry point and returns its stable process result.
@@ -76,8 +57,48 @@ fn run(arguments: Vec<String>) -> Result<(), CliError> {
         }
         Some("inspect") => run_inspect(&arguments[1..]),
         Some("convert") => run_convert(&arguments[1..]),
+        Some("export") => run_export(&arguments[1..]),
         Some(command) => Err(CliError::Usage(format!("unknown command: {command}"))),
     }
+}
+
+/// Executes the independently validated Aseprite-to-PSD/PSB export command.
+fn run_export(arguments: &[String]) -> Result<(), CliError> {
+    let command = export_arguments(arguments)?;
+    let report = export(
+        &command.input,
+        &command.composite,
+        &command.output,
+        &ExportOptions {
+            overwrite: command.overwrite,
+        },
+    )
+    .map_err(|error| CliError::Conversion(error.to_string()))?;
+    println!("wrote {}", report.output.display());
+    if let Some(path) = command.report {
+        write_report(
+            &path,
+            &report.input,
+            &report.output,
+            &report.information_loss,
+        )
+        .map_err(|error| {
+            CliError::Conversion(format!(
+                "output generated, report write failed for {}: {error}",
+                path.display()
+            ))
+        })?;
+    }
+    for loss in &report.information_loss.entries {
+        println!(
+            "information-loss {} {} count={} {}",
+            loss.disposition.as_str(),
+            loss.code.as_str(),
+            loss.count,
+            loss.detail
+        );
+    }
+    Ok(())
 }
 
 /// Executes the metadata-only inspection command.
@@ -99,6 +120,7 @@ fn run_convert(arguments: &[String]) -> Result<(), CliError> {
         &command.output,
         &ConvertOptions {
             overwrite: command.overwrite,
+            preserve_photoshop_metadata: command.preserve_photoshop_metadata,
             linked_cels: command.linked_cels,
             layer_association: command.layer_association,
             jitter: command.jitter,
@@ -107,56 +129,18 @@ fn run_convert(arguments: &[String]) -> Result<(), CliError> {
     .map_err(|error| CliError::Conversion(error.to_string()))?;
     println!("wrote {}", report.output.display());
     if let Some(path) = command.report {
-        let losses = report
-            .information_loss
-            .entries
-            .iter()
-            .map(|loss| JsonLoss {
-                code: loss.code.as_str(),
-                disposition: loss.disposition.as_str(),
-                count: loss.count,
-                detail: &loss.detail,
-                visual_impact: loss.visual_impact,
-                editability_impact: loss.editability_impact,
-                locations: loss
-                    .locations
-                    .iter()
-                    .map(|location| JsonLocation {
-                        layer_id: location.layer_id,
-                        path: location.path.clone(),
-                    })
-                    .collect(),
-            })
-            .collect::<Vec<_>>();
-        let payload = serde_json::to_vec_pretty(&JsonReport {
-            schema_version: 1,
-            tool_version: VERSION,
-            input: report.input.display().to_string(),
-            output: report.output.display().to_string(),
-            summary: JsonSummary {
-                total: losses.len(),
-            },
-            losses,
-        })
+        write_report(
+            &path,
+            &report.input,
+            &report.output,
+            &report.information_loss,
+        )
         .map_err(|error| {
-            CliError::Conversion(format!(
-                "output generated, report serialization failed: {error}"
-            ))
-        })?;
-        let temporary = path.with_extension("json.tmp");
-        fs::write(&temporary, payload).map_err(|error| {
             CliError::Conversion(format!(
                 "output generated, report write failed for {}: {error}",
                 path.display()
             ))
         })?;
-        if let Err(error) = fs::rename(&temporary, &path) {
-            let _ = fs::remove_file(&temporary);
-            return Err(CliError::Conversion(format!(
-                "output generated, report commit failed for {}: {error}",
-                path.display()
-            )));
-        }
     }
     println!(
         "cel reuse: {} pixel cels, {} linked cels",
@@ -314,6 +298,7 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
     let mut output = None;
     let mut report = None;
     let mut overwrite = false;
+    let mut preserve_photoshop_metadata = false;
     let mut linked_cels = LinkedCelMode::Off;
     let mut automatic = false;
     let mut conservative = false;
@@ -331,6 +316,7 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
     while index < arguments.len() {
         match arguments[index].as_str() {
             "--overwrite" => overwrite = true,
+            "--preserve-photoshop-metadata" => preserve_photoshop_metadata = true,
             "--linked-cels" => {
                 index += 1;
                 let value = arguments
@@ -605,10 +591,69 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
         input,
         output,
         overwrite,
+        preserve_photoshop_metadata,
         linked_cels,
         layer_association,
         jitter,
         report,
+    })
+}
+
+/// Parses the deliberately narrow export command without adding another protocol layer.
+fn export_arguments(arguments: &[String]) -> Result<ExportCommand, CliError> {
+    if arguments.is_empty() {
+        return Err(CliError::Usage(EXPORT_USAGE.to_string()));
+    }
+    let mut input = None;
+    let mut output = None;
+    let mut composite = None;
+    let mut report = None;
+    let mut overwrite = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "-o" | "--output" => {
+                index += 1;
+                output = Some(PathBuf::from(
+                    arguments
+                        .get(index)
+                        .ok_or_else(|| CliError::Usage(EXPORT_USAGE.to_string()))?,
+                ));
+            }
+            "--composite" => {
+                index += 1;
+                composite = Some(PathBuf::from(
+                    arguments
+                        .get(index)
+                        .ok_or_else(|| CliError::Usage(EXPORT_USAGE.to_string()))?,
+                ));
+            }
+            "--report" => {
+                index += 1;
+                report = Some(PathBuf::from(
+                    arguments
+                        .get(index)
+                        .ok_or_else(|| CliError::Usage(EXPORT_USAGE.to_string()))?,
+                ));
+            }
+            "--overwrite" => overwrite = true,
+            value if value.starts_with('-') => {
+                return Err(CliError::Usage(format!("unknown export option: {value}")));
+            }
+            value => {
+                if input.replace(PathBuf::from(value)).is_some() {
+                    return Err(CliError::Usage(EXPORT_USAGE.to_string()));
+                }
+            }
+        }
+        index += 1;
+    }
+    Ok(ExportCommand {
+        input: input.ok_or_else(|| CliError::Usage(EXPORT_USAGE.to_string()))?,
+        output: output.ok_or_else(|| CliError::Usage(EXPORT_USAGE.to_string()))?,
+        composite: composite.ok_or_else(|| CliError::Usage(EXPORT_USAGE.to_string()))?,
+        report,
+        overwrite,
     })
 }
 
@@ -650,7 +695,7 @@ fn one_path_argument(arguments: &[String], command: &str) -> Result<PathBuf, Cli
 fn print_help() {
     println!(
         "psd2ase {VERSION}\n\n\
-         Usage:\n  psd2ase inspect INPUT\n  {CONVERT_USAGE}\n  psd2ase --version"
+         Usage:\n  psd2ase inspect INPUT\n  {CONVERT_USAGE}\n  {EXPORT_USAGE}\n  psd2ase --version"
     );
 }
 

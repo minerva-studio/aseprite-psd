@@ -4,7 +4,10 @@
 //! Aseprite writer. Coordinate mapping remains provisional until visual review
 //! of a generated file is complete.
 
+mod aseprite_metadata;
+pub mod aseprite_reader;
 pub mod aseprite_writer;
+mod atomic_output;
 mod error;
 pub mod information_loss;
 pub mod jitter;
@@ -12,14 +15,16 @@ pub mod layer_names;
 pub mod logical_layers;
 mod model;
 pub mod photoshop_animation;
+mod photoshop_metadata;
+pub mod psd_writer;
 
 pub use aseprite_writer::{
     CelReuseReport, DEFAULT_FRAME_DURATION_MS, EncodedAseprite, WriterError,
 };
-pub use error::{ConversionError, InspectionError};
+pub use error::{ConversionError, ExportError, InspectionError};
 pub use information_loss::{
     InformationLocation, InformationLoss, InformationLossCode, InformationLossReport,
-    LossDisposition,
+    LossDisposition, report_json, write_report,
 };
 pub use jitter::{
     JitterKind, JitterMode, JitterOptions, JitterPlan, JitterProfile, JitterReport,
@@ -45,6 +50,7 @@ pub use photoshop_animation::{
     LayerFrameState, LoopMode, PhotoshopAnimation, PhotoshopFrame, VisibleFrameLayers,
     parse_photoshop_animation,
 };
+pub use psd_writer::{ExportOptions, ExportReport, export};
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -66,6 +72,8 @@ pub struct ConvertOptions {
     pub linked_cels: LinkedCelMode,
     /// Selects conservative pixel stabilization before cel emission.
     pub jitter: JitterOptions,
+    /// Preserve meaningful Photoshop-only metadata for a later PSD round trip.
+    pub preserve_photoshop_metadata: bool,
 }
 
 /// Selects whether identical cels are emitted as links to an earlier cel.
@@ -251,6 +259,7 @@ fn collect_source_losses(psd: &ag_psd::psd::Psd, report: &mut InformationLossRep
                 InformationLocation {
                     layer_id: None,
                     path: "document".to_string(),
+                    frame_index: None,
                 },
                 "artboards are not represented in the normalized model",
                 true,
@@ -270,6 +279,7 @@ fn collect_source_losses(psd: &ag_psd::psd::Psd, report: &mut InformationLossRep
                 InformationLocation {
                     layer_id: None,
                     path: "image_resources".to_string(),
+                    frame_index: None,
                 },
                 "slices are not represented in the normalized model",
                 false,
@@ -283,6 +293,7 @@ fn collect_source_losses(psd: &ag_psd::psd::Psd, report: &mut InformationLossRep
                 InformationLocation {
                     layer_id: None,
                     path: "image_resources".to_string(),
+                    frame_index: None,
                 },
                 "layer comps are not represented in the normalized model",
                 false,
@@ -307,6 +318,7 @@ fn collect_layer_losses(
     let location = |layer_id| InformationLocation {
         layer_id,
         path: path.clone(),
+        frame_index: None,
     };
     let id = layer
         .additional_info
@@ -720,6 +732,7 @@ pub fn convert(
             InformationLocation {
                 layer_id: None,
                 path: "document".to_string(),
+                frame_index: None,
             },
             format!(
                 "source color mode {:?} at {:?} bits per channel is normalized to RGBA8",
@@ -732,7 +745,11 @@ pub fn convert(
     let initial_plan = match options.layer_association {
         LayerAssociation::Preserve => None,
         LayerAssociation::Auto(auto_options) => Some(
-            build_layer_write_plan(&document, auto_options)
+            logical_layers::build_layer_write_plan_with_metadata(
+                &document,
+                auto_options,
+                options.preserve_photoshop_metadata,
+            )
                 .map_err(|error| ConversionError::Writer(error.to_string()))?,
         ),
     };
@@ -748,7 +765,11 @@ pub fn convert(
         ) {
             let stabilized = stabilized_document(&document, &initial_jitter_plan);
             Some(
-                build_layer_write_plan(&stabilized, auto_options)
+                logical_layers::build_layer_write_plan_with_metadata(
+                    &stabilized,
+                    auto_options,
+                    options.preserve_photoshop_metadata,
+                )
                     .map_err(|error| ConversionError::Writer(error.to_string()))?,
             )
         } else {
@@ -768,86 +789,34 @@ pub fn convert(
     let jitter =
         (options.jitter.mode != crate::JitterMode::Off).then(|| jitter_plan.report.clone());
     let association = plan.as_ref().map(|plan| plan.report.clone());
-    let mut encoded = match plan.as_ref() {
-        None => aseprite_writer::encode_with_linked_cels_and_jitter(
+    let encoded = match plan.as_ref() {
+        None => aseprite_writer::encode_with_linked_cels_and_jitter_and_metadata(
             &document,
             options.linked_cels,
             &jitter_plan,
+            options.preserve_photoshop_metadata,
         ),
-        Some(plan) => aseprite_writer::encode_with_plan_and_linked_cels_and_jitter(
+        Some(plan) => aseprite_writer::encode_with_plan_and_linked_cels_and_jitter_and_metadata(
             &document,
             plan,
             options.linked_cels,
             &jitter_plan,
+            options.preserve_photoshop_metadata,
         ),
     }
     .map_err(|error| ConversionError::Writer(error.to_string()))?;
-    encoded.warnings.insert(
-        0,
+    let retained_warnings = vec![
         "coordinate policy: provisional pixels.left/top plus frame offset cel origin".to_string(),
-    );
-    let mut retained_warnings = Vec::new();
-    for warning in encoded.warnings {
-        let (code, disposition, visual, editable) = if warning.contains("blend mode") {
-            (
-                Some(InformationLossCode::UnknownBlendMode),
-                LossDisposition::Degraded,
-                true,
-                true,
-            )
-        } else if warning.contains("opacity") && warning.contains("quantized") {
-            (
-                Some(InformationLossCode::OpacityQuantization),
-                LossDisposition::Degraded,
-                true,
-                true,
-            )
-        } else if warning.contains("reference points") {
-            (
-                Some(InformationLossCode::ReferencePoint),
-                LossDisposition::Dropped,
-                false,
-                true,
-            )
-        } else if warning.contains("group frame opacity") {
-            (
-                Some(InformationLossCode::GroupFrameOpacity),
-                LossDisposition::Dropped,
-                true,
-                true,
-            )
-        } else if warning.contains("active frame") {
-            (
-                Some(InformationLossCode::ActiveFrame),
-                LossDisposition::Dropped,
-                false,
-                true,
-            )
-        } else if warning.contains("pixel layer") && warning.contains("children") {
-            (
-                Some(InformationLossCode::PixelLayerChildren),
-                LossDisposition::Dropped,
-                true,
-                true,
-            )
-        } else {
-            (None, LossDisposition::Unknown, false, false)
-        };
-        if let Some(code) = code {
-            information_loss.add(
-                code,
-                disposition,
-                InformationLocation {
-                    layer_id: None,
-                    path: String::new(),
-                },
-                warning,
-                visual,
-                editable,
-            );
-        } else {
-            retained_warnings.push(warning);
-        }
+    ];
+    for warning in encoded.warning_details {
+        information_loss.add(
+            warning.code,
+            warning.disposition,
+            warning.location,
+            warning.message,
+            warning.visual_impact,
+            warning.editability_impact,
+        );
     }
     match plan.as_ref() {
         None => {

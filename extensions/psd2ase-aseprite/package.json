@@ -1,7 +1,7 @@
 {
   "name": "psd2ase-aseprite",
   "displayName": "PSD to Aseprite",
-  "description": "Import Photoshop PSD documents through the psd2ase converter.",
+  "description": "Import and export Photoshop PSD/PSB documents through the psd2ase converter.",
   "version": "0.2.0",
   "author": {
     "name": "Minerva Studio"

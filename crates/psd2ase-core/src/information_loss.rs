@@ -1,9 +1,15 @@
 //! Structured compatibility losses collected during PSD conversion.
 
+use serde::Serialize;
 use std::fmt;
+use std::io;
+use std::path::Path;
+
+use crate::atomic_output::commit_bytes;
 
 /// Stable identifiers for source information that cannot be represented exactly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum InformationLossCode {
     UnsupportedColor,
     PixelMask,
@@ -23,6 +29,10 @@ pub enum InformationLossCode {
     GroupFrameOpacity,
     ActiveFrame,
     PixelLayerChildren,
+    AnimationTagName,
+    Tilemap,
+    CelZIndex,
+    EmptyPixelLayer,
 }
 
 impl InformationLossCode {
@@ -47,12 +57,17 @@ impl InformationLossCode {
             Self::GroupFrameOpacity => "group_frame_opacity",
             Self::ActiveFrame => "active_frame",
             Self::PixelLayerChildren => "pixel_layer_children",
+            Self::AnimationTagName => "animation_tag_name",
+            Self::Tilemap => "tilemap",
+            Self::CelZIndex => "cel_z_index",
+            Self::EmptyPixelLayer => "empty_pixel_layer",
         }
     }
 }
 
 /// Describes how a source value was handled by the output mapping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LossDisposition {
     Rasterized,
     Degraded,
@@ -73,14 +88,16 @@ impl LossDisposition {
 }
 
 /// A source location associated with a loss.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct InformationLocation {
     pub layer_id: Option<u32>,
     pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_index: Option<u32>,
 }
 
 /// One aggregated compatibility loss.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct InformationLoss {
     pub code: InformationLossCode,
     pub disposition: LossDisposition,
@@ -92,9 +109,53 @@ pub struct InformationLoss {
 }
 
 /// The single compatibility-loss accumulator shared by reader and writer.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct InformationLossReport {
     pub entries: Vec<InformationLoss>,
+}
+
+#[derive(Serialize)]
+struct JsonReport<'a> {
+    schema_version: u32,
+    tool_version: &'static str,
+    input: String,
+    output: String,
+    summary: JsonSummary,
+    losses: &'a [InformationLoss],
+}
+
+#[derive(Serialize)]
+struct JsonSummary {
+    total: usize,
+}
+
+/// Serializes one compatibility report using the shared stable JSON schema.
+pub fn report_json(
+    input: &Path,
+    output: &Path,
+    report: &InformationLossReport,
+) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec_pretty(&JsonReport {
+        schema_version: 1,
+        tool_version: crate::VERSION,
+        input: input.display().to_string(),
+        output: output.display().to_string(),
+        summary: JsonSummary {
+            total: report.entries.len(),
+        },
+        losses: &report.entries,
+    })
+}
+
+/// Atomically writes one compatibility report, replacing a prior report.
+pub fn write_report(
+    path: &Path,
+    input: &Path,
+    output: &Path,
+    report: &InformationLossReport,
+) -> io::Result<()> {
+    let payload = report_json(input, output, report).map_err(io::Error::other)?;
+    commit_bytes(path, &payload, true)
 }
 
 impl InformationLossReport {
@@ -156,6 +217,7 @@ mod tests {
                 InformationLocation {
                     layer_id: Some(index),
                     path: format!("layer/{index}"),
+                    frame_index: None,
                 },
                 "clipping is not represented",
                 true,
@@ -165,5 +227,51 @@ mod tests {
         assert_eq!(report.entries.len(), 1);
         assert_eq!(report.entries[0].count, 10);
         assert_eq!(report.entries[0].locations.len(), 8);
+    }
+
+    #[test]
+    fn report_json_uses_v1_and_omits_unset_frame_indices() {
+        let mut report = InformationLossReport::default();
+        report.add(
+            InformationLossCode::ReferencePoint,
+            LossDisposition::Dropped,
+            InformationLocation {
+                layer_id: Some(42),
+                path: "角色/手臂".to_string(),
+                frame_index: Some(2),
+            },
+            "reference point is not serialized",
+            false,
+            true,
+        );
+        report.add(
+            InformationLossCode::ActiveFrame,
+            LossDisposition::Dropped,
+            InformationLocation {
+                layer_id: None,
+                path: String::new(),
+                frame_index: None,
+            },
+            "active frame is not serialized",
+            false,
+            true,
+        );
+
+        let value: serde_json::Value = serde_json::from_slice(
+            &report_json(
+                Path::new("input.psd"),
+                Path::new("output.aseprite"),
+                &report,
+            )
+            .expect("report JSON should serialize"),
+        )
+        .expect("report JSON should decode");
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["losses"][0]["locations"][0]["frame_index"], 2);
+        assert!(
+            value["losses"][1]["locations"][0]
+                .get("frame_index")
+                .is_none()
+        );
     }
 }

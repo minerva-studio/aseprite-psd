@@ -28,6 +28,37 @@ fn default_plan_uses_compact_strategy_without_candidate_folders() {
     assert_eq!(plan.report.strategy, AssociationStrategy::Compact);
     assert!(plan.report.candidate_groups.is_empty());
 }
+
+#[test]
+fn metadata_preservation_isolates_only_layers_with_reference_points() {
+    let mut referenced = pixel(1, "role", 0, [1, 2, 3, 255]);
+    referenced.frame_states[0].reference_point = Some(crate::AnimationPoint { x: 8.0, y: 8.0 });
+    referenced.frame_states.push(second_frame_state(false));
+
+    let mut ordinary = pixel(2, "role", 1, [1, 2, 3, 255]);
+    ordinary.frame_states[0].enabled = false;
+    ordinary.frame_states.push(second_frame_state(true));
+
+    let mut source = two_frame_document(vec![referenced, ordinary]);
+    source.root_layers[0].frame_states[1].enabled = false;
+    source.root_layers[1].frame_states[1].enabled = true;
+
+    let isolated = super::build_layer_write_plan_with_metadata(
+        &source,
+        AutoAssociationOptions::default(),
+        true,
+    )
+    .expect("metadata-aware association should succeed");
+    assert_eq!(isolated.tracks.len(), 2);
+
+    let merged = super::build_layer_write_plan_with_metadata(
+        &source,
+        AutoAssociationOptions::default(),
+        false,
+    )
+    .expect("ordinary association should succeed");
+    assert_eq!(merged.tracks.len(), 1);
+}
 use crate::{NormalizedBounds, NormalizedFrame, NormalizedLayerFrameState, NormalizedPixels};
 
 fn pixel(id: u32, name: &str, x: i32, color: [u8; 4]) -> NormalizedLayer {
@@ -856,6 +887,7 @@ fn overlapping_observation(
             width: 1,
             height: 1,
             pixels: &[1, 2, 3, 255],
+            metadata_locked: false,
         }),
         frame_index,
         source_order,

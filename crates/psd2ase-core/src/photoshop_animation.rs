@@ -323,16 +323,30 @@ struct AnimationCatalog {
 fn scan_psd_metadata(bytes: &[u8]) -> Result<ScanResult, AnimationParseError> {
     let mut cursor = Cursor::new(bytes);
     cursor.expect_bytes(b"8BPS", "PSD header")?;
-    cursor.skip(22, "PSD header")?;
+    let version = cursor.u16("PSD version")?;
+    if version != 1 && version != 2 {
+        return Err(AnimationParseError::InvalidData(format!(
+            "unsupported Photoshop document version: {version}"
+        )));
+    }
+    cursor.skip(20, "PSD header")?;
     let color_length = cursor.u32("color mode data length")? as usize;
     cursor.skip(color_length, "color mode data")?;
     let resources_length = cursor.u32("image resources length")? as usize;
     let resources = cursor.take(resources_length, "image resources")?;
     let mut result = ScanResult::default();
     scan_resources(resources, &mut result)?;
-    let layer_mask_length = cursor.u32("layer and mask info length")? as usize;
+    let layer_mask_length = if version == 2 {
+        usize::try_from(cursor.u64("layer and mask info length")?).map_err(|_| {
+            AnimationParseError::InvalidData(
+                "layer and mask info length exceeds this platform".to_string(),
+            )
+        })?
+    } else {
+        cursor.u32("layer and mask info length")? as usize
+    };
     let layer_mask = cursor.take(layer_mask_length, "layer and mask info")?;
-    result.layers = scan_layer_records(layer_mask)?;
+    result.layers = scan_layer_records(layer_mask, version == 2)?;
     Ok(result)
 }
 
@@ -395,18 +409,25 @@ fn parse_animation_resource(data: &[u8]) -> Result<Option<Descriptor>, Animation
 }
 
 /// Walks PSD layer records and excludes bounding section dividers.
-fn scan_layer_records(data: &[u8]) -> Result<Vec<RawLayer>, AnimationParseError> {
+fn scan_layer_records(data: &[u8], is_psb: bool) -> Result<Vec<RawLayer>, AnimationParseError> {
     if data.is_empty() {
         return Ok(Vec::new());
     }
-    if data.len() < 4 {
+    let layer_info_length_size = if is_psb { 8 } else { 4 };
+    if data.len() < layer_info_length_size {
         return Err(AnimationParseError::Truncated {
             section: "layer info length".to_string(),
             offset: 0,
         });
     }
     let mut outer = Cursor::new(data);
-    let layer_info_length = outer.u32("layer info length")? as usize;
+    let layer_info_length = if is_psb {
+        usize::try_from(outer.u64("layer info length")?).map_err(|_| {
+            AnimationParseError::InvalidData("layer info length exceeds this platform".to_string())
+        })?
+    } else {
+        outer.u32("layer info length")? as usize
+    };
     if layer_info_length == 0 {
         return Ok(Vec::new());
     }
@@ -418,10 +439,13 @@ fn scan_layer_records(data: &[u8]) -> Result<Vec<RawLayer>, AnimationParseError>
     for _ in 0..count {
         cursor.skip(16, "layer bounds")?;
         let channel_count = cursor.u16("layer channel count")? as usize;
+        let channel_record_size = if is_psb { 10 } else { 6 };
         cursor.skip(
-            channel_count.checked_mul(6).ok_or_else(|| {
-                AnimationParseError::InvalidData("layer channel count overflow".to_string())
-            })?,
+            channel_count
+                .checked_mul(channel_record_size)
+                .ok_or_else(|| {
+                    AnimationParseError::InvalidData("layer channel count overflow".to_string())
+                })?,
             "layer channel records",
         )?;
         cursor.expect_bytes(b"8BIM", "layer blend signature")?;
@@ -458,7 +482,15 @@ fn scan_layer_extra(data: &[u8]) -> Result<RawLayer, AnimationParseError> {
             });
         }
         let key = cursor.take(4, "layer additional-info key")?;
-        let length = cursor.u32("layer additional-info length")? as usize;
+        let length = if signature == b"8B64" {
+            usize::try_from(cursor.u64("layer additional-info length")?).map_err(|_| {
+                AnimationParseError::InvalidData(
+                    "layer additional-info length exceeds this platform".to_string(),
+                )
+            })?
+        } else {
+            cursor.u32("layer additional-info length")? as usize
+        };
         let value = cursor.take(length, "layer additional-info value")?;
         if !length.is_multiple_of(2) {
             cursor.skip(1, "layer additional-info padding")?;
@@ -664,7 +696,15 @@ fn parse_catalog_frame(descriptor: &Descriptor) -> Result<PhotoshopFrame, Animat
         AnimationParseError::InvalidData(format!("frame {id} has no FrDl duration"))
     })?;
     let duration_ms = number_to_u32(delay * 10.0, "FrDl")?;
-    let dispose = descriptor_enum(descriptor, "FrDs")?;
+    let dispose = descriptor_enum(descriptor, "FrDs")?.map(|value| {
+        let suffix = value.rsplit('.').next().unwrap_or(&value);
+        match suffix.to_ascii_lowercase().as_str() {
+            "auto" => "auto".to_string(),
+            "none" => "none".to_string(),
+            "dispose" => "dispose".to_string(),
+            _ => value,
+        }
+    });
     Ok(PhotoshopFrame {
         id,
         duration_ms,
@@ -898,13 +938,18 @@ fn descriptor_point(
         return Ok(None);
     };
     let point = item_descriptor(value, key)?;
-    let x = descriptor_number(point, "Hrzn")?.ok_or_else(|| {
-        AnimationParseError::InvalidData(format!("{key} point has no Hrzn value"))
-    })?;
-    let y = descriptor_number(point, "Vrtc")?.ok_or_else(|| {
-        AnimationParseError::InvalidData(format!("{key} point has no Vrtc value"))
-    })?;
-    Ok(Some(AnimationPoint { x, y }))
+    let x = descriptor_number(point, "Hrzn")?;
+    let y = descriptor_number(point, "Vrtc")?;
+    match (x, y) {
+        (None, None) => Ok(None),
+        (Some(x), Some(y)) => Ok(Some(AnimationPoint { x, y })),
+        (None, Some(_)) => Err(AnimationParseError::InvalidData(format!(
+            "{key} point has no Hrzn value"
+        ))),
+        (Some(_), None) => Err(AnimationParseError::InvalidData(format!(
+            "{key} point has no Vrtc value"
+        ))),
+    }
 }
 
 /// Converts a PSD number into a checked normalized u32.
@@ -1014,6 +1059,13 @@ impl<'a> Cursor<'a> {
     fn u32(&mut self, section: &str) -> Result<u32, AnimationParseError> {
         Ok(u32::from_be_bytes(
             self.take(4, section)?.try_into().expect("length checked"),
+        ))
+    }
+
+    /// Reads a bounded big-endian unsigned 64-bit value.
+    fn u64(&mut self, section: &str) -> Result<u64, AnimationParseError> {
+        Ok(u64::from_be_bytes(
+            self.take(8, section)?.try_into().expect("length checked"),
         ))
     }
 }

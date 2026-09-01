@@ -12,6 +12,14 @@ fn extension_preserve_arguments_use_the_preserve_configuration() {
     assert_eq!(command.layer_association, LayerAssociation::Preserve);
     assert_eq!(command.linked_cels, LinkedCelMode::Off);
     assert_eq!(command.output, PathBuf::from("output.aseprite"));
+    assert!(!command.preserve_photoshop_metadata);
+}
+
+#[test]
+fn photoshop_metadata_flag_is_opt_in() {
+    let command = convert_arguments(&arguments(&["input.psd", "--preserve-photoshop-metadata"]))
+        .expect("metadata flag should parse");
+    assert!(command.preserve_photoshop_metadata);
 }
 
 #[test]
@@ -202,4 +210,28 @@ fn color_repair_requires_automatic_association() {
         error.to_string(),
         "--jitter-kind color/all with --jitter-mode repair requires --layer-association auto"
     );
+}
+
+#[test]
+fn export_requires_composite_and_preserves_all_paths() {
+    let command = export_arguments(&arguments(&[
+        "source.aseprite",
+        "-o",
+        "output.psb",
+        "--composite",
+        "flattened.aseprite",
+        "--report",
+        "loss.json",
+        "--overwrite",
+    ]))
+    .expect("export arguments should parse");
+    assert_eq!(command.input, PathBuf::from("source.aseprite"));
+    assert_eq!(command.output, PathBuf::from("output.psb"));
+    assert_eq!(command.composite, PathBuf::from("flattened.aseprite"));
+    assert_eq!(command.report, Some(PathBuf::from("loss.json")));
+    assert!(command.overwrite);
+
+    let error = export_arguments(&arguments(&["source.aseprite", "-o", "output.psd"]))
+        .expect_err("composite snapshot is mandatory");
+    assert_eq!(error.to_string(), EXPORT_USAGE);
 }
