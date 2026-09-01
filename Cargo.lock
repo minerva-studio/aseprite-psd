@@ -11,7 +11,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "ag-psd"
 version = "0.2.0"
-source = "git+https://github.com/minerva-studio/ag-psd-rs.git?rev=3a99e89#3a99e8916485992885026591f4879f5ee1e77e3e"
+source = "git+https://github.com/minerva-studio/ag-psd-rs.git?rev=c250b11#c250b11f6f89ea70e49b223b7734d48924ee46b7"
 dependencies = [
  "flate2",
 ]

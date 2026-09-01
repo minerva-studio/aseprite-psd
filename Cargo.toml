@@ -17,7 +17,7 @@ license = "MIT"
 rust-version = "1.88"
 
 [workspace.dependencies]
-ag-psd = { git = "https://github.com/minerva-studio/ag-psd-rs.git", rev = "3a99e89" }
+ag-psd = { git = "https://github.com/minerva-studio/ag-psd-rs.git", rev = "c250b11" }
 aseprite-io = "0.2.0"
 
 [workspace.lints.rust]
