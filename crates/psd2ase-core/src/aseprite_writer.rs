@@ -9,6 +9,7 @@ use crate::{
     LayerWritePlan, LogicalLayerTrack, NormalizedDocument, NormalizedLayer,
     NormalizedLayerFrameState, NormalizedLayerKind, NormalizedLoopMode, NormalizedPixels,
     PlannedNode,
+    jitter::{JitterPlan, resolved_pixels},
 };
 
 /// Serialization default used only when a static normalized frame has no source duration.
@@ -134,6 +135,15 @@ pub fn encode_with_linked_cels(
     document: &NormalizedDocument,
     linked_cels: crate::LinkedCelMode,
 ) -> Result<EncodedAseprite, WriterError> {
+    encode_with_linked_cels_and_jitter(document, linked_cels, &JitterPlan::default())
+}
+
+/// Encodes a normalized document using resolved jitter pixels.
+pub fn encode_with_linked_cels_and_jitter(
+    document: &NormalizedDocument,
+    linked_cels: crate::LinkedCelMode,
+    jitter: &JitterPlan,
+) -> Result<EncodedAseprite, WriterError> {
     let (mut file, mut warnings) = initialize_file(document)?;
 
     let mut bindings = Vec::new();
@@ -166,7 +176,9 @@ pub fn encode_with_linked_cels(
                         message: "pixel layer has no owned data".to_string(),
                     })?;
             let position = cel_position(pixels, state)?;
-            let ase_pixels = aseprite_pixels(binding.layer.id, pixels)?;
+            let resolved = resolved_pixels(document, jitter, binding.layer.id)
+                .unwrap_or_else(|| pixels.clone());
+            let ase_pixels = aseprite_pixels(binding.layer.id, &resolved)?;
             let opacity = normalized_opacity(
                 state.opacity.or(binding.layer.opacity),
                 format!("layer {} frame {frame_index}", binding.layer.id),
@@ -219,6 +231,16 @@ pub fn encode_with_plan_and_linked_cels(
     plan: &LayerWritePlan,
     linked_cels: crate::LinkedCelMode,
 ) -> Result<EncodedAseprite, WriterError> {
+    encode_with_plan_and_linked_cels_and_jitter(document, plan, linked_cels, &JitterPlan::default())
+}
+
+/// Encodes a logical-layer plan using resolved jitter pixels.
+pub fn encode_with_plan_and_linked_cels_and_jitter(
+    document: &NormalizedDocument,
+    plan: &LayerWritePlan,
+    linked_cels: crate::LinkedCelMode,
+    jitter: &JitterPlan,
+) -> Result<EncodedAseprite, WriterError> {
     let (mut file, mut warnings) = initialize_file(document)?;
 
     let mut bindings = Vec::new();
@@ -262,7 +284,9 @@ pub fn encode_with_plan_and_linked_cels(
                     message: "pixel layer has no owned data".to_string(),
                 })?;
             let position = cel_position(pixels, state)?;
-            let ase_pixels = aseprite_pixels(source.id, pixels)?;
+            let resolved =
+                resolved_pixels(document, jitter, source.id).unwrap_or_else(|| pixels.clone());
+            let ase_pixels = aseprite_pixels(source.id, &resolved)?;
             let opacity = normalized_opacity(
                 state.opacity.or(source.opacity),
                 format!("layer {} frame {frame_index}", source.id),

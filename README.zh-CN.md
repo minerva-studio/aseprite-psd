@@ -52,6 +52,7 @@ psd2ase inspect INPUT.psd
 psd2ase convert INPUT.psd -o OUTPUT.aseprite
 psd2ase convert INPUT.psd -o OUTPUT.aseprite --overwrite
 psd2ase convert INPUT.psd -o OUTPUT.aseprite --layer-association auto --linked-cels identical
+psd2ase convert INPUT.psd -o OUTPUT.aseprite --layer-association auto --linked-cels identical --jitter-mode repair --jitter-kind all
 ```
 
 使用 `psd2ase --help` 查看完整命令格式。
@@ -73,6 +74,17 @@ psd2ase convert INPUT.psd -o OUTPUT.aseprite --layer-association auto --linked-c
 `off`，只有尺寸和字节都完全一致时才会建立链接。它要求同时使用
 `--layer-association auto`，因为 `preserve` 会独立输出每个源图层，没有跨图层
 cel 复用候选。
+
+## 导入防抖
+
+防抖默认关闭。`--jitter-mode report` 只报告疑似问题，`assist` 只把稳定化
+结果作为自动图层关联的证据，`repair` 才会改变导出的 cel。可用
+`--jitter-kind alpha|color|all` 选择低 Alpha 孤立杂点或同一逻辑轨道内的
+轻微颜色差异，并用 `--jitter-profile conservative|balanced` 选择阈值预设。
+颜色防抖只在自动关联已经确认的同一轨道、同尺寸和同位置 cel 之间进行；修复
+时选择真实代表 cel，不合成新颜色。高级阈值可通过
+`--jitter-alpha-threshold`、`--jitter-max-speck-area`、
+`--jitter-max-changed-ratio` 和 `--jitter-max-channel-delta` 覆盖。
 
 ## 当前边界
 

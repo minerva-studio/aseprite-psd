@@ -4,11 +4,11 @@ use std::process::ExitCode;
 
 use psd2ase_core::{
     AssociationDecisionStatus, AssociationStrategy, AutoAssociationOptions, ConvertOptions,
-    LayerAssociation, LayerZOrderMode, LinkedCelMode, StableOrderMode, UncertainLayerMode, VERSION,
-    convert, inspect,
+    JitterKind, JitterMode, JitterOptions, JitterProfile, LayerAssociation, LayerZOrderMode,
+    LinkedCelMode, StableOrderMode, UncertainLayerMode, VERSION, convert, inspect,
 };
 
-const CONVERT_USAGE: &str = "usage: psd2ase convert INPUT [-o OUTPUT] [--overwrite] [--linked-cels off|identical] [--layer-association preserve|auto] [--association-strategy compact|conservative] [--z-order stable|auto] [--stable-order consensus|anchor|strict] [--uncertain-layers group|flat]";
+const CONVERT_USAGE: &str = "usage: psd2ase convert INPUT [-o OUTPUT] [--overwrite] [--linked-cels off|identical] [--layer-association preserve|auto] [--association-strategy compact|conservative] [--z-order stable|auto] [--stable-order consensus|anchor|strict] [--uncertain-layers group|flat] [--jitter-mode off|report|assist|repair] [--jitter-kind alpha|color|all] [--jitter-profile conservative|balanced] [--jitter-alpha-threshold N] [--jitter-max-speck-area N] [--jitter-max-changed-ratio N] [--jitter-max-channel-delta N]";
 
 #[derive(Debug, PartialEq, Eq)]
 struct ConvertCommand {
@@ -17,6 +17,7 @@ struct ConvertCommand {
     overwrite: bool,
     linked_cels: LinkedCelMode,
     layer_association: LayerAssociation,
+    jitter: JitterOptions,
 }
 
 /// Runs the command-line entry point and returns its stable process result.
@@ -68,6 +69,7 @@ fn run_convert(arguments: &[String]) -> Result<(), CliError> {
             overwrite: command.overwrite,
             linked_cels: command.linked_cels,
             layer_association: command.layer_association,
+            jitter: command.jitter,
         },
     )
     .map_err(|error| CliError::Conversion(error.to_string()))?;
@@ -194,6 +196,19 @@ fn run_convert(arguments: &[String]) -> Result<(), CliError> {
             }
         }
     }
+    if let Some(jitter) = report.jitter {
+        println!(
+            "jitter: inspected={} alpha-candidates={} alpha-repairs={} color-candidates={} color-repairs={}",
+            jitter.inspected_cels,
+            jitter.alpha_candidates,
+            jitter.alpha_repairs,
+            jitter.color_candidates,
+            jitter.color_repairs
+        );
+        for diagnostic in jitter.diagnostics {
+            println!("jitter diagnostic: {diagnostic}");
+        }
+    }
     Ok(())
 }
 
@@ -214,6 +229,10 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
     let mut stable_order_explicit = false;
     let mut uncertain_layers = UncertainLayerMode::Group;
     let mut uncertain_layers_explicit = false;
+    let mut jitter = JitterOptions::default();
+    let mut jitter_kind_explicit = false;
+    let mut jitter_profile_explicit = false;
+    let mut jitter_numeric_explicit = false;
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
@@ -312,6 +331,88 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
                 };
                 uncertain_layers_explicit = true;
             }
+            "--jitter-mode" => {
+                index += 1;
+                let value = arguments
+                    .get(index)
+                    .ok_or_else(|| CliError::Usage(CONVERT_USAGE.to_string()))?;
+                jitter.mode = match value.as_str() {
+                    "off" => JitterMode::Off,
+                    "report" => JitterMode::Report,
+                    "assist" => JitterMode::Assist,
+                    "repair" => JitterMode::Repair,
+                    _ => {
+                        return Err(CliError::Usage(format!(
+                            "invalid --jitter-mode value: {value:?}"
+                        )));
+                    }
+                };
+            }
+            "--jitter-kind" => {
+                index += 1;
+                let value = arguments
+                    .get(index)
+                    .ok_or_else(|| CliError::Usage(CONVERT_USAGE.to_string()))?;
+                jitter.kind = match value.as_str() {
+                    "alpha" => JitterKind::Alpha,
+                    "color" => JitterKind::Color,
+                    "all" => JitterKind::All,
+                    _ => {
+                        return Err(CliError::Usage(format!(
+                            "invalid --jitter-kind value: {value:?}"
+                        )));
+                    }
+                };
+                jitter_kind_explicit = true;
+            }
+            "--jitter-profile" => {
+                index += 1;
+                let value = arguments
+                    .get(index)
+                    .ok_or_else(|| CliError::Usage(CONVERT_USAGE.to_string()))?;
+                jitter.profile = match value.as_str() {
+                    "conservative" => JitterProfile::Conservative,
+                    "balanced" => JitterProfile::Balanced,
+                    _ => {
+                        return Err(CliError::Usage(format!(
+                            "invalid --jitter-profile value: {value:?}"
+                        )));
+                    }
+                };
+                jitter_profile_explicit = true;
+            }
+            "--jitter-alpha-threshold" => {
+                jitter_numeric_explicit = true;
+                jitter.alpha_threshold = Some(parse_jitter_u8(
+                    arguments,
+                    &mut index,
+                    "--jitter-alpha-threshold",
+                )?)
+            }
+            "--jitter-max-speck-area" => {
+                jitter_numeric_explicit = true;
+                jitter.max_speck_area = Some(parse_jitter_usize(
+                    arguments,
+                    &mut index,
+                    "--jitter-max-speck-area",
+                )?)
+            }
+            "--jitter-max-changed-ratio" => {
+                jitter_numeric_explicit = true;
+                jitter.max_changed_ratio_percent = Some(parse_jitter_u8(
+                    arguments,
+                    &mut index,
+                    "--jitter-max-changed-ratio",
+                )?)
+            }
+            "--jitter-max-channel-delta" => {
+                jitter_numeric_explicit = true;
+                jitter.max_channel_delta = Some(parse_jitter_u8(
+                    arguments,
+                    &mut index,
+                    "--jitter-max-channel-delta",
+                )?)
+            }
             "-o" | "--output" => {
                 index += 1;
                 let value = arguments
@@ -363,6 +464,28 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
             "--uncertain-layers requires --association-strategy conservative".to_string(),
         ));
     }
+    if !automatic && jitter.mode == JitterMode::Assist {
+        return Err(CliError::Usage(
+            "--jitter-mode assist requires --layer-association auto".to_string(),
+        ));
+    }
+    if !automatic
+        && matches!(jitter.kind, JitterKind::Color | JitterKind::All)
+        && jitter.mode == JitterMode::Repair
+    {
+        return Err(CliError::Usage(
+            "--jitter-kind color/all with --jitter-mode repair requires --layer-association auto"
+                .to_string(),
+        ));
+    }
+    if jitter.mode == JitterMode::Off
+        && (jitter_kind_explicit || jitter_profile_explicit || jitter_numeric_explicit)
+    {
+        return Err(CliError::Usage(
+            "jitter options require --jitter-mode report|assist|repair".to_string(),
+        ));
+    }
+    jitter.thresholds().map_err(CliError::Usage)?;
     let layer_association = if automatic {
         let strategy = if conservative {
             AssociationStrategy::Conservative { uncertain_layers }
@@ -383,7 +506,34 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
         overwrite,
         linked_cels,
         layer_association,
+        jitter,
     })
+}
+
+/// Parses a bounded unsigned jitter parameter.
+fn parse_jitter_u8(arguments: &[String], index: &mut usize, flag: &str) -> Result<u8, CliError> {
+    *index += 1;
+    let value = arguments
+        .get(*index)
+        .ok_or_else(|| CliError::Usage(CONVERT_USAGE.to_string()))?;
+    value
+        .parse::<u8>()
+        .map_err(|_| CliError::Usage(format!("{flag} expects an integer between 0 and 255")))
+}
+
+/// Parses a positive jitter area parameter.
+fn parse_jitter_usize(
+    arguments: &[String],
+    index: &mut usize,
+    flag: &str,
+) -> Result<usize, CliError> {
+    *index += 1;
+    let value = arguments
+        .get(*index)
+        .ok_or_else(|| CliError::Usage(CONVERT_USAGE.to_string()))?;
+    value
+        .parse::<usize>()
+        .map_err(|_| CliError::Usage(format!("{flag} expects a positive integer")))
 }
 
 /// Extracts the single positional path accepted by a phase-one command.

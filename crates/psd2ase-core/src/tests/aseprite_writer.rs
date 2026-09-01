@@ -1,5 +1,7 @@
 use super::*;
-use crate::{AnimationPoint, NormalizedBounds, NormalizedFrame, NormalizedLayerFrameState};
+use crate::{
+    AnimationPoint, JitterPlan, NormalizedBounds, NormalizedFrame, NormalizedLayerFrameState,
+};
 
 fn pixel_document(width: u32, height: u32, left: i32, top: i32) -> NormalizedDocument {
     NormalizedDocument {
@@ -59,6 +61,25 @@ fn encodes_static_frame_with_serialization_default() {
         }
         _ => panic!("expected compressed pixel cel"),
     }
+}
+
+#[test]
+fn resolved_jitter_pixels_are_written_and_valid_for_linking() {
+    let document = pixel_document(8, 8, 0, 0);
+    let mut jitter = JitterPlan::default();
+    jitter.repaired_pixels.insert(1, vec![9, 8, 7, 6]);
+    let encoded = encode_with_linked_cels_and_jitter(&document, crate::LinkedCelMode::Off, &jitter)
+        .expect("resolved jitter pixels should encode");
+    let file = AsepriteFile::from_reader(&encoded.bytes[..]).expect("valid Aseprite bytes");
+    let layer = file.layer_ref(0).expect("pixel layer");
+    let cel = file.cel(layer, 0).expect("visible pixel cel");
+    let pixels = match &cel.kind {
+        aseprite::CelKind::Raw { pixels, .. } | aseprite::CelKind::Compressed { pixels, .. } => {
+            pixels
+        }
+        _ => panic!("expected a pixel cel"),
+    };
+    assert_eq!(pixels.data, vec![9, 8, 7, 6]);
 }
 
 #[test]

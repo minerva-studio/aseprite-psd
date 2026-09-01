@@ -57,6 +57,7 @@ specified:
 psd2ase convert INPUT.psd -o OUTPUT.aseprite
 psd2ase convert INPUT.psd -o OUTPUT.aseprite --overwrite
 psd2ase convert INPUT.psd -o OUTPUT.aseprite --layer-association auto --linked-cels identical
+psd2ase convert INPUT.psd -o OUTPUT.aseprite --layer-association auto --linked-cels identical --jitter-mode repair --jitter-kind all
 ```
 
 Run `psd2ase --help` for the complete command syntax.
@@ -83,6 +84,18 @@ per-cel Z-Index remain frame-local. The default is `off`; only exact
 size-and-byte matches are linked. It requires `--layer-association auto` because
 `preserve` emits each source layer independently and has no cross-layer cel
 reuse candidates.
+
+## Import jitter repair
+
+Jitter handling is disabled by default. `--jitter-mode report` only emits
+diagnostics, `assist` supplies stabilized comparison evidence to automatic
+association, and `repair` changes emitted cel pixels. Select `alpha`, `color`,
+or `all` with `--jitter-kind`, and choose the `conservative` or `balanced`
+threshold profile. Color repair is restricted to already-associated tracks
+with matching size and origin; it selects a real representative cel rather
+than synthesizing colors. Advanced overrides are available through
+`--jitter-alpha-threshold`, `--jitter-max-speck-area`,
+`--jitter-max-changed-ratio`, and `--jitter-max-channel-delta`.
 
 ## Current boundaries
 

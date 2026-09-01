@@ -6,6 +6,7 @@
 
 pub mod aseprite_writer;
 mod error;
+pub mod jitter;
 pub mod layer_names;
 pub mod logical_layers;
 mod model;
@@ -15,6 +16,10 @@ pub use aseprite_writer::{
     CelReuseReport, DEFAULT_FRAME_DURATION_MS, EncodedAseprite, WriterError,
 };
 pub use error::{ConversionError, InspectionError};
+pub use jitter::{
+    JitterKind, JitterMode, JitterOptions, JitterPlan, JitterProfile, JitterReport,
+    JitterThresholds, build_jitter_plan, resolved_pixels, stabilized_document,
+};
 pub use layer_names::{
     COPY_SUFFIX_CATALOG_VERSION, CopySuffixCatalog, CopySuffixKind, CopySuffixMatch,
     CopySuffixRule, MAX_COPY_SUFFIX_DEPTH, ParsedLayerName,
@@ -54,6 +59,8 @@ pub struct ConvertOptions {
     pub layer_association: LayerAssociation,
     /// Selects whether identical pixel cels may share Aseprite storage.
     pub linked_cels: LinkedCelMode,
+    /// Selects conservative pixel stabilization before cel emission.
+    pub jitter: JitterOptions,
 }
 
 /// Selects whether identical cels are emitted as links to an earlier cel.
@@ -79,6 +86,8 @@ pub struct ConversionReport {
     pub association: Option<AssociationReport>,
     /// Counts of ordinary and linked cels in the committed output.
     pub cel_reuse: CelReuseReport,
+    /// Pixel stabilization diagnostics, when enabled.
+    pub jitter: Option<JitterReport>,
 }
 
 /// Reads PSD structure metadata without creating an output file.
@@ -492,19 +501,57 @@ pub fn convert(
 
     let document =
         normalize(input).map_err(|error| ConversionError::InputInspection(error.to_string()))?;
-    let plan = match options.layer_association {
+    let initial_plan = match options.layer_association {
         LayerAssociation::Preserve => None,
         LayerAssociation::Auto(auto_options) => Some(
             build_layer_write_plan(&document, auto_options)
                 .map_err(|error| ConversionError::Writer(error.to_string()))?,
         ),
     };
+    let initial_jitter_plan = build_jitter_plan(&document, initial_plan.as_ref(), options.jitter)
+        .map_err(|error| ConversionError::Writer(error.to_string()))?;
+    let plan = if options.jitter.mode == crate::JitterMode::Assist {
+        if let (Some(auto_options), Some(_initial_plan)) = (
+            match options.layer_association {
+                LayerAssociation::Auto(value) => Some(value),
+                LayerAssociation::Preserve => None,
+            },
+            initial_plan.as_ref(),
+        ) {
+            let stabilized = stabilized_document(&document, &initial_jitter_plan);
+            Some(
+                build_layer_write_plan(&stabilized, auto_options)
+                    .map_err(|error| ConversionError::Writer(error.to_string()))?,
+            )
+        } else {
+            initial_plan
+        }
+    } else {
+        initial_plan
+    };
+    let jitter_plan = if options.jitter.mode == crate::JitterMode::Assist {
+        JitterPlan {
+            report: initial_jitter_plan.report.clone(),
+            ..JitterPlan::default()
+        }
+    } else {
+        initial_jitter_plan
+    };
+    let jitter =
+        (options.jitter.mode != crate::JitterMode::Off).then(|| jitter_plan.report.clone());
     let association = plan.as_ref().map(|plan| plan.report.clone());
     let mut encoded = match plan.as_ref() {
-        None => aseprite_writer::encode_with_linked_cels(&document, options.linked_cels),
-        Some(plan) => {
-            aseprite_writer::encode_with_plan_and_linked_cels(&document, plan, options.linked_cels)
-        }
+        None => aseprite_writer::encode_with_linked_cels_and_jitter(
+            &document,
+            options.linked_cels,
+            &jitter_plan,
+        ),
+        Some(plan) => aseprite_writer::encode_with_plan_and_linked_cels_and_jitter(
+            &document,
+            plan,
+            options.linked_cels,
+            &jitter_plan,
+        ),
     }
     .map_err(|error| ConversionError::Writer(error.to_string()))?;
     encoded.warnings.insert(
@@ -512,10 +559,16 @@ pub fn convert(
         "coordinate policy: provisional pixels.left/top plus frame offset cel origin".to_string(),
     );
     match plan.as_ref() {
-        None => validate_aseprite_output(&encoded.bytes, &document, options.linked_cels)?,
-        Some(plan) => {
-            validate_planned_aseprite_output(&encoded.bytes, &document, plan, options.linked_cels)?
+        None => {
+            validate_aseprite_output(&encoded.bytes, &document, options.linked_cels, &jitter_plan)?
         }
+        Some(plan) => validate_planned_aseprite_output(
+            &encoded.bytes,
+            &document,
+            plan,
+            options.linked_cels,
+            &jitter_plan,
+        )?,
     }
     commit_output(output, &encoded.bytes, options.overwrite)?;
 
@@ -525,6 +578,7 @@ pub fn convert(
         warnings: encoded.warnings,
         association,
         cel_reuse: encoded.cel_reuse,
+        jitter,
     })
 }
 
@@ -569,6 +623,7 @@ fn validate_planned_aseprite_output(
     document: &NormalizedDocument,
     plan: &LayerWritePlan,
     linked_cels: LinkedCelMode,
+    jitter: &JitterPlan,
 ) -> Result<(), ConversionError> {
     let file = read_and_validate_output_header(bytes, document)?;
 
@@ -637,9 +692,11 @@ fn validate_planned_aseprite_output(
                             &file,
                             output_handle,
                             actual,
+                            document,
                             source,
                             frame_index,
                             linked_cels,
+                            jitter,
                         )?;
                         if actual.z_index != expected.z_index {
                             return Err(ConversionError::OutputValidation(format!(
@@ -674,6 +731,7 @@ fn validate_aseprite_output(
     bytes: &[u8],
     document: &NormalizedDocument,
     linked_cels: LinkedCelMode,
+    jitter: &JitterPlan,
 ) -> Result<(), ConversionError> {
     let file = read_and_validate_output_header(bytes, document)?;
 
@@ -729,7 +787,16 @@ fn validate_aseprite_output(
                         )));
                     }
                     if let Some(cel) = cel {
-                        validate_cel(&file, output_handle, cel, source, frame_index, linked_cels)?;
+                        validate_cel(
+                            &file,
+                            output_handle,
+                            cel,
+                            document,
+                            source,
+                            frame_index,
+                            linked_cels,
+                            jitter,
+                        )?;
                     }
                 }
             }
@@ -761,18 +828,21 @@ fn is_visible_pixel(document: &NormalizedDocument, layer_id: u32, frame_index: u
 }
 
 /// Validates one read-back cel's dimensions, position, opacity, and bytes.
+#[allow(clippy::too_many_arguments)]
 fn validate_cel(
     file: &aseprite::AsepriteFile,
     layer: aseprite::LayerRef,
     cel: &aseprite::Cel,
+    document: &NormalizedDocument,
     source: &NormalizedLayer,
     frame_index: usize,
     linked_cels: LinkedCelMode,
+    jitter: &JitterPlan,
 ) -> Result<(), ConversionError> {
     let expected_state = source.frame_states.get(frame_index).ok_or_else(|| {
         ConversionError::OutputValidation(format!("missing source frame state {frame_index}"))
     })?;
-    let pixels = source.pixels.as_ref().ok_or_else(|| {
+    let pixels = resolved_pixels(document, jitter, source.id).ok_or_else(|| {
         ConversionError::OutputValidation(format!("pixel layer {} has no source pixels", source.id))
     })?;
     let expected_opacity = aseprite_writer::opacity_to_u8(
@@ -786,7 +856,7 @@ fn validate_cel(
             source.id
         )));
     }
-    let expected_position = aseprite_writer::cel_position(pixels, expected_state)
+    let expected_position = aseprite_writer::cel_position(&pixels, expected_state)
         .map_err(|error| ConversionError::OutputValidation(error.to_string()))?;
     let (output_pixels, x, y) = match &cel.kind {
         aseprite::CelKind::Raw { pixels, x, y }

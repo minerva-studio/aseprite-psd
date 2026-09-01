@@ -157,3 +157,49 @@ fn compact_rejects_uncertain_layer_policy() {
         "--uncertain-layers requires --association-strategy conservative"
     );
 }
+
+#[test]
+fn jitter_repair_arguments_parse_and_preserve_defaults() {
+    let command = convert_arguments(&arguments(&[
+        "input.psd",
+        "--layer-association",
+        "auto",
+        "--jitter-mode",
+        "repair",
+        "--jitter-kind",
+        "all",
+        "--jitter-profile",
+        "balanced",
+        "--jitter-alpha-threshold",
+        "12",
+        "--jitter-max-speck-area",
+        "3",
+        "--jitter-max-changed-ratio",
+        "5",
+        "--jitter-max-channel-delta",
+        "9",
+    ]))
+    .expect("jitter arguments should parse");
+    assert_eq!(command.jitter.mode, JitterMode::Repair);
+    assert_eq!(command.jitter.profile, JitterProfile::Balanced);
+    assert_eq!(command.jitter.alpha_threshold, Some(12));
+    assert_eq!(command.jitter.max_speck_area, Some(3));
+    assert_eq!(command.jitter.max_changed_ratio_percent, Some(5));
+    assert_eq!(command.jitter.max_channel_delta, Some(9));
+}
+
+#[test]
+fn color_repair_requires_automatic_association() {
+    let error = convert_arguments(&arguments(&[
+        "input.psd",
+        "--jitter-mode",
+        "repair",
+        "--jitter-kind",
+        "color",
+    ]))
+    .expect_err("color repair must require automatic association");
+    assert_eq!(
+        error.to_string(),
+        "--jitter-kind color/all with --jitter-mode repair requires --layer-association auto"
+    );
+}

@@ -117,6 +117,15 @@ local function build_arguments(binary, input, output, options)
     table.insert(arguments, "identical")
   end
 
+  if options.jitter_mode and options.jitter_mode ~= "off" then
+    table.insert(arguments, "--jitter-mode")
+    table.insert(arguments, options.jitter_mode)
+    table.insert(arguments, "--jitter-kind")
+    table.insert(arguments, options.jitter_kind)
+    table.insert(arguments, "--jitter-profile")
+    table.insert(arguments, options.jitter_profile)
+  end
+
   if options.layer_association == "auto" then
     table.insert(arguments, "--layer-association")
     table.insert(arguments, "auto")
@@ -216,9 +225,85 @@ local function show_error(title, message)
   app.alert{ title=title, text=message }
 end
 
+--- Returns the compact label shown for the current jitter settings.
+local function jitter_summary(options)
+  if options.jitter_mode == "off" then
+    return "Off…"
+  end
+  local mode = options.jitter_mode:gsub("^%l", string.upper)
+  local kind = options.jitter_kind:gsub("^%l", string.upper)
+  return string.format("%s · %s…", mode, kind)
+end
+
+--- Opens the modal jitter settings dialog and returns committed values.
+local function select_jitter_options(parent_dialog, initial, automatic)
+  local selected = {
+    jitter_mode = initial.jitter_mode or "off",
+    jitter_kind = initial.jitter_kind or "alpha",
+    jitter_profile = initial.jitter_profile or "conservative",
+  }
+  if not automatic then
+    selected.jitter_kind = "alpha"
+  end
+
+  local dialog = Dialog{ title="Jitter Repair", parent=parent_dialog }
+  if not dialog then
+    return nil
+  end
+
+  --- Keeps the dependent jitter controls aligned with the selected mode.
+  local function update_controls()
+    local current = dialog.data
+    local enabled = current.jitter_mode ~= "off"
+    dialog:modify{ id="jitter_kind", enabled=enabled }
+    dialog:modify{ id="jitter_profile", enabled=enabled }
+  end
+
+  dialog:combobox{
+    id="jitter_mode",
+    label="Mode",
+    option=selected.jitter_mode,
+    options={"off", "report", "repair"},
+    onchange=update_controls,
+  }
+  dialog:combobox{
+    id="jitter_kind",
+    label="Kind",
+    option=selected.jitter_kind,
+    options=automatic and {"alpha", "color", "all"} or {"alpha"},
+    enabled=false,
+  }
+  dialog:combobox{
+    id="jitter_profile",
+    label="Profile",
+    option=selected.jitter_profile,
+    options={"conservative", "balanced"},
+    enabled=false,
+  }
+  update_controls()
+  dialog:button{ id="apply", text="Apply", focus=true }
+  dialog:button{ id="cancel", text="Cancel" }
+  dialog:show()
+
+  local data = dialog.data
+  if not data.apply then
+    return nil
+  end
+  return {
+    jitter_mode = data.jitter_mode,
+    jitter_kind = data.jitter_kind,
+    jitter_profile = data.jitter_profile,
+  }
+end
+
 --- Shows the complete PSD import dialog and returns the selected options.
 local function select_import_options()
   local dialog = Dialog{ title="Import PSD" }
+  local jitter_options = {
+    jitter_mode = "off",
+    jitter_kind = "alpha",
+    jitter_profile = "conservative",
+  }
   if not dialog then
     show_error("PSD to Aseprite", "Aseprite does not have an available UI.")
     return nil
@@ -246,6 +331,10 @@ local function select_import_options()
       id="uncertain_layers",
       enabled=automatic and current.association_strategy == "conservative",
     }
+    if not automatic and jitter_options.jitter_kind ~= "alpha" then
+      jitter_options.jitter_kind = "alpha"
+      dialog:modify{ id="jitter_settings", text=jitter_summary(jitter_options) }
+    end
   end
   dialog:combobox{
     id="layer_association",
@@ -290,6 +379,26 @@ local function select_import_options()
     options={"group", "flat"},
     enabled=false,
   }
+  dialog:newrow()
+  dialog:button{
+    id="jitter_settings",
+    label="Jitter repair",
+    text=jitter_summary(jitter_options),
+    hexpand=false,
+    onclick=function()
+      local current = dialog.data
+      local committed = select_jitter_options(
+        dialog,
+        jitter_options,
+        current.layer_association == "auto")
+      if committed then
+        jitter_options = committed
+        dialog:modify{ id="jitter_settings", text=jitter_summary(jitter_options) }
+      end
+    end,
+  }
+  update_option_controls()
+  dialog:newrow()
   dialog:button{ id="import", text="Import", focus=true }
   dialog:button{ id="cancel", text="Cancel" }
   dialog:show()
@@ -298,7 +407,26 @@ local function select_import_options()
     return nil
   end
   data.overwrite = true
+  data.jitter_mode = jitter_options.jitter_mode
+  data.jitter_kind = jitter_options.jitter_kind
+  data.jitter_profile = jitter_options.jitter_profile
   return data
+end
+
+--- Returns the non-interactive defaults used when Aseprite opens a PSD directly.
+local function default_import_options()
+  return {
+    overwrite = true,
+    layer_association = "preserve",
+    link_identical_cels = false,
+    jitter_mode = "off",
+    jitter_kind = "alpha",
+    jitter_profile = "conservative",
+    association_strategy = "compact",
+    z_order = "stable",
+    stable_order = "consensus",
+    uncertain_layers = "group",
+  }
 end
 
 --- Returns the native Save As suggestion for an imported PSD.
@@ -368,6 +496,28 @@ function init(plugin)
         return
       end
       import_from_menu(binary)
+    end,
+  }
+  plugin:newFileFormat{
+    name="Photoshop Document (PSD/PSB)",
+    extensions={"psd", "psb"},
+    binary=true,
+    onload=function(ev)
+      if not binary then
+        error("This extension has no converter for the current platform.")
+      end
+      local temporary_output = temporary_path("aseprite")
+      local success, result = pcall(function()
+        run_conversion(binary, ev.filename, temporary_output, default_import_options())
+        return open_as_unsaved_document(
+          temporary_output,
+          suggested_output_path(ev.filename))
+      end)
+      remove_file(temporary_output)
+      if not success then
+        error(result, 0)
+      end
+      return result
     end,
   }
   if not binary or not app.fs.isFile(binary) then
