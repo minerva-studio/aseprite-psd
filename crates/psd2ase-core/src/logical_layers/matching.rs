@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
-use super::{FAMILY_MATCH_ASSIGNMENT_BONUS, MAX_FAMILY_MATCHING_STATES};
+const FAMILY_MATCH_ASSIGNMENT_BONUS: u32 = 100;
+const MAX_FAMILY_MATCHING_STATES: usize = 100_000;
 
 struct WeightedMatchingSearch<'a, ObservationKey, TrackKey, OccupiedKey, Occupancy> {
     observations: &'a [ObservationKey],

@@ -61,15 +61,20 @@ all unsupported mappings are reported as warnings.
 - `LayerAssociation` is the conversion-policy source of truth. Preserve mode
   carries no automatic-only settings; auto mode carries `AutoAssociationOptions`,
   and only the conservative strategy can carry an uncertain-layer policy.
-- The logical-layer planner builds one `ObservationStore` per normalized
-  document. Source-layer names, paths, group evidence, frame-container evidence,
-  and borrowed RGBA pixels are stored once; frame observations and track history
+- The logical-layer planner is staged inside `logical_layers/`: observation
+  discovery and selector evidence live in `observation.rs`, association and
+  scoring in `association.rs`, stable ordering and Z-Index work in
+  `ordering.rs`, and candidate-folder/layout topology in `layout.rs`.
+- The planner builds one `ObservationStore` per normalized document.
+  Source-layer names, paths, group evidence, frame-container evidence, and
+  borrowed RGBA pixels are stored once; frame observations and track history
   refer back to that evidence instead of cloning image buffers.
 - `AssociationEngine` owns mutable tracks, decisions, family preassignments, and
-  selector evidence for one planning run. Compact and conservative association
-  remain explicit branches; the shared weighted matcher lives in
-  `logical_layers/matching.rs`, while report text is derived from decisions in
-  `logical_layers/report.rs`.
+  selector evidence for one planning run. It transfers an owned
+  `AssociationOutput` to ordering and layout after matching. Compact and
+  conservative association remain explicit branches; the shared weighted
+  matcher lives in `logical_layers/matching.rs`, while report text is derived
+  from decisions in `logical_layers/report.rs`.
 - Layout owns persistent and candidate group identities through `GroupKey`.
   Candidate folders never reuse a source layer ID and are validated against the
   public planned topology before writing.
