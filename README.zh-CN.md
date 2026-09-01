@@ -23,6 +23,14 @@ Save As 选择最终 `.aseprite` 路径；Aseprite 会默认建议 PSD 所在目
 扩展默认使用 `preserve`，保持源图层相互独立。导入对话框也提供下文所述的
 实验性自动关联模式。
 
+带有该标记的 PSD 再次导入时默认使用 `auto`；普通 PSD 仍默认使用 `preserve`。
+
+导出默认会写入不可见、带版本的 PSD round-trip 元数据。它只记录元数据版本、
+逻辑图层 ID 和物化 cel 关系，不包含文件路径、用户名、设备信息或使用追踪；
+Photoshop 等其他读取器可以忽略这段信息。通过 **File > Export > PSD to Aseprite
+Settings...** 可以关闭后续导出的标记。关闭后 PSD 仍可正常读写，但再次打开时
+无法自动识别本转换器生成的图层关联。
+
 导出时选择 **File > Save As...**，并指定 `.psd` 或 `.psb`。扩展会分别创建
 隔离的原始副本与扁平副本，调用内附 converter 并验证 Photoshop 文档，最后
 才通过 Aseprite 自定义格式的保存流写入。保存选项可以选择是否把当前帧写成
@@ -71,6 +79,7 @@ PSB；除非明确指定 `--overwrite`，已有输出不会被替换：
 ```text
 psd2ase export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite
 psd2ase export INPUT.aseprite -o OUTPUT.psb --composite COMPOSITE.aseprite --report REPORT.json --overwrite
+psd2ase export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite --roundtrip-metadata off
 ```
 
 使用 `psd2ase --help` 查看完整命令格式。

@@ -112,6 +112,14 @@ yet write `shmd`, the writer has one bounded post-processor for that missing blo
 it uses ag-psd descriptor primitives and does not introduce another document
 model.
 
+Exports also append an optional private `p2rt` layer additional-info block to
+materialized cel wrappers and variants. The block contains only a version,
+logical layer ID, wrapper/variant role, and variant ordinal. It is not a visible
+watermark or tracking payload. The extension keeps this metadata enabled by
+default and stores the user's opt-out in `plugin.preferences`; marked inputs can
+default to automatic association while ordinary PSD inputs retain preserve
+semantics. Invalid or incomplete markers are ignored safely.
+
 The current writer is deliberately experimental. `convert` writes to a
 same-directory temporary file, reads it back through `aseprite-io`, and only
 then commits it. The first coordinate policy uses `pixels.left/top` plus

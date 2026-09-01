@@ -461,7 +461,7 @@ fn build_cel_layers(
     for (variant_index, variant) in variants.iter().enumerate() {
         children.push(static_cel_layer(
             take_id(next_id),
-            format!("{} — Cel {}", layer.name, variant_index + 1),
+            layer.name.clone(),
             variant,
             &occurrences,
             variant_index,

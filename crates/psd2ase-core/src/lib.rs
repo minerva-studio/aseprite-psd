@@ -17,6 +17,7 @@ mod model;
 pub mod photoshop_animation;
 mod photoshop_metadata;
 pub mod psd_writer;
+mod roundtrip;
 
 pub use aseprite_writer::{
     CelReuseReport, DEFAULT_FRAME_DURATION_MS, EncodedAseprite, WriterError,
@@ -119,6 +120,7 @@ pub fn inspect(input: &Path) -> Result<DocumentInspection, InspectionError> {
     };
     let psd = ag_psd::read_psd(&bytes, &options)
         .map_err(|error| InspectionError::PsdRead(error.to_string()))?;
+    let roundtrip = roundtrip::inspect(&bytes)?;
 
     Ok(DocumentInspection {
         width: psd.width as u32,
@@ -126,6 +128,7 @@ pub fn inspect(input: &Path) -> Result<DocumentInspection, InspectionError> {
         bits_per_channel: psd.bits_per_channel.map(|value| value as u32),
         color_mode: psd.color_mode.map(|value| format!("{value:?}")),
         root_layer_count: psd.children.as_ref().map_or(0, Vec::len),
+        roundtrip_marked: roundtrip.marked && roundtrip.valid,
     })
 }
 

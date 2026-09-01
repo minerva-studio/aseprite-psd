@@ -11,6 +11,8 @@ pub struct DocumentInspection {
     pub color_mode: Option<String>,
     /// Number of top-level PSD layers.
     pub root_layer_count: usize,
+    /// Whether valid converter-owned round-trip metadata was found.
+    pub roundtrip_marked: bool,
 }
 
 /// Format-neutral document model used as the boundary between readers and writers.
