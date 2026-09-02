@@ -1,5 +1,13 @@
 # Development workflow
 
+## License policy
+
+Project-authored code is available under the [MIT License](../LICENSE-MIT) or
+the [Apache License, Version 2.0](../LICENSE-APACHE), at the user's option.
+New project-authored code follows the same dual-license policy. Third-party
+code and dependencies retain their own licenses, which are recorded in
+`THIRD_PARTY_LICENSES.md` when applicable.
+
 ## Phase gates
 
 1. **Toolchain:** workspace, dependency versions, license records, and CI build

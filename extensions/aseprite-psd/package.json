@@ -7,7 +7,7 @@
     "name": "Minerva Studio"
   },
   "publisher": "minerva-studio",
-  "license": "MIT",
+  "license": "MIT OR Apache-2.0",
   "categories": [
     "Scripts"
   ],

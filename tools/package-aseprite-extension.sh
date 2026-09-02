@@ -147,6 +147,8 @@ else
   mkdir -p "$staging/bin/$platform"
 fi
 mkdir -p "$staging/lib"
+cp -- "$repo_root/LICENSE-MIT" "$staging/LICENSE-MIT"
+cp -- "$repo_root/LICENSE-APACHE" "$staging/LICENSE-APACHE"
 cp -- "$source_dir/package.json" "$staging/package.json"
 cp -- "$source_dir/aseprite-psd.lua" "$staging/aseprite-psd.lua"
 for module_file in "${module_files[@]}"; do
@@ -194,6 +196,8 @@ require_entry() {
     exit 1
   fi
 }
+require_entry "LICENSE-MIT"
+require_entry "LICENSE-APACHE"
 require_entry "package.json"
 require_entry "aseprite-psd.lua"
 for module_file in "${module_files[@]}"; do

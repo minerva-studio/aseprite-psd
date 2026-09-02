@@ -80,6 +80,8 @@ $Output = [IO.Path]::GetFullPath($Output)
 $staging = Join-Path ([IO.Path]::GetTempPath()) "aseprite-psd-$([Guid]::NewGuid().ToString('N'))"
 try {
     New-Item -ItemType Directory -Force -Path (Join-Path $staging 'bin\windows-x64'), (Join-Path $staging 'lib') | Out-Null
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'LICENSE-MIT') -Destination (Join-Path $staging 'LICENSE-MIT')
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'LICENSE-APACHE') -Destination (Join-Path $staging 'LICENSE-APACHE')
     Copy-Item -LiteralPath (Join-Path $sourceDirectory 'package.json') -Destination (Join-Path $staging 'package.json')
     Copy-Item -LiteralPath (Join-Path $sourceDirectory 'aseprite-psd.lua') -Destination (Join-Path $staging 'aseprite-psd.lua')
     foreach ($moduleFile in $moduleFiles) {
@@ -94,7 +96,7 @@ try {
 
     $archive = [IO.Compression.ZipFile]::OpenRead($Output)
     try {
-        $requiredEntries = @('package.json', 'aseprite-psd.lua') + ($moduleFiles | ForEach-Object { "lib/$_" }) + 'bin/windows-x64/aseprite-psd.exe'
+        $requiredEntries = @('LICENSE-MIT', 'LICENSE-APACHE', 'package.json', 'aseprite-psd.lua') + ($moduleFiles | ForEach-Object { "lib/$_" }) + 'bin/windows-x64/aseprite-psd.exe'
         $entryNames = @($archive.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
         foreach ($requiredEntry in $requiredEntries) {
             if ($entryNames -notcontains $requiredEntry) {

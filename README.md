@@ -223,4 +223,4 @@ The parser and writer dependency is the Minerva fork of `ag-psd`, pinned to a
 reviewed Git commit; `aseprite-io` remains a published crate. Upstream
 repositories and license details are recorded in
 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md). The project is licensed
-under the [MIT License](LICENSE).
+under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).
