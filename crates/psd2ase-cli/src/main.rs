@@ -10,7 +10,7 @@ use psd2ase_core::{
 };
 
 const CONVERT_USAGE: &str = "usage: psd2ase convert INPUT [-o OUTPUT] [--report PATH] [--overwrite] [--preserve-photoshop-metadata] [--linked-cels off|identical] [--layer-association preserve|auto] [--association-strategy compact|conservative] [--z-order stable|auto] [--stable-order consensus|anchor|strict] [--uncertain-layers group|flat] [--jitter-mode off|report|assist|repair] [--jitter-kind alpha|color|all] [--jitter-profile conservative|balanced] [--jitter-alpha-threshold N] [--jitter-max-speck-area N] [--jitter-max-changed-ratio N] [--jitter-max-channel-delta N]";
-const EXPORT_USAGE: &str = "usage: psd2ase export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite [--active-frame-index N] [--compression raw|rle|zip|zip-prediction] [--report PATH] [--overwrite]";
+const EXPORT_USAGE: &str = "usage: psd2ase export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite [--active-frame-index N] [--compression raw|rle|zip|zip-prediction] [--report PATH] [--overwrite] [--roundtrip-metadata on|off]";
 
 #[derive(Debug, PartialEq, Eq)]
 struct ConvertCommand {
@@ -33,6 +33,7 @@ struct ExportCommand {
     overwrite: bool,
     active_frame_index: Option<u32>,
     compression: Option<ExportCompression>,
+    embed_roundtrip_metadata: bool,
 }
 
 /// Runs the command-line entry point and returns its stable process result.
@@ -75,6 +76,7 @@ fn run_export(arguments: &[String]) -> Result<(), CliError> {
             overwrite: command.overwrite,
             active_frame_index: command.active_frame_index,
             compression: command.compression,
+            embed_roundtrip_metadata: command.embed_roundtrip_metadata,
         },
     )
     .map_err(|error| CliError::Conversion(error.to_string()))?;
@@ -114,6 +116,7 @@ fn run_inspect(arguments: &[String]) -> Result<(), CliError> {
     println!("bits per channel: {:?}", document.bits_per_channel);
     println!("color mode: {:?}", document.color_mode);
     println!("root layers: {}", document.root_layer_count);
+    println!("roundtrip metadata: {}", document.roundtrip_marked);
     Ok(())
 }
 
@@ -617,6 +620,7 @@ fn export_arguments(arguments: &[String]) -> Result<ExportCommand, CliError> {
     let mut overwrite = false;
     let mut active_frame_index = None;
     let mut compression = None;
+    let mut embed_roundtrip_metadata = true;
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
@@ -670,6 +674,21 @@ fn export_arguments(arguments: &[String]) -> Result<ExportCommand, CliError> {
                 })?);
             }
             "--overwrite" => overwrite = true,
+            "--roundtrip-metadata" => {
+                index += 1;
+                let value = arguments
+                    .get(index)
+                    .ok_or_else(|| CliError::Usage(EXPORT_USAGE.to_string()))?;
+                embed_roundtrip_metadata = match value.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => {
+                        return Err(CliError::Usage(format!(
+                            "invalid --roundtrip-metadata value: {value:?}"
+                        )));
+                    }
+                };
+            }
             value if value.starts_with('-') => {
                 return Err(CliError::Usage(format!("unknown export option: {value}")));
             }
@@ -689,6 +708,7 @@ fn export_arguments(arguments: &[String]) -> Result<ExportCommand, CliError> {
         overwrite,
         active_frame_index,
         compression,
+        embed_roundtrip_metadata,
     })
 }
 

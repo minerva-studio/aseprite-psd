@@ -153,7 +153,15 @@ local function build_arguments(binary, input, output, options)
 end
 
 --- Builds the single Rust export command used by the custom file-format saver.
-local function build_export_arguments(binary, input, output, composite, report, active_frame_index, compression)
+local function build_export_arguments(
+  binary,
+  input,
+  output,
+  composite,
+  report,
+  active_frame_index,
+  compression,
+  embed_roundtrip_metadata)
   local arguments = {
     binary,
     "export",
@@ -172,6 +180,10 @@ local function build_export_arguments(binary, input, output, composite, report, 
   if compression ~= nil then
     table.insert(arguments, "--compression")
     table.insert(arguments, compression)
+  end
+  if not embed_roundtrip_metadata then
+    table.insert(arguments, "--roundtrip-metadata")
+    table.insert(arguments, "off")
   end
   return arguments
 end
@@ -284,6 +296,38 @@ local function run_converter(binary, arguments, output)
   return diagnostics
 end
 
+--- Runs a converter command that reports diagnostics without creating an output file.
+local function run_diagnostics(binary, arguments)
+  if not app.fs.isFile(binary) then
+    error("Bundled psd2ase executable was not found: " .. binary)
+  end
+  local log_filename = temporary_path("log")
+  local command = build_command(arguments, log_filename)
+  local launch_ok, result, reason, code = pcall(function()
+    return os.execute(command)
+  end)
+  local diagnostics = read_text_file(log_filename)
+  remove_file(log_filename)
+  if not launch_ok then
+    error("Could not launch psd2ase: " .. tostring(result))
+  end
+  if not command_succeeded(result, reason, code) then
+    error(string.format(
+      "psd2ase inspection failed (%s).\n\n%s",
+      format_exit_status(result, reason, code),
+      diagnostics ~= "" and diagnostics or "The converter exited without diagnostic output."))
+  end
+  return diagnostics
+end
+
+--- Returns whether a PSD carries a valid converter-owned round-trip marker.
+local function is_roundtrip_document(binary, input)
+  local success, diagnostics = pcall(function()
+    return run_diagnostics(binary, { binary, "inspect", input })
+  end)
+  return success and diagnostics:find("roundtrip metadata: true", 1, true) ~= nil
+end
+
 --- Runs the PSD import subcommand through the common converter launcher.
 local function run_conversion(binary, input, output, options)
   if not app.fs.isFile(input) then
@@ -293,13 +337,29 @@ local function run_conversion(binary, input, output, options)
 end
 
 --- Runs the Aseprite export subcommand through the common converter launcher.
-local function run_export_conversion(binary, input, output, composite, report, active_frame_index, compression)
+local function run_export_conversion(
+  binary,
+  input,
+  output,
+  composite,
+  report,
+  active_frame_index,
+  compression,
+  embed_roundtrip_metadata)
   if not app.fs.isFile(input) or not app.fs.isFile(composite) then
     error("Aseprite export snapshots were not created.")
   end
   return run_converter(
     binary,
-    build_export_arguments(binary, input, output, composite, report, active_frame_index, compression),
+    build_export_arguments(
+      binary,
+      input,
+      output,
+      composite,
+      report,
+      active_frame_index,
+      compression,
+      embed_roundtrip_metadata),
     output)
 end
 
@@ -506,10 +566,10 @@ local function select_jitter_options(parent_dialog, initial, automatic)
 end
 
 --- Returns the non-interactive defaults used when Aseprite opens a PSD directly.
-local function default_import_options()
+local function default_import_options(roundtrip_marked)
   return {
     overwrite = true,
-    layer_association = "preserve",
+    layer_association = roundtrip_marked and "auto" or "preserve",
     link_identical_cels = false,
     jitter_mode = "off",
     jitter_kind = "alpha",
@@ -523,9 +583,9 @@ local function default_import_options()
 end
 
 --- Shows the complete PSD import dialog and returns the selected options.
-local function select_import_options(input_filename)
+local function select_import_options(input_filename, roundtrip_marked)
   local dialog = Dialog{ title="Import PSD" }
-  local defaults = default_import_options()
+  local defaults = default_import_options(roundtrip_marked)
   local jitter_options = {
     jitter_mode = defaults.jitter_mode,
     jitter_kind = defaults.jitter_kind,
@@ -537,6 +597,9 @@ local function select_import_options(input_filename)
   end
   if input_filename then
     dialog:label{ id="input_summary", label="PSD", text=app.fs.fileTitle(input_filename) }
+    if roundtrip_marked then
+      dialog:label{ id="roundtrip_summary", text="Round-trip metadata detected; auto association is enabled by default." }
+    end
   else
     dialog:file{
       id="input",
@@ -544,7 +607,7 @@ local function select_import_options(input_filename)
       title="Select Photoshop document",
       open=true,
       entry=true,
-      filetypes={"psd"},
+      filetypes={"psd", "psb"},
     }
   end
   --- Keeps advanced association controls aligned with the selected mode.
@@ -795,7 +858,7 @@ local function write_binary_file(filename, bytes)
 end
 
 --- Exports one sprite into a verified temporary PSD/PSB and commits it to ev.file.
-local function save_photoshop_document(binary, ev)
+local function save_photoshop_document(binary, ev, plugin)
   if not binary then
     show_error("PSD export failed", "This extension has no converter for the current platform.")
     return false
@@ -823,7 +886,8 @@ local function save_photoshop_document(binary, ev)
       composite_filename,
       report_filename,
       active_frame_index,
-      export_options.compression)
+      export_options.compression,
+      plugin.preferences.embed_roundtrip_metadata ~= false)
     local bytes = read_text_file(output_filename)
     if bytes == "" then
       error("The converter produced an empty Photoshop document.")
@@ -877,7 +941,7 @@ local function select_export_destination()
 end
 
 --- Exports the active sprite through the fallback PSD/PSB menu command.
-local function export_from_menu(binary)
+local function export_from_menu(binary, plugin)
   if not binary then
     show_error("PSD export failed", "This extension has no converter for the current platform.")
     return
@@ -909,7 +973,8 @@ local function export_from_menu(binary)
       composite_filename,
       report_filename,
       active_frame_index,
-      export_options.compression)
+      export_options.compression,
+      plugin.preferences.embed_roundtrip_metadata ~= false)
     local bytes = read_text_file(output_filename)
     if bytes == "" then
       error("The converter produced an empty Photoshop document.")
@@ -926,9 +991,37 @@ local function export_from_menu(binary)
   end
 end
 
+--- Selects a PSD/PSB source before showing its import settings.
+local function select_import_source()
+  local dialog = Dialog{ title="Import PSD" }
+  if not dialog then
+    show_error("PSD to Aseprite", "Aseprite does not have an available UI.")
+    return nil
+  end
+  dialog:file{
+    id="input",
+    label="PSD",
+    title="Select Photoshop document",
+    open=true,
+    entry=true,
+    filetypes={"psd", "psb"},
+  }
+  dialog:button{ id="select", text="Next", focus=true }
+  dialog:button{ id="cancel", text="Cancel" }
+  dialog:show()
+  if not dialog.data.select or not dialog.data.input or dialog.data.input == "" then
+    return nil
+  end
+  return dialog.data.input
+end
+
 --- Executes the menu-driven import workflow through a temporary output file.
 local function import_from_menu(binary)
-  local options = select_import_options()
+  local input = select_import_source()
+  if not input then
+    return
+  end
+  local options = select_import_options(input, is_roundtrip_document(binary, input))
   if not options then
     return
   end
@@ -949,9 +1042,40 @@ local function import_from_menu(binary)
   end
 end
 
+--- Shows and persists the PSD round-trip metadata preference for this extension.
+local function show_roundtrip_settings(plugin)
+  local dialog = Dialog{ title="PSD to Aseprite Settings" }
+  if not dialog then
+    show_error("PSD to Aseprite", "Aseprite does not have an available UI.")
+    return
+  end
+  dialog:check{
+    id="embed_roundtrip_metadata",
+    label="PSD round-trip",
+    text="Embed invisible PSD round-trip metadata",
+    selected=plugin.preferences.embed_roundtrip_metadata ~= false,
+  }
+  dialog:label{
+    text="Stores only version, logical layer IDs, and cel relationships; no paths or user data.",
+  }
+  dialog:label{
+    text="Disable this only if you do not want automatic association when reopening exported PSDs.",
+  }
+  dialog:newrow()
+  dialog:button{ id="apply", text="Apply", focus=true }
+  dialog:button{ id="cancel", text="Cancel" }
+  dialog:show()
+  if dialog.data.apply then
+    plugin.preferences.embed_roundtrip_metadata = dialog.data.embed_roundtrip_metadata == true
+  end
+end
+
 --- Registers the explicit PSD import command.
 function init(plugin)
   local binary = converter_path(plugin)
+  if plugin.preferences.embed_roundtrip_metadata == nil then
+    plugin.preferences.embed_roundtrip_metadata = true
+  end
   plugin:newCommand{
     id=COMMAND_ID,
     title="Import PSD to Aseprite...",
@@ -969,7 +1093,15 @@ function init(plugin)
     title="Export PSD/PSB...",
     group="file_export",
     onclick=function()
-      export_from_menu(binary)
+      export_from_menu(binary, plugin)
+    end,
+  }
+  plugin:newCommand{
+    id="Psd2aseSettings",
+    title="PSD to Aseprite Settings...",
+    group="file_export",
+    onclick=function()
+      show_roundtrip_settings(plugin)
     end,
   }
   plugin:newFileFormat{
@@ -977,7 +1109,7 @@ function init(plugin)
     extensions={"psd", "psb"},
     binary=true,
     onsave=function(ev)
-      return save_photoshop_document(binary, ev)
+      return save_photoshop_document(binary, ev, plugin)
     end,
     onload=function(ev)
       if not binary then
@@ -985,9 +1117,13 @@ function init(plugin)
       end
       local temporary_output = temporary_path("aseprite")
       local report_filename = temporary_path("json")
-      local options = select_import_options(ev.filename)
+      local options = select_import_options(
+        ev.filename,
+        is_roundtrip_document(binary, ev.filename))
       if not options then
-        error("PSD import cancelled.", 0)
+        remove_file(temporary_output)
+        remove_file(report_filename)
+        return nil
       end
       options.report = report_filename
       local success, result = pcall(function()

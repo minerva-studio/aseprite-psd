@@ -26,6 +26,17 @@ The extension defaults to `preserve`, which keeps source layers separate. Its
 dialog also exposes the experimental automatic association modes described
 below.
 
+PSD files carrying this marker default to `auto` on a later import; ordinary
+PSDs continue to default to `preserve`.
+
+Exports include an invisible, versioned PSD round-trip metadata block by
+default. It records only the metadata version, logical layer IDs, and
+materialized cel relationships; it does not contain file paths, usernames,
+device information, or usage tracking. Photoshop and other readers may ignore
+this block. Use **File > Export > PSD to Aseprite Settings...** to disable it
+for future exports. The PSD remains readable when disabled, but reopening it
+cannot automatically recognize the converter-owned layer association.
+
 To export, choose **File > Save As...** and select `.psd` or `.psb`. The
 extension snapshots isolated original and flattened copies, runs the bundled
 converter, validates the Photoshop document, and only then writes it through
@@ -79,6 +90,7 @@ preserved unless `--overwrite` is explicit:
 ```text
 psd2ase export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite
 psd2ase export INPUT.aseprite -o OUTPUT.psb --composite COMPOSITE.aseprite --report REPORT.json --overwrite
+psd2ase export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite --roundtrip-metadata off
 ```
 
 Run `psd2ase --help` for the complete command syntax.

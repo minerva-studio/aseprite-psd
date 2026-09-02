@@ -239,6 +239,19 @@ fn export_requires_composite_and_preserves_all_paths() {
     assert_eq!(command.active_frame_index, Some(8));
     assert_eq!(command.compression, None);
     assert!(command.overwrite);
+    assert!(command.embed_roundtrip_metadata);
+
+    let command = export_arguments(&arguments(&[
+        "source.aseprite",
+        "-o",
+        "output.psd",
+        "--composite",
+        "flattened.aseprite",
+        "--roundtrip-metadata",
+        "off",
+    ]))
+    .expect("round-trip metadata option should parse");
+    assert!(!command.embed_roundtrip_metadata);
 
     for value in ["raw", "rle", "zip", "zip-prediction"] {
         let parsed = export_arguments(&arguments(&[

@@ -21,13 +21,14 @@ use ag_psd::writer::{
 
 use crate::aseprite_reader::read_aseprite_export_with_active_frame;
 use crate::atomic_output::commit_bytes;
+use crate::roundtrip::{LayerMarker, MarkerRole, encode_marker};
 use crate::{
     ExportError, InformationLossReport, NormalizedDocument, NormalizedLayer, NormalizedLayerKind,
     NormalizedLoopMode,
 };
 
 /// Options controlling one validated PSD/PSB export transaction.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExportOptions {
     /// Allow replacing an existing output only after the new bytes validate.
     pub overwrite: bool,
@@ -35,6 +36,8 @@ pub struct ExportOptions {
     pub active_frame_index: Option<u32>,
     /// Channel compression policy; `None` preserves the existing ZIP default.
     pub compression: Option<ExportCompression>,
+    /// Embed private metadata that allows this converter to recover cel relationships.
+    pub embed_roundtrip_metadata: bool,
 }
 
 /// Compression modes supported by the PSD/PSB writer.
@@ -84,6 +87,18 @@ impl ExportCompression {
             Self::Rle => Compression::RleCompressed,
             Self::Zip => Compression::ZipWithoutPrediction,
             Self::ZipPrediction => Compression::ZipWithPrediction,
+        }
+    }
+}
+
+impl Default for ExportOptions {
+    /// Enables round-trip metadata while keeping replacement and active-frame defaults safe.
+    fn default() -> Self {
+        Self {
+            overwrite: false,
+            active_frame_index: None,
+            compression: None,
+            embed_roundtrip_metadata: true,
         }
     }
 }
@@ -151,7 +166,12 @@ pub fn export(
         ag_psd::write_psd(&model, &write_options)
     }))
     .map_err(|_| ExportError::Writer("ag-psd panicked while encoding the document".to_string()))?;
-    let mut encoded = inject_animation_metadata(encoded, &source.document, psb)?;
+    let mut encoded = inject_animation_metadata(
+        encoded,
+        &source.document,
+        psb,
+        options.embed_roundtrip_metadata,
+    )?;
     if options.active_frame_index.is_none() {
         encoded = omit_active_frame_descriptor(encoded)?;
     }
@@ -410,8 +430,9 @@ fn inject_animation_metadata(
     mut bytes: Vec<u8>,
     document: &NormalizedDocument,
     psb: bool,
+    embed_roundtrip_metadata: bool,
 ) -> Result<Vec<u8>, ExportError> {
-    let metadata = animation_metadata(document);
+    let metadata = animation_metadata(document, embed_roundtrip_metadata);
     let layout = layer_record_layout(&bytes, psb)?;
     let mut insertions = Vec::new();
     for record in layout.records {
@@ -421,7 +442,10 @@ fn inject_animation_metadata(
         let Some(payload) = metadata.get(&id) else {
             continue;
         };
-        let block = shmd_block(id, payload);
+        let mut block = shmd_block(id, payload);
+        if let Some(marker) = payload.marker {
+            block.extend(roundtrip_block(marker));
+        }
         let new_extra = record
             .extra_length
             .checked_add(block.len())
@@ -694,11 +718,44 @@ fn rewrite_animation_descriptor_without_active_frame(
 struct LayerAnimationMetadata {
     frames: Vec<AnimationFrame>,
     flags: AnimationFrameFlags,
+    marker: Option<LayerMarker>,
 }
 
 /// Indexes normalized per-layer animation records by the PSD layer ID.
-fn animation_metadata(document: &NormalizedDocument) -> HashMap<u32, LayerAnimationMetadata> {
-    fn collect(layer: &NormalizedLayer, output: &mut HashMap<u32, LayerAnimationMetadata>) {
+fn animation_metadata(
+    document: &NormalizedDocument,
+    embed_roundtrip_metadata: bool,
+) -> HashMap<u32, LayerAnimationMetadata> {
+    fn collect(
+        layer: &NormalizedLayer,
+        parent: Option<&NormalizedLayer>,
+        output: &mut HashMap<u32, LayerAnimationMetadata>,
+        embed_roundtrip_metadata: bool,
+    ) {
+        let marker = if embed_roundtrip_metadata {
+            parent
+                .filter(|parent| is_materialized_cel_wrapper(parent))
+                .map(|parent| LayerMarker {
+                    role: MarkerRole::Variant,
+                    logical_layer_id: parent.id,
+                    variant_index: parent
+                        .children
+                        .iter()
+                        .position(|child| child.id == layer.id)
+                        .map_or(0, |index| index as u32 + 1),
+                    variant_count: parent.children.len() as u32,
+                })
+                .or_else(|| {
+                    is_materialized_cel_wrapper(layer).then(|| LayerMarker {
+                        role: MarkerRole::Wrapper,
+                        logical_layer_id: layer.id,
+                        variant_index: 0,
+                        variant_count: layer.children.len() as u32,
+                    })
+                })
+        } else {
+            None
+        };
         output.insert(
             layer.id,
             LayerAnimationMetadata {
@@ -726,17 +783,65 @@ fn animation_metadata(document: &NormalizedDocument) -> HashMap<u32, LayerAnimat
                     unify_layer_style: Some(false),
                     unify_layer_visibility: Some(false),
                 },
+                marker,
             },
         );
         for child in &layer.children {
-            collect(child, output);
+            collect(child, Some(layer), output, embed_roundtrip_metadata);
         }
     }
     let mut output = HashMap::new();
     for layer in &document.root_layers {
-        collect(layer, &mut output);
+        collect(layer, None, &mut output, embed_roundtrip_metadata);
     }
     output
+}
+
+/// Recognizes the wrapper shape created when one Aseprite layer has multiple cel variants.
+fn is_materialized_cel_wrapper(layer: &NormalizedLayer) -> bool {
+    if layer.kind != NormalizedLayerKind::Group || layer.children.len() < 2 {
+        return false;
+    }
+    let child_ids = layer
+        .children
+        .iter()
+        .map(|child| child.id)
+        .collect::<Vec<_>>();
+    if child_ids
+        .windows(2)
+        .any(|pair| pair[1] != pair[0].saturating_add(1))
+        || child_ids
+            .last()
+            .is_none_or(|last_id| last_id.saturating_add(1) != layer.id)
+    {
+        return false;
+    }
+    if !layer
+        .children
+        .iter()
+        .all(|child| child.kind == NormalizedLayerKind::Pixel && child.name == layer.name)
+    {
+        return false;
+    }
+    let active_sets = layer
+        .children
+        .iter()
+        .map(|child| {
+            child
+                .frame_states
+                .iter()
+                .enumerate()
+                .filter_map(|(index, state)| state.enabled.then_some(index))
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .collect::<Vec<_>>();
+    active_sets.iter().all(|set| !set.is_empty())
+        && active_sets.iter().enumerate().all(|(index, left)| {
+            active_sets
+                .iter()
+                .skip(index + 1)
+                .all(|right| left.is_disjoint(right))
+        })
 }
 
 /// Serializes one shmd additional-info block using ag-psd descriptor primitives.
@@ -790,6 +895,21 @@ fn shmd_block(id: u32, metadata: &LayerAnimationMetadata) -> Vec<u8> {
         &mut block,
         2,
         |writer| write_bytes(writer, Some(&payload)),
+        false,
+        false,
+    );
+    get_writer_buffer(&block)
+}
+
+/// Serializes one private round-trip marker as a layer additional-info block.
+fn roundtrip_block(marker: LayerMarker) -> Vec<u8> {
+    let mut block = create_writer_default();
+    write_signature(&mut block, "8BIM");
+    write_signature(&mut block, "p2rt");
+    write_section(
+        &mut block,
+        2,
+        |writer| write_bytes(writer, Some(&encode_marker(marker))),
         false,
         false,
     );
@@ -1102,13 +1222,17 @@ fn validate_layer_records(
 ) -> Result<(), ExportError> {
     let layout = layer_record_layout(bytes, psb)?;
     let expected_ids = collect_layer_ids(&expected.root_layers);
+    let expected_records_without_id = count_group_layers(&expected.root_layers);
     let mut ids = BTreeSet::new();
+    let mut bounding_dividers_without_id = 0usize;
     let mut invalid_records_without_id = 0usize;
     for record in layout.records {
         let Some(id) = record.layer_id else {
             if record.section_divider_type
-                != Some(SectionDividerType::BoundingSectionDivider as u32)
+                == Some(SectionDividerType::BoundingSectionDivider as u32)
             {
+                bounding_dividers_without_id += 1;
+            } else {
                 invalid_records_without_id += 1;
             }
             continue;
@@ -1119,10 +1243,17 @@ fn validate_layer_records(
             )));
         }
     }
-    if invalid_records_without_id > 0 || ids != expected_ids {
+    if invalid_records_without_id > 0
+        || bounding_dividers_without_id != expected_records_without_id
+        || ids != expected_ids
+    {
         return Err(ExportError::OutputValidation(format!(
-            "encoded layer IDs differ: expected {:?}, got {:?} (invalid records without ID: {invalid_records_without_id})",
-            expected_ids, ids
+            "encoded layer IDs differ: expected {:?}, got {:?} (bounding dividers without ID: {}, expected {}; invalid records without ID: {})",
+            expected_ids,
+            ids,
+            bounding_dividers_without_id,
+            expected_records_without_id,
+            invalid_records_without_id
         )));
     }
     Ok(())
@@ -1136,6 +1267,17 @@ fn collect_layer_ids(layers: &[NormalizedLayer]) -> BTreeSet<u32> {
         ids.extend(collect_layer_ids(&layer.children));
     }
     ids
+}
+
+/// Counts PSD section-divider records emitted for normalized group layers.
+fn count_group_layers(layers: &[NormalizedLayer]) -> usize {
+    layers
+        .iter()
+        .map(|layer| {
+            usize::from(layer.kind == NormalizedLayerKind::Group)
+                + count_group_layers(&layer.children)
+        })
+        .sum()
 }
 
 /// Compares the enduring normalized contracts written into the PSD.
@@ -1333,6 +1475,10 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use crate::{
+        AutoAssociationOptions, ConvertOptions, JitterKind, JitterMode, JitterOptions,
+        JitterProfile, LayerAssociation,
+    };
     use aseprite::{
         AsepriteFile, BlendMode as AseBlendMode, ColorMode as AseColorMode, LayerOptions, Pixels,
         Tileset, TilesetData, TilesetFlags,
@@ -1437,6 +1583,26 @@ mod tests {
         export(&input, &composite, &output, &ExportOptions::default()).expect("export PSD");
         let bytes = fs::read(&output).expect("read PSD");
         assert_eq!(&bytes[..6], b"8BPS\0\x01");
+        assert_eq!(
+            crate::roundtrip::inspect(&bytes).expect("inspect round-trip metadata"),
+            crate::roundtrip::RoundTripStatus {
+                marked: true,
+                valid: true,
+            }
+        );
+        let mut corrupted = bytes.clone();
+        let marker_offset = corrupted
+            .windows(4)
+            .position(|window| window == b"P2RT")
+            .expect("round-trip marker payload");
+        corrupted[marker_offset + 5] = 2;
+        assert_eq!(
+            crate::roundtrip::inspect(&corrupted).expect("inspect corrupted metadata"),
+            crate::roundtrip::RoundTripStatus {
+                marked: true,
+                valid: false,
+            }
+        );
         let normalized = crate::normalize(&output).expect("normalize written PSD");
         assert_eq!(normalized.frames.len(), 3);
         assert_eq!(normalized.frames[0].duration_ms, Some(120));
@@ -1471,10 +1637,52 @@ mod tests {
         assert_eq!(
             visible,
             vec![
-                ("动画层 — Cel 1".to_string(), 0, 0, vec![255, 0, 0, 255]),
-                ("动画层 — Cel 2".to_string(), 1, 0, vec![0, 0, 255, 255]),
-                ("动画层 — Cel 1".to_string(), 0, 0, vec![255, 0, 0, 255]),
+                ("动画层".to_string(), 0, 0, vec![255, 0, 0, 255]),
+                ("动画层".to_string(), 1, 0, vec![0, 0, 255, 255]),
+                ("动画层".to_string(), 0, 0, vec![255, 0, 0, 255]),
             ]
+        );
+
+        let auto_roundtrip = directory.join("roundtrip-auto.aseprite");
+        crate::convert(
+            &output,
+            &auto_roundtrip,
+            &crate::ConvertOptions {
+                layer_association: crate::LayerAssociation::Auto(
+                    crate::AutoAssociationOptions::default(),
+                ),
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .expect("auto association should round-trip exported PSD");
+        let auto_file = AsepriteFile::from_reader(
+            fs::read(&auto_roundtrip)
+                .expect("read auto roundtrip ASE")
+                .as_slice(),
+        )
+        .expect("parse auto roundtrip ASE");
+        assert_eq!(auto_file.layers().len(), 1);
+        assert_eq!(auto_file.layers()[0].name, "动画层");
+
+        let unmarked_output = directory.join("unmarked.psd");
+        export(
+            &input,
+            &composite,
+            &unmarked_output,
+            &ExportOptions {
+                embed_roundtrip_metadata: false,
+                ..Default::default()
+            },
+        )
+        .expect("export PSD without round-trip metadata");
+        assert_eq!(
+            crate::roundtrip::inspect(&fs::read(&unmarked_output).expect("read unmarked PSD"))
+                .expect("inspect unmarked PSD"),
+            crate::roundtrip::RoundTripStatus {
+                marked: false,
+                valid: true,
+            }
         );
 
         export(&input, &composite, &psb_output, &ExportOptions::default()).expect("export PSB");
@@ -1573,6 +1781,145 @@ mod tests {
         assert!(matches!(error, ExportError::AsepriteRead(_)));
         assert_eq!(fs::read(&output).expect("read rollback PSD"), original);
         fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    /// Generates a deterministic PSD fixture and verifies the complete Jitter import path.
+    #[test]
+    fn generated_jitter_fixture_reports_and_repairs_known_pixels() {
+        let directory = std::env::temp_dir().join(format!(
+            "psd2ase-jitter-fixture-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).expect("create jitter fixture directory");
+        let input = directory.join("jitter-source.aseprite");
+        let composite = directory.join("jitter-composite.aseprite");
+        let psd = directory.join("jitter-positive.psd");
+        let output = directory.join("jitter-repair.aseprite");
+        let width = 16usize;
+        let height = 16usize;
+        let transparent = vec![0; width * height * 4];
+        let alpha_pixels = |speck: bool| {
+            let mut pixels = transparent.clone();
+            let opaque = (4 * width + 4) * 4;
+            pixels[opaque..opaque + 4].copy_from_slice(&[220, 80, 40, 255]);
+            if speck {
+                let isolated = (10 * width + 10) * 4;
+                pixels[isolated..isolated + 4].copy_from_slice(&[12, 34, 56, 4]);
+            }
+            pixels
+        };
+        let color_pixels = |variant: u8| {
+            let mut pixels = transparent.clone();
+            let base = (7 * width + 7) * 4;
+            pixels[base..base + 4].copy_from_slice(&[80 + variant, 120, 180, 255]);
+            pixels
+        };
+
+        let mut source = AsepriteFile::new(width as u16, height as u16, AseColorMode::Rgba);
+        let alpha_layer = source.add_layer("Jitter Alpha");
+        let color_layer = source.add_layer("Jitter Color");
+        let frames = [
+            source.add_frame(100),
+            source.add_frame(100),
+            source.add_frame(100),
+        ];
+        for (index, frame) in frames.iter().copied().enumerate() {
+            source
+                .set_cel(
+                    alpha_layer,
+                    frame,
+                    Pixels::new(
+                        alpha_pixels(index == 0),
+                        width as u16,
+                        height as u16,
+                        AseColorMode::Rgba,
+                    )
+                    .expect("alpha fixture pixels"),
+                    0,
+                    0,
+                )
+                .expect("alpha fixture cel");
+            source
+                .set_cel(
+                    color_layer,
+                    frame,
+                    Pixels::new(
+                        color_pixels(if index == 1 { 4 } else { 0 }),
+                        width as u16,
+                        height as u16,
+                        AseColorMode::Rgba,
+                    )
+                    .expect("color fixture pixels"),
+                    0,
+                    0,
+                )
+                .expect("color fixture cel");
+        }
+        write_aseprite(&input, &source);
+
+        let mut flattened = AsepriteFile::new(width as u16, height as u16, AseColorMode::Rgba);
+        let composite_layer = flattened.add_layer("Composite");
+        let composite_frames = [
+            flattened.add_frame(100),
+            flattened.add_frame(100),
+            flattened.add_frame(100),
+        ];
+        for frame in composite_frames {
+            flattened
+                .set_cel(
+                    composite_layer,
+                    frame,
+                    Pixels::new(
+                        transparent.clone(),
+                        width as u16,
+                        height as u16,
+                        AseColorMode::Rgba,
+                    )
+                    .expect("composite fixture pixels"),
+                    0,
+                    0,
+                )
+                .expect("composite fixture cel");
+        }
+        write_aseprite(&composite, &flattened);
+
+        export(&input, &composite, &psd, &ExportOptions::default()).expect("export jitter PSD");
+        let report = crate::convert(
+            &psd,
+            &output,
+            &ConvertOptions {
+                layer_association: LayerAssociation::Auto(AutoAssociationOptions::default()),
+                jitter: JitterOptions {
+                    mode: JitterMode::Repair,
+                    kind: JitterKind::All,
+                    profile: JitterProfile::Conservative,
+                    ..Default::default()
+                },
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .expect("convert generated jitter PSD");
+        let jitter = report.jitter.expect("jitter report");
+        assert_eq!(jitter.alpha_candidates, 1);
+        assert_eq!(jitter.alpha_repairs, 1);
+        assert_eq!(jitter.color_candidates, 1);
+        assert_eq!(jitter.color_repairs, 1);
+
+        let keep = std::env::var_os("PSD2ASE_KEEP_JITTER_FIXTURE").is_some();
+        if keep {
+            let kept = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+            fs::create_dir_all(&kept).expect("create kept fixture directory");
+            for file in [&input, &composite, &psd, &output] {
+                fs::copy(file, kept.join(file.file_name().expect("fixture filename")))
+                    .expect("copy kept jitter fixture");
+            }
+        } else {
+            fs::remove_dir_all(directory).expect("remove jitter fixture directory");
+        }
     }
 
     #[test]
