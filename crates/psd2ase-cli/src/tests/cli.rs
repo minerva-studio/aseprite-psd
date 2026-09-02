@@ -21,6 +21,70 @@ fn extension_preserve_arguments_use_the_preserve_configuration() {
 }
 
 #[test]
+fn roundtrip_association_is_selected_without_auto_options() {
+    let command = convert_arguments(&arguments(&[
+        "input.psd",
+        "--layer-association",
+        "roundtrip",
+    ]))
+    .expect("roundtrip association should parse");
+
+    assert_eq!(
+        command.layer_association,
+        LayerAssociation::AutoForRoundTrip
+    );
+}
+
+#[test]
+fn automatic_association_defaults_to_conservative() {
+    let command = convert_arguments(&arguments(&["input.psd", "--layer-association", "auto"]))
+        .expect("automatic association should parse");
+    assert!(matches!(
+        command.layer_association,
+        LayerAssociation::Auto(AutoAssociationOptions {
+            strategy: AssociationStrategy::Conservative {
+                uncertain_layers: UncertainLayerMode::Group,
+            },
+            ..
+        })
+    ));
+}
+
+#[test]
+fn frame_source_defaults_to_auto_and_accepts_top_level() {
+    let default =
+        convert_arguments(&arguments(&["input.psd"])).expect("default conversion should parse");
+    assert_eq!(default.frame_source, FrameSource::Auto);
+
+    let top_level = convert_arguments(&arguments(&["input.psd", "--frame-source", "top-level"]))
+        .expect("top-level frame source should parse");
+    assert_eq!(top_level.frame_source, FrameSource::TopLevel);
+}
+
+#[test]
+fn unknown_frame_source_is_rejected() {
+    let error = convert_arguments(&arguments(&["input.psd", "--frame-source", "procreate"]))
+        .expect_err("unknown frame source must fail");
+    assert!(error.to_string().contains("invalid --frame-source"));
+}
+
+#[test]
+fn roundtrip_association_rejects_auto_only_options() {
+    let error = convert_arguments(&arguments(&[
+        "input.psd",
+        "--layer-association",
+        "roundtrip",
+        "--z-order",
+        "auto",
+    ]))
+    .expect_err("roundtrip must reject auto-only ordering options");
+    assert_eq!(
+        error.to_string(),
+        "--z-order auto cannot be combined with --layer-association roundtrip"
+    );
+}
+
+#[test]
 fn photoshop_metadata_flag_is_opt_in() {
     let command = convert_arguments(&arguments(&["input.psd", "--preserve-photoshop-metadata"]))
         .expect("metadata flag should parse");
@@ -240,6 +304,7 @@ fn export_requires_composite_and_preserves_all_paths() {
     assert_eq!(command.compression, None);
     assert!(command.overwrite);
     assert!(command.embed_roundtrip_metadata);
+    assert!(!command.include_empty_layers);
 
     let command = export_arguments(&arguments(&[
         "source.aseprite",
@@ -252,6 +317,30 @@ fn export_requires_composite_and_preserves_all_paths() {
     ]))
     .expect("round-trip metadata option should parse");
     assert!(!command.embed_roundtrip_metadata);
+
+    let command = export_arguments(&arguments(&[
+        "source.aseprite",
+        "-o",
+        "output.psd",
+        "--composite",
+        "flattened.aseprite",
+        "--empty-layers",
+        "omit",
+    ]))
+    .expect("empty-layer policy should parse");
+    assert!(!command.include_empty_layers);
+
+    let error = export_arguments(&arguments(&[
+        "source.aseprite",
+        "-o",
+        "output.psd",
+        "--composite",
+        "flattened.aseprite",
+        "--empty-layers",
+        "invalid",
+    ]))
+    .expect_err("unknown empty-layer policy should be rejected");
+    assert!(error.to_string().contains("invalid --empty-layers value"));
 
     for value in ["raw", "rle", "zip", "zip-prediction"] {
         let parsed = export_arguments(&arguments(&[

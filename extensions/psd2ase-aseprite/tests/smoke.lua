@@ -25,15 +25,22 @@ assert(type(process.build_arguments) == "function")
 assert(type(process.build_export_arguments) == "function")
 assert(type(process.with_temp_files) == "function")
 assert(type(dialogs.select_import_options) == "function")
+assert(dialogs.default_import_options().layer_association == "auto")
+assert(dialogs.default_import_options().frame_source == "auto")
+assert(dialogs.default_import_options().association_strategy == "conservative")
+assert(dialogs.default_import_options().use_roundtrip_metadata == true)
+assert(type(dialogs.select_roundtrip_recovery) == "function")
 assert(type(dialogs.select_export_options) == "function")
 assert(type(documents.create_export_snapshots) == "function")
 assert(type(workflows.import_document) == "function")
+assert(type(workflows.load_photoshop_document) == "function")
 assert(type(workflows.save_photoshop_document) == "function")
 
 local import_arguments = process.build_arguments("converter", "input.psd", "output.aseprite", {
   report = "report.json",
   overwrite = true,
   preserve_photoshop_metadata = true,
+  frame_source = "top-level",
   link_identical_cels = true,
   layer_association = "auto",
   association_strategy = "conservative",
@@ -46,8 +53,67 @@ local import_arguments = process.build_arguments("converter", "input.psd", "outp
 })
 local import_text = table.concat(import_arguments, "\0")
 assert(import_text:find("--linked-cels\0identical", 1, true))
+assert(import_text:find("--frame-source\0top-level", 1, true))
 assert(import_text:find("--jitter-mode\0repair", 1, true))
 assert(import_text:find("--uncertain-layers\0group", 1, true))
+
+local roundtrip_arguments = process.build_arguments("converter", "input.psd", "output.aseprite", {
+  report = "report.json",
+  overwrite = true,
+  layer_association = "roundtrip",
+  jitter_mode = "off",
+})
+local roundtrip_text = table.concat(roundtrip_arguments, "\0")
+assert(roundtrip_text:find("--layer-association\0roundtrip", 1, true))
+
+local automatic_roundtrip_arguments = process.build_arguments("converter", "input.psd", "output.aseprite", {
+  report = "report.json",
+  overwrite = true,
+  layer_association = "auto",
+  use_roundtrip_metadata = true,
+  association_strategy = "compact",
+  z_order = "stable",
+  stable_order = "consensus",
+  jitter_mode = "off",
+})
+local automatic_roundtrip_text = table.concat(automatic_roundtrip_arguments, "\0")
+assert(automatic_roundtrip_text:find("--layer-association\0roundtrip", 1, true))
+assert(not automatic_roundtrip_text:find("--association-strategy", 1, true))
+
+local automatic_arguments = process.build_arguments("converter", "input.psd", "output.aseprite", {
+  report = "report.json",
+  overwrite = true,
+  layer_association = "auto",
+  use_roundtrip_metadata = false,
+  association_strategy = "compact",
+  z_order = "stable",
+  stable_order = "consensus",
+  jitter_mode = "off",
+})
+local automatic_text = table.concat(automatic_arguments, "\0")
+assert(automatic_text:find("--layer-association\0auto", 1, true))
+assert(automatic_text:find("--association-strategy\0compact", 1, true))
+assert(automatic_text:find("--z-order\0stable", 1, true))
+assert(automatic_text:find("--stable-order\0consensus", 1, true))
+
+local preserve_arguments = process.build_arguments("converter", "input.psd", "output.aseprite", {
+  report = "report.json",
+  overwrite = true,
+  layer_association = "preserve",
+  use_roundtrip_metadata = true,
+  association_strategy = "conservative",
+  jitter_mode = "off",
+})
+local preserve_text = table.concat(preserve_arguments, "\0")
+assert(not preserve_text:find("--layer-association", 1, true))
+assert(not preserve_text:find("--association-strategy", 1, true))
+
+local frame_report = process.temporary_path("json")
+process.write_file(frame_report, '{"active_frame_index":2}')
+assert(documents.read_imported_active_frame(frame_report) == 2)
+process.write_file(frame_report, '{"active_frame_index":"2"}')
+assert(documents.read_imported_active_frame(frame_report) == nil)
+process.remove_file(frame_report)
 
 local export_arguments = process.build_export_arguments(
   "converter",
@@ -57,11 +123,25 @@ local export_arguments = process.build_export_arguments(
   "report.json",
   3,
   "zip-prediction",
+  false,
   false)
 local export_text = table.concat(export_arguments, "\0")
 assert(export_text:find("--active-frame-index\0" .. "3", 1, true))
 assert(export_text:find("--compression\0zip-prediction", 1, true))
 assert(export_text:find("--roundtrip-metadata\0off", 1, true))
+assert(export_text:find("--empty-layers\0omit", 1, true))
+
+local default_export_arguments = process.build_export_arguments(
+  "psd2ase.exe",
+  "source.aseprite",
+  "composite.aseprite",
+  "output.psd",
+  nil,
+  nil,
+  nil,
+  true)
+local default_export_text = table.concat(default_export_arguments, "\0")
+assert(default_export_text:find("--empty-layers\0omit", 1, true))
 
 local temporary_path
 local result = process.with_temp_files({"smoke"}, function(path)

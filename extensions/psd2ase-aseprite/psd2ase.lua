@@ -29,6 +29,9 @@ function init(plugin)
   if plugin.preferences.embed_roundtrip_metadata == nil then
     plugin.preferences.embed_roundtrip_metadata = true
   end
+  if plugin.preferences.use_roundtrip_metadata == nil then
+    plugin.preferences.use_roundtrip_metadata = true
+  end
 
   plugin:newCommand{
     id=COMMAND_ID,
@@ -39,7 +42,7 @@ function init(plugin)
         dialogs.show_error("PSD to Aseprite", "This extension has no binary for the current platform.")
         return
       end
-      workflows.import_from_menu()
+      workflows.import_from_menu(plugin)
     end,
   }
   plugin:newCommand{
@@ -69,9 +72,12 @@ function init(plugin)
       if not process.binary then
         error("This extension has no converter for the current platform.")
       end
-      local sprite, report = workflows.import_document(ev.filename)
-      if sprite then
-        dialogs.show_information_loss(report)
+      local sprite, status = workflows.load_photoshop_document(ev.filename, plugin)
+      if not sprite then
+        if status and status.cancelled then
+          error("PSD opening cancelled by user.")
+        end
+        error("PSD opening did not produce a sprite: " .. tostring(status and status.reason or "unknown error"))
       end
       return sprite
     end,

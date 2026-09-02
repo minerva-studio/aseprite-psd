@@ -76,6 +76,20 @@ pub struct ConvertOptions {
     pub jitter: JitterOptions,
     /// Preserve meaningful Photoshop-only metadata for a later PSD round trip.
     pub preserve_photoshop_metadata: bool,
+    /// Selects how source layers become playback frames before association.
+    pub frame_source: FrameSource,
+}
+
+/// Selects the source structure used to construct playback frames.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FrameSource {
+    /// Use a Photoshop timeline when present and otherwise preserve a static document.
+    #[default]
+    Auto,
+    /// Preserve the PSD as one static frame even when other frame-like structures exist.
+    Static,
+    /// Treat each non-background top-level layer or group as one playback frame.
+    TopLevel,
 }
 
 /// Selects whether identical cels are emitted as links to an earlier cel.
@@ -711,6 +725,117 @@ fn normalize_enum_name(value: &str) -> String {
     spaced.replace('_', " ").to_ascii_lowercase()
 }
 
+/// Applies an explicit non-timeline frame interpretation before logical association.
+fn apply_frame_source(
+    document: &mut NormalizedDocument,
+    frame_source: FrameSource,
+) -> Result<Vec<String>, String> {
+    match frame_source {
+        FrameSource::Auto => return Ok(Vec::new()),
+        FrameSource::Static => {
+            apply_static_states(&mut document.root_layers);
+            document.frames = vec![NormalizedFrame {
+                index: 0,
+                source_id: None,
+                duration_ms: None,
+                dispose: None,
+            }];
+            document.loop_mode = None;
+            document.active_frame_index = None;
+            document.animation_resource_ids.clear();
+            document.animation_frame_flags = None;
+            return Ok(vec!["frame source: static document".to_string()]);
+        }
+        FrameSource::TopLevel if !document.animation_resource_ids.is_empty() => {
+            return Err(
+                "top-level frame source cannot replace a Photoshop timeline; use --frame-source auto or static"
+                    .to_string(),
+            );
+        }
+        FrameSource::TopLevel => {}
+    }
+
+    let frame_roots = document
+        .root_layers
+        .iter()
+        .enumerate()
+        .filter(|(_, layer)| !is_shared_background(layer))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if frame_roots.is_empty() {
+        return Err("top-level frame source found no frame layers".to_string());
+    }
+    let frame_count = frame_roots.len();
+    for (root_index, layer) in document.root_layers.iter_mut().enumerate() {
+        let active_frame = frame_roots.iter().position(|index| *index == root_index);
+        apply_top_level_frame_states(
+            layer,
+            frame_count,
+            active_frame,
+            active_frame.is_some(),
+            true,
+        );
+    }
+    document.frames = (0..frame_count)
+        .map(|index| NormalizedFrame {
+            index: index as u32,
+            source_id: None,
+            duration_ms: Some(u32::from(DEFAULT_FRAME_DURATION_MS)),
+            dispose: None,
+        })
+        .collect();
+    document.loop_mode = Some(NormalizedLoopMode::Infinite);
+    document.active_frame_index = Some(0);
+    document.animation_resource_ids.clear();
+    document.animation_frame_flags = None;
+    let shared = document
+        .root_layers
+        .iter()
+        .filter(|layer| is_shared_background(layer))
+        .map(|layer| layer.name.as_str())
+        .collect::<Vec<_>>();
+    Ok(vec![format!(
+        "frame source: {frame_count} top-level frames; shared layers: {}",
+        if shared.is_empty() {
+            "none".to_string()
+        } else {
+            shared.join(", ")
+        }
+    )])
+}
+
+/// Returns whether a top-level layer is the explicit shared Procreate background.
+fn is_shared_background(layer: &NormalizedLayer) -> bool {
+    layer.name.trim().eq_ignore_ascii_case("background")
+}
+
+/// Replaces one static layer subtree with states for a top-level frame interpretation.
+fn apply_top_level_frame_states(
+    layer: &mut NormalizedLayer,
+    frame_count: usize,
+    active_frame: Option<usize>,
+    force_selected_root: bool,
+    ancestors_active: bool,
+) {
+    let source_enabled = !layer.hidden.unwrap_or(false);
+    layer.frame_states = (0..frame_count)
+        .map(|frame_index| NormalizedLayerFrameState {
+            frame_index: frame_index as u32,
+            record_present: false,
+            enabled: ancestors_active
+                && (force_selected_root || source_enabled)
+                && active_frame.is_none_or(|active| active == frame_index),
+            explicit_enable: false,
+            offset: None,
+            reference_point: None,
+            opacity: None,
+        })
+        .collect();
+    for child in &mut layer.children {
+        apply_top_level_frame_states(child, frame_count, active_frame, false, ancestors_active);
+    }
+}
+
 /// Converts a PSD into an Aseprite file after validation and mapping.
 pub fn convert(
     input: &Path,
@@ -727,8 +852,18 @@ pub fn convert(
 
     let bytes =
         fs::read(input).map_err(|error| ConversionError::InputInspection(error.to_string()))?;
-    let (document, mut information_loss) = normalize_bytes(&bytes)
+    let (exact_roundtrip, layer_association) = match options.layer_association {
+        LayerAssociation::AutoForRoundTrip => {
+            let layout = roundtrip::inspect_detailed(&bytes)
+                .map_err(|error| ConversionError::InputInspection(error.to_string()))?;
+            resolve_roundtrip_association(layout)?
+        }
+        association => (false, association),
+    };
+    let (mut document, mut information_loss) = normalize_bytes(&bytes)
         .map_err(|error| ConversionError::InputInspection(error.to_string()))?;
+    let frame_source_warnings = apply_frame_source(&mut document, options.frame_source)
+        .map_err(ConversionError::InputInspection)?;
     if document.bits_per_channel != Some(8)
         || !matches!(document.color_mode.as_deref(), Some("rgb" | "rgba"))
     {
@@ -748,33 +883,55 @@ pub fn convert(
             true,
         );
     }
-    let initial_plan = match options.layer_association {
-        LayerAssociation::Preserve => None,
-        LayerAssociation::Auto(auto_options) => Some(
-            logical_layers::build_layer_write_plan_with_metadata(
-                &document,
-                auto_options,
-                options.preserve_photoshop_metadata,
-            )
-            .map_err(|error| ConversionError::Writer(error.to_string()))?,
-        ),
+    let allow_inferred_cross_source_matches =
+        !matches!(options.frame_source, FrameSource::TopLevel)
+            || !matches!(
+                layer_association,
+                LayerAssociation::Auto(AutoAssociationOptions {
+                    strategy: AssociationStrategy::Conservative { .. },
+                    ..
+                })
+            );
+    let initial_plan = if exact_roundtrip {
+        merge_frame_group_states(&mut document)
+            .map_err(ConversionError::RoundTripRecoveryRequired)?;
+        Some(
+            build_frame_group_roundtrip_plan(&document)
+                .map_err(ConversionError::RoundTripRecoveryRequired)?,
+        )
+    } else {
+        match layer_association {
+            LayerAssociation::Preserve => None,
+            LayerAssociation::Auto(auto_options) => Some(
+                logical_layers::build_layer_write_plan_with_context(
+                    &document,
+                    auto_options,
+                    options.preserve_photoshop_metadata,
+                    allow_inferred_cross_source_matches,
+                )
+                .map_err(|error| ConversionError::Writer(error.to_string()))?,
+            ),
+            LayerAssociation::AutoForRoundTrip => None,
+        }
     };
     let initial_jitter_plan = build_jitter_plan(&document, initial_plan.as_ref(), options.jitter)
         .map_err(|error| ConversionError::Writer(error.to_string()))?;
     let plan = if options.jitter.mode == crate::JitterMode::Assist {
         if let (Some(auto_options), Some(_initial_plan)) = (
-            match options.layer_association {
+            match layer_association {
                 LayerAssociation::Auto(value) => Some(value),
                 LayerAssociation::Preserve => None,
+                LayerAssociation::AutoForRoundTrip => None,
             },
             initial_plan.as_ref(),
         ) {
             let stabilized = stabilized_document(&document, &initial_jitter_plan);
             Some(
-                logical_layers::build_layer_write_plan_with_metadata(
+                logical_layers::build_layer_write_plan_with_context(
                     &stabilized,
                     auto_options,
                     options.preserve_photoshop_metadata,
+                    allow_inferred_cross_source_matches,
                 )
                 .map_err(|error| ConversionError::Writer(error.to_string()))?,
             )
@@ -811,9 +968,10 @@ pub fn convert(
         ),
     }
     .map_err(|error| ConversionError::Writer(error.to_string()))?;
-    let retained_warnings = vec![
+    let mut retained_warnings = vec![
         "coordinate policy: provisional pixels.left/top plus frame offset cel origin".to_string(),
     ];
+    retained_warnings.extend(frame_source_warnings);
     for warning in encoded.warning_details {
         information_loss.add(
             warning.code,
@@ -850,6 +1008,24 @@ pub fn convert(
     })
 }
 
+/// Resolves the internal round-trip preset while preserving automatic fallback semantics.
+fn resolve_roundtrip_association(
+    layout: roundtrip::RoundTripLayout,
+) -> Result<(bool, LayerAssociation), ConversionError> {
+    if layout.status.marked && !layout.status.valid {
+        return Err(ConversionError::RoundTripRecoveryRequired(
+            "converter-owned frame-group metadata is missing, damaged, or inconsistent".to_string(),
+        ));
+    }
+    if layout.version == Some(2) {
+        return Ok((true, LayerAssociation::Preserve));
+    }
+    Ok((
+        false,
+        LayerAssociation::Auto(AutoAssociationOptions::default()),
+    ))
+}
+
 /// Parses output bytes and validates the format-independent document header.
 fn read_and_validate_output_header(
     bytes: &[u8],
@@ -875,7 +1051,8 @@ fn read_and_validate_output_header(
         let expected = frame
             .duration_ms
             .unwrap_or(u32::from(DEFAULT_FRAME_DURATION_MS));
-        if u32::from(file.frames()[index].duration_ms) != expected {
+        let actual = u32::from(file.frames()[index].duration_ms);
+        if canonical_frame_duration_ms(actual) != canonical_frame_duration_ms(expected) {
             return Err(ConversionError::OutputValidation(format!(
                 "frame {index} duration differs: expected {expected}, got {}",
                 file.frames()[index].duration_ms
@@ -883,6 +1060,191 @@ fn read_and_validate_output_header(
         }
     }
     Ok(file)
+}
+
+/// Returns the ten-millisecond duration quantum used by Photoshop animation data.
+fn canonical_frame_duration_ms(duration_ms: u32) -> u32 {
+    duration_ms / 10 * 10
+}
+
+/// Merges frame-local visibility from duplicated Frame groups into representatives.
+fn merge_frame_group_states(document: &mut NormalizedDocument) -> Result<(), String> {
+    let snapshots = document.root_layers.clone();
+    let first = snapshots
+        .first()
+        .ok_or_else(|| "frame-group document has no roots".to_string())?;
+    for child_index in 0..first.children.len() {
+        let sources = snapshots
+            .iter()
+            .map(|root| root.children.get(child_index))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| "frame-group topology differs between frames".to_string())?;
+        let target = document
+            .root_layers
+            .get_mut(0)
+            .and_then(|root| root.children.get_mut(child_index))
+            .ok_or_else(|| "frame-group topology differs between frames".to_string())?;
+        merge_frame_group_layer_states(target, &sources)?;
+    }
+    Ok(())
+}
+
+/// Recursively merges one representative's frame-local visibility states.
+fn merge_frame_group_layer_states(
+    target: &mut NormalizedLayer,
+    sources: &[&NormalizedLayer],
+) -> Result<(), String> {
+    if sources
+        .iter()
+        .any(|source| source.name != target.name || source.kind != target.kind)
+    {
+        return Err("frame-group layer names or kinds differ between frames".to_string());
+    }
+    target.frame_states = sources
+        .iter()
+        .enumerate()
+        .map(|(frame_index, source)| NormalizedLayerFrameState {
+            frame_index: frame_index as u32,
+            record_present: true,
+            enabled: source
+                .frame_states
+                .first()
+                .map_or(!source.hidden.unwrap_or(false), |state| state.enabled),
+            explicit_enable: true,
+            offset: source.frame_states.first().and_then(|state| state.offset),
+            reference_point: source
+                .frame_states
+                .first()
+                .and_then(|state| state.reference_point),
+            opacity: source.frame_states.first().and_then(|state| state.opacity),
+        })
+        .collect();
+    if target.kind == NormalizedLayerKind::Group {
+        for child_index in 0..target.children.len() {
+            let child_sources = sources
+                .iter()
+                .map(|source| source.children.get(child_index))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| "frame-group topology differs between frames".to_string())?;
+            merge_frame_group_layer_states(&mut target.children[child_index], &child_sources)?;
+        }
+    }
+    Ok(())
+}
+
+/// Builds an exact write plan from converter-owned Frame group snapshots.
+fn build_frame_group_roundtrip_plan(
+    document: &NormalizedDocument,
+) -> Result<LayerWritePlan, String> {
+    if document.frames.is_empty() || document.root_layers.len() != document.frames.len() {
+        return Err("frame-group root count does not match the animation frame count".to_string());
+    }
+    for (index, layer) in document.root_layers.iter().enumerate() {
+        if layer.kind != NormalizedLayerKind::Group || layer.name != format!("Frame {}", index + 1)
+        {
+            return Err("frame-group roots are missing or out of order".to_string());
+        }
+    }
+    let mut tracks = Vec::new();
+    let mut root_nodes = Vec::new();
+    let first_children = &document.root_layers[0].children;
+    for child_index in 0..first_children.len() {
+        let layers = document
+            .root_layers
+            .iter()
+            .map(|root| root.children.get(child_index))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| "frame-group topology differs between frames".to_string())?;
+        root_nodes.push(build_frame_group_node(
+            &layers,
+            &mut tracks,
+            &mut Vec::new(),
+        )?);
+    }
+    let track_count = tracks.len();
+    Ok(LayerWritePlan {
+        root_nodes,
+        tracks,
+        report: AssociationReport {
+            observation_count: track_count,
+            track_count,
+            omitted_source_layer_ids: Vec::new(),
+            z_order_mode: LayerZOrderMode::Stable,
+            stable_order_mode: StableOrderMode::Consensus,
+            uncertain_layer_mode: UncertainLayerMode::Group,
+            strategy: AssociationStrategy::Compact,
+            name_catalog_version: COPY_SUFFIX_CATALOG_VERSION,
+            z_order_diagnostics: Vec::new(),
+            stable_order_diagnostics: vec!["exact converter-owned frame-group mapping".to_string()],
+            candidate_groups: Vec::new(),
+            decisions: Vec::new(),
+            warnings: Vec::new(),
+        },
+    })
+}
+
+/// Recursively maps corresponding layers from every Frame group into one plan node.
+fn build_frame_group_node(
+    layers: &[&NormalizedLayer],
+    tracks: &mut Vec<LogicalLayerTrack>,
+    group_path: &mut Vec<String>,
+) -> Result<PlannedNode, String> {
+    let first = layers
+        .first()
+        .ok_or_else(|| "frame-group layer is missing".to_string())?;
+    if layers.iter().any(|layer| {
+        layer.name != first.name
+            || layer.kind != first.kind
+            || layer.children.len() != first.children.len()
+    }) {
+        return Err("frame-group layer names or kinds differ between frames".to_string());
+    }
+    match first.kind {
+        NormalizedLayerKind::Group => {
+            let mut children = Vec::new();
+            group_path.push(first.name.clone());
+            for child_index in 0..first.children.len() {
+                let child_layers = layers
+                    .iter()
+                    .map(|layer| layer.children.get(child_index))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| "frame-group topology differs between frames".to_string())?;
+                children.push(build_frame_group_node(&child_layers, tracks, group_path)?);
+            }
+            group_path.pop();
+            Ok(PlannedNode::Group {
+                name: first.name.clone(),
+                source_layer_id: Some(first.id),
+                children,
+            })
+        }
+        NormalizedLayerKind::Pixel => {
+            let id = tracks.len();
+            let cels = layers
+                .iter()
+                .enumerate()
+                .map(|(frame_index, layer)| {
+                    let enabled = layer
+                        .frame_states
+                        .first()
+                        .map_or(!layer.hidden.unwrap_or(false), |state| state.enabled);
+                    enabled.then_some(PlannedCel {
+                        source_layer_id: layer.id,
+                        source_frame_index: frame_index as u32,
+                        z_index: 0,
+                    })
+                })
+                .collect();
+            tracks.push(LogicalLayerTrack {
+                id,
+                name: first.name.clone(),
+                representative_source_layer_id: first.id,
+                group_path: group_path.clone(),
+                cels,
+            });
+            Ok(PlannedNode::Track { track_id: id })
+        }
+    }
 }
 
 /// Validates an Aseprite file produced from the experimental logical plan.

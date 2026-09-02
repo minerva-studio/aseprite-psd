@@ -2,23 +2,63 @@ local Workflows = {}
 
 --- Creates import/export workflows from the owning process, dialog, and document boundaries.
 function Workflows.new(process, dialogs, documents)
-  local state = {}
+  local state = {
+    export_sessions = setmetatable({}, { __mode = "k" }),
+  }
 
-  --- Imports one PSD/PSB and returns the new sprite plus its optional report text.
-  local function import_document(input)
-    local roundtrip_marked = process.is_roundtrip_document(process.binary, input)
-    local options = dialogs.select_import_options(input, roundtrip_marked)
-    if not options then
-      return nil
-    end
+  --- Converts one PSD/PSB and opens it using the supplied document strategy.
+  local function convert_document(input, options, opener)
     return process.with_temp_files({"aseprite", "json"}, function(temporary_output, report_filename)
       options.report = report_filename
-      process.run_conversion(process.binary, options.input, temporary_output, options)
-      local sprite = documents.open_as_unsaved_document(
+      local diagnostics, exit_code = process.run_conversion(
+        process.binary, options.input, temporary_output, options)
+      if exit_code == 4 then
+        return nil, { recovery_required = true, diagnostics = diagnostics }
+      end
+      local sprite = opener(
         temporary_output,
         documents.suggested_output_path(options.input),
         documents.read_imported_active_frame(report_filename))
       return sprite, process.read_file(report_filename)
+    end)
+  end
+
+  --- Retries a conversion after asking the user to choose a recovery strategy.
+  local function convert_with_recovery(input, options, opener)
+    local sprite, report = convert_document(input, options, opener)
+    if not report or not report.recovery_required then
+      return sprite, report
+    end
+    local strategy, status = dialogs.select_roundtrip_recovery()
+    if not strategy then
+      return nil, { cancelled = status == "cancelled", reason = status }
+    end
+    options.layer_association = strategy
+    if strategy == "auto" then
+      options.use_roundtrip_metadata = false
+    end
+    return convert_document(input, options, opener)
+  end
+
+  --- Imports one PSD/PSB through the interactive menu as an unassociated copy.
+  local function import_document(input, plugin)
+    local options, status = dialogs.select_import_options(input, plugin and plugin.preferences)
+    if not options then
+      return nil, { cancelled = status == "cancelled", reason = status }
+    end
+    options.input = input
+    return convert_with_recovery(input, options, documents.open_as_imported_copy)
+  end
+
+  --- Loads one PSD/PSB through the native file-format path after choosing import options.
+  local function load_photoshop_document(input, plugin)
+    local options, status = dialogs.select_import_options(input, plugin and plugin.preferences)
+    if not options then
+      return nil, { cancelled = status == "cancelled", reason = status }
+    end
+    options.input = input
+    return convert_with_recovery(input, options, function(filename, _, active_frame_index)
+      return documents.open_for_native_load(filename, active_frame_index)
     end)
   end
 
@@ -39,7 +79,8 @@ function Workflows.new(process, dialogs, documents)
         report_filename,
         active_frame_index,
         export_options.compression,
-        plugin.preferences.embed_roundtrip_metadata ~= false)
+        plugin.preferences.embed_roundtrip_metadata ~= false,
+        export_options.include_empty_layers == true)
       local bytes = process.read_file(output_filename)
       if bytes == "" then
         error("The converter produced an empty Photoshop document.")
@@ -49,15 +90,17 @@ function Workflows.new(process, dialogs, documents)
   end
 
   --- Executes the menu-driven import workflow and reports failures to the user.
-  local function import_from_menu()
+  local function import_from_menu(plugin)
     local input = dialogs.select_import_source()
     if not input then
       return
     end
     local success, result = pcall(function()
-      local sprite, report = import_document(input)
+      local sprite, report = import_document(input, plugin)
       if sprite then
         dialogs.show_information_loss(report)
+      elseif report and not report.cancelled then
+        error("PSD import did not produce a sprite: " .. tostring(report.reason or "unknown error"))
       end
       return sprite
     end)
@@ -107,7 +150,16 @@ function Workflows.new(process, dialogs, documents)
       dialogs.show_error("PSD export failed", "The destination must use a .psd or .psb extension.")
       return false
     end
-    local export_options = dialogs.select_export_options()
+    local session = state.export_sessions[ev.sprite]
+    local export_options
+    if session and session.filename == ev.filename then
+      export_options = {
+        compression = session.compression,
+        include_empty_layers = session.include_empty_layers,
+      }
+    else
+      export_options = dialogs.select_export_options()
+    end
     if not export_options then
       return false
     end
@@ -116,6 +168,11 @@ function Workflows.new(process, dialogs, documents)
       ev.file:write(bytes)
       ev.file:flush()
       dialogs.show_information_loss(report, "export")
+      state.export_sessions[ev.sprite] = {
+        filename = ev.filename,
+        compression = export_options.compression,
+        include_empty_layers = export_options.include_empty_layers == true,
+      }
     end)
     if not success then
       dialogs.show_error("PSD export failed", tostring(result))
@@ -126,6 +183,7 @@ function Workflows.new(process, dialogs, documents)
 
   return {
     import_document = import_document,
+    load_photoshop_document = load_photoshop_document,
     import_from_menu = import_from_menu,
     export_from_menu = export_from_menu,
     save_photoshop_document = save_photoshop_document,

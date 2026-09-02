@@ -100,6 +100,21 @@ function DocumentIO.new(process)
     return sprite
   end
 
+  --- Opens a converted document for native file-format loading without cloning it.
+  local function open_for_native_load(filename, active_frame_index)
+    local sprite = app.open(filename)
+    if not sprite then
+      error("Aseprite could not open the generated temporary file: " .. filename)
+    end
+    apply_imported_active_frame(sprite, active_frame_index)
+    return sprite
+  end
+
+  --- Opens a converted document as an unassociated imported copy.
+  local function open_as_imported_copy(filename, suggested_filename, active_frame_index)
+    return open_as_unsaved_document(filename, suggested_filename, active_frame_index)
+  end
+
   --- Closes an isolated sprite copy without turning cleanup into an export error.
   local function close_sprite(sprite)
     if sprite then
@@ -144,6 +159,8 @@ function DocumentIO.new(process)
     read_imported_active_frame = read_imported_active_frame,
     current_frame_index = current_frame_index,
     open_as_unsaved_document = open_as_unsaved_document,
+    open_for_native_load = open_for_native_load,
+    open_as_imported_copy = open_as_imported_copy,
     create_export_snapshots = create_export_snapshots,
   }
 end

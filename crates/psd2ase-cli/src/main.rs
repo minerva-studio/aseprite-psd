@@ -3,14 +3,15 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use psd2ase_core::{
-    AssociationDecisionStatus, AssociationStrategy, AutoAssociationOptions, ConvertOptions,
-    ExportCompression, ExportOptions, JitterKind, JitterMode, JitterOptions, JitterProfile,
-    LayerAssociation, LayerZOrderMode, LinkedCelMode, StableOrderMode, UncertainLayerMode, VERSION,
-    convert, export, inspect, write_report_with_active_frame,
+    AssociationDecisionStatus, AssociationStrategy, AutoAssociationOptions, ConversionError,
+    ConvertOptions, ExportCompression, ExportOptions, FrameSource, JitterKind, JitterMode,
+    JitterOptions, JitterProfile, LayerAssociation, LayerZOrderMode, LinkedCelMode,
+    StableOrderMode, UncertainLayerMode, VERSION, convert, export, inspect,
+    write_report_with_active_frame,
 };
 
-const CONVERT_USAGE: &str = "usage: psd2ase convert INPUT [-o OUTPUT] [--report PATH] [--overwrite] [--preserve-photoshop-metadata] [--linked-cels off|identical] [--layer-association preserve|auto] [--association-strategy compact|conservative] [--z-order stable|auto] [--stable-order consensus|anchor|strict] [--uncertain-layers group|flat] [--jitter-mode off|report|assist|repair] [--jitter-kind alpha|color|all] [--jitter-profile conservative|balanced] [--jitter-alpha-threshold N] [--jitter-max-speck-area N] [--jitter-max-changed-ratio N] [--jitter-max-channel-delta N]";
-const EXPORT_USAGE: &str = "usage: psd2ase export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite [--active-frame-index N] [--compression raw|rle|zip|zip-prediction] [--report PATH] [--overwrite] [--roundtrip-metadata on|off]";
+const CONVERT_USAGE: &str = "usage: psd2ase convert INPUT [-o OUTPUT] [--report PATH] [--overwrite] [--frame-source auto|static|top-level] [--preserve-photoshop-metadata] [--linked-cels off|identical] [--layer-association preserve|auto|roundtrip] [--association-strategy compact|conservative] [--z-order stable|auto] [--stable-order consensus|anchor|strict] [--uncertain-layers group|flat] [--jitter-mode off|report|assist|repair] [--jitter-kind alpha|color|all] [--jitter-profile conservative|balanced] [--jitter-alpha-threshold N] [--jitter-max-speck-area N] [--jitter-max-changed-ratio N] [--jitter-max-channel-delta N]";
+const EXPORT_USAGE: &str = "usage: psd2ase export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite [--active-frame-index N] [--compression raw|rle|zip|zip-prediction] [--empty-layers include|omit] [--report PATH] [--overwrite] [--roundtrip-metadata on|off]";
 
 #[derive(Debug, PartialEq, Eq)]
 struct ConvertCommand {
@@ -18,6 +19,7 @@ struct ConvertCommand {
     output: PathBuf,
     overwrite: bool,
     preserve_photoshop_metadata: bool,
+    frame_source: FrameSource,
     linked_cels: LinkedCelMode,
     layer_association: LayerAssociation,
     jitter: JitterOptions,
@@ -34,6 +36,7 @@ struct ExportCommand {
     active_frame_index: Option<u32>,
     compression: Option<ExportCompression>,
     embed_roundtrip_metadata: bool,
+    include_empty_layers: bool,
 }
 
 /// Runs the command-line entry point and returns its stable process result.
@@ -77,6 +80,7 @@ fn run_export(arguments: &[String]) -> Result<(), CliError> {
             active_frame_index: command.active_frame_index,
             compression: command.compression,
             embed_roundtrip_metadata: command.embed_roundtrip_metadata,
+            include_empty_layers: command.include_empty_layers,
         },
     )
     .map_err(|error| CliError::Conversion(error.to_string()))?;
@@ -129,12 +133,16 @@ fn run_convert(arguments: &[String]) -> Result<(), CliError> {
         &ConvertOptions {
             overwrite: command.overwrite,
             preserve_photoshop_metadata: command.preserve_photoshop_metadata,
+            frame_source: command.frame_source,
             linked_cels: command.linked_cels,
             layer_association: command.layer_association,
             jitter: command.jitter,
         },
     )
-    .map_err(|error| CliError::Conversion(error.to_string()))?;
+    .map_err(|error| match error {
+        ConversionError::RoundTripRecoveryRequired(message) => CliError::Recovery(message),
+        error => CliError::Conversion(error.to_string()),
+    })?;
     println!("wrote {}", report.output.display());
     if let Some(path) = command.report {
         write_report_with_active_frame(
@@ -308,9 +316,11 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
     let mut report = None;
     let mut overwrite = false;
     let mut preserve_photoshop_metadata = false;
+    let mut frame_source = FrameSource::Auto;
     let mut linked_cels = LinkedCelMode::Off;
     let mut automatic = false;
-    let mut conservative = false;
+    let mut roundtrip = false;
+    let mut conservative = true;
     let mut association_strategy_explicit = false;
     let mut z_order = LayerZOrderMode::Stable;
     let mut stable_order = StableOrderMode::Consensus;
@@ -326,6 +336,22 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
         match arguments[index].as_str() {
             "--overwrite" => overwrite = true,
             "--preserve-photoshop-metadata" => preserve_photoshop_metadata = true,
+            "--frame-source" => {
+                index += 1;
+                let value = arguments
+                    .get(index)
+                    .ok_or_else(|| CliError::Usage(CONVERT_USAGE.to_string()))?;
+                frame_source = match value.as_str() {
+                    "auto" => FrameSource::Auto,
+                    "static" => FrameSource::Static,
+                    "top-level" => FrameSource::TopLevel,
+                    _ => {
+                        return Err(CliError::Usage(format!(
+                            "invalid --frame-source value: {value:?}"
+                        )));
+                    }
+                };
+            }
             "--linked-cels" => {
                 index += 1;
                 let value = arguments
@@ -347,8 +373,18 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
                     .get(index)
                     .ok_or_else(|| CliError::Usage(CONVERT_USAGE.to_string()))?;
                 automatic = match value.as_str() {
-                    "preserve" => false,
-                    "auto" => true,
+                    "preserve" => {
+                        roundtrip = false;
+                        false
+                    }
+                    "auto" => {
+                        roundtrip = false;
+                        true
+                    }
+                    "roundtrip" => {
+                        roundtrip = true;
+                        false
+                    }
                     _ => {
                         return Err(CliError::Usage(format!(
                             "invalid --layer-association value: {value:?}"
@@ -530,27 +566,54 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
     }
     let input = input.ok_or_else(|| CliError::Usage(CONVERT_USAGE.to_string()))?;
     let output = output.unwrap_or_else(|| input.with_extension("aseprite"));
-    if !automatic && z_order == LayerZOrderMode::Auto {
+    if roundtrip && z_order == LayerZOrderMode::Auto {
+        return Err(CliError::Usage(
+            "--z-order auto cannot be combined with --layer-association roundtrip".to_string(),
+        ));
+    }
+    if !automatic && !roundtrip && z_order == LayerZOrderMode::Auto {
         return Err(CliError::Usage(
             "--z-order auto requires --layer-association auto".to_string(),
         ));
     }
-    if !automatic && stable_order_explicit {
+    if roundtrip && stable_order_explicit {
+        return Err(CliError::Usage(
+            "--stable-order cannot be combined with --layer-association roundtrip".to_string(),
+        ));
+    }
+    if !automatic && !roundtrip && stable_order_explicit {
         return Err(CliError::Usage(
             "--stable-order requires --layer-association auto".to_string(),
         ));
     }
-    if !automatic && uncertain_layers_explicit {
+    if roundtrip && uncertain_layers_explicit {
+        return Err(CliError::Usage(
+            "--uncertain-layers cannot be combined with --layer-association roundtrip".to_string(),
+        ));
+    }
+    if !automatic && !roundtrip && uncertain_layers_explicit {
         return Err(CliError::Usage(
             "--uncertain-layers requires --layer-association auto".to_string(),
         ));
     }
-    if !automatic && association_strategy_explicit {
+    if roundtrip && association_strategy_explicit {
+        return Err(CliError::Usage(
+            "--association-strategy cannot be combined with --layer-association roundtrip"
+                .to_string(),
+        ));
+    }
+    if !automatic && !roundtrip && association_strategy_explicit {
         return Err(CliError::Usage(
             "--association-strategy requires --layer-association auto".to_string(),
         ));
     }
-    if !automatic && linked_cels == LinkedCelMode::Identical {
+    if roundtrip && linked_cels == LinkedCelMode::Identical {
+        return Err(CliError::Usage(
+            "--linked-cels identical cannot be combined with --layer-association roundtrip"
+                .to_string(),
+        ));
+    }
+    if !automatic && !roundtrip && linked_cels == LinkedCelMode::Identical {
         return Err(CliError::Usage(
             "--linked-cels identical requires --layer-association auto".to_string(),
         ));
@@ -560,12 +623,27 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
             "--uncertain-layers requires --association-strategy conservative".to_string(),
         ));
     }
-    if !automatic && jitter.mode == JitterMode::Assist {
+    if roundtrip && jitter.mode == JitterMode::Assist {
+        return Err(CliError::Usage(
+            "--jitter-mode assist cannot be combined with --layer-association roundtrip"
+                .to_string(),
+        ));
+    }
+    if !automatic && !roundtrip && jitter.mode == JitterMode::Assist {
         return Err(CliError::Usage(
             "--jitter-mode assist requires --layer-association auto".to_string(),
         ));
     }
+    if roundtrip
+        && matches!(jitter.kind, JitterKind::Color | JitterKind::All)
+        && jitter.mode == JitterMode::Repair
+    {
+        return Err(CliError::Usage(
+            "--jitter-kind color/all with --jitter-mode repair cannot be combined with --layer-association roundtrip".to_string(),
+        ));
+    }
     if !automatic
+        && !roundtrip
         && matches!(jitter.kind, JitterKind::Color | JitterKind::All)
         && jitter.mode == JitterMode::Repair
     {
@@ -582,7 +660,9 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
         ));
     }
     jitter.thresholds().map_err(CliError::Usage)?;
-    let layer_association = if automatic {
+    let layer_association = if roundtrip {
+        LayerAssociation::AutoForRoundTrip
+    } else if automatic {
         let strategy = if conservative {
             AssociationStrategy::Conservative { uncertain_layers }
         } else {
@@ -601,6 +681,7 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
         output,
         overwrite,
         preserve_photoshop_metadata,
+        frame_source,
         linked_cels,
         layer_association,
         jitter,
@@ -621,6 +702,7 @@ fn export_arguments(arguments: &[String]) -> Result<ExportCommand, CliError> {
     let mut active_frame_index = None;
     let mut compression = None;
     let mut embed_roundtrip_metadata = true;
+    let mut include_empty_layers = false;
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
@@ -689,6 +771,21 @@ fn export_arguments(arguments: &[String]) -> Result<ExportCommand, CliError> {
                     }
                 };
             }
+            "--empty-layers" => {
+                index += 1;
+                let value = arguments
+                    .get(index)
+                    .ok_or_else(|| CliError::Usage(EXPORT_USAGE.to_string()))?;
+                include_empty_layers = match value.as_str() {
+                    "include" => true,
+                    "omit" => false,
+                    _ => {
+                        return Err(CliError::Usage(format!(
+                            "invalid --empty-layers value: {value:?}"
+                        )));
+                    }
+                };
+            }
             value if value.starts_with('-') => {
                 return Err(CliError::Usage(format!("unknown export option: {value}")));
             }
@@ -709,6 +806,7 @@ fn export_arguments(arguments: &[String]) -> Result<ExportCommand, CliError> {
         active_frame_index,
         compression,
         embed_roundtrip_metadata,
+        include_empty_layers,
     })
 }
 
@@ -760,6 +858,7 @@ enum CliError {
     Usage(String),
     Inspection(String),
     Conversion(String),
+    Recovery(String),
 }
 
 impl CliError {
@@ -769,6 +868,7 @@ impl CliError {
             Self::Usage(_) => 64,
             Self::Inspection(_) => 3,
             Self::Conversion(_) => 2,
+            Self::Recovery(_) => 4,
         }
     }
 }
@@ -777,9 +877,10 @@ impl std::fmt::Display for CliError {
     /// Formats a CLI error without exposing internal Rust types.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Usage(message) | Self::Inspection(message) | Self::Conversion(message) => {
-                formatter.write_str(message)
-            }
+            Self::Usage(message)
+            | Self::Inspection(message)
+            | Self::Conversion(message)
+            | Self::Recovery(message) => formatter.write_str(message),
         }
     }
 }

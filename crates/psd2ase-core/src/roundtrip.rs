@@ -6,7 +6,8 @@ use crate::InspectionError;
 
 const MARKER_KEY: &[u8; 4] = b"p2rt";
 const MARKER_MAGIC: &[u8; 4] = b"P2RT";
-const MARKER_VERSION: u16 = 1;
+const LEGACY_MARKER_VERSION: u16 = 1;
+const FRAME_GROUP_MARKER_VERSION: u16 = 2;
 const MARKER_SIZE: usize = 20;
 
 /// The role of one layer in a converter-owned cel materialization.
@@ -14,11 +15,14 @@ const MARKER_SIZE: usize = 20;
 pub(crate) enum MarkerRole {
     Wrapper,
     Variant,
+    FrameGroup,
+    LayerCopy,
 }
 
 /// Identifies one converter-owned materialized cel layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LayerMarker {
+    pub(crate) version: u16,
     pub(crate) role: MarkerRole,
     pub(crate) logical_layer_id: u32,
     pub(crate) variant_index: u32,
@@ -34,15 +38,28 @@ pub struct RoundTripStatus {
     pub valid: bool,
 }
 
+/// Detailed converter-owned marker classification used by round-trip conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct RoundTripLayout {
+    /// Aggregate marker status retained for public inspection.
+    pub(crate) status: RoundTripStatus,
+    /// Marker protocol version when all markers use one known version.
+    pub(crate) version: Option<u16>,
+    /// Declared frame count for v2 frame-group markers.
+    pub(crate) frame_count: Option<u32>,
+}
+
 /// Encodes one marker payload for a PSD additional-info block.
 pub(crate) fn encode_marker(marker: LayerMarker) -> Vec<u8> {
     let role = match marker.role {
         MarkerRole::Wrapper => 1,
         MarkerRole::Variant => 2,
+        MarkerRole::FrameGroup => 3,
+        MarkerRole::LayerCopy => 4,
     };
     let mut payload = Vec::with_capacity(MARKER_SIZE);
     payload.extend_from_slice(MARKER_MAGIC);
-    payload.extend_from_slice(&MARKER_VERSION.to_be_bytes());
+    payload.extend_from_slice(&marker.version.to_be_bytes());
     payload.push(role);
     payload.push(0);
     payload.extend_from_slice(&marker.logical_layer_id.to_be_bytes());
@@ -57,15 +74,18 @@ pub(crate) fn decode_marker(data: &[u8]) -> Option<LayerMarker> {
         return None;
     }
     let version = u16::from_be_bytes(data[4..6].try_into().ok()?);
-    if version != MARKER_VERSION || data[7] != 0 {
+    if data[7] != 0 {
         return None;
     }
     let role = match data[6] {
-        1 => MarkerRole::Wrapper,
-        2 => MarkerRole::Variant,
+        1 if version == LEGACY_MARKER_VERSION => MarkerRole::Wrapper,
+        2 if version == LEGACY_MARKER_VERSION => MarkerRole::Variant,
+        3 if version == FRAME_GROUP_MARKER_VERSION => MarkerRole::FrameGroup,
+        4 if version == FRAME_GROUP_MARKER_VERSION => MarkerRole::LayerCopy,
         _ => return None,
     };
     Some(LayerMarker {
+        version,
         role,
         logical_layer_id: u32::from_be_bytes(data[8..12].try_into().ok()?),
         variant_index: u32::from_be_bytes(data[12..16].try_into().ok()?),
@@ -75,6 +95,11 @@ pub(crate) fn decode_marker(data: &[u8]) -> Option<LayerMarker> {
 
 /// Scans PSD/PSB layer records and validates converter-owned marker sets.
 pub fn inspect(bytes: &[u8]) -> Result<RoundTripStatus, InspectionError> {
+    Ok(inspect_detailed(bytes)?.status)
+}
+
+/// Scans markers and reports whether the document carries a coherent protocol layout.
+pub(crate) fn inspect_detailed(bytes: &[u8]) -> Result<RoundTripLayout, InspectionError> {
     if bytes.len() < 34 || &bytes[..4] != b"8BPS" {
         return Err(InspectionError::PsdRead("invalid PSD header".to_string()));
     }
@@ -145,9 +170,77 @@ pub fn inspect(bytes: &[u8]) -> Result<RoundTripStatus, InspectionError> {
 
     let marked = !markers.is_empty();
     if !marked {
-        return Ok(RoundTripStatus {
-            marked: false,
-            valid: true,
+        return Ok(RoundTripLayout {
+            status: RoundTripStatus {
+                marked: false,
+                valid: true,
+            },
+            ..Default::default()
+        });
+    }
+    let versions = markers
+        .iter()
+        .map(|marker| marker.version)
+        .collect::<BTreeSet<_>>();
+    if versions.len() != 1 {
+        return Ok(RoundTripLayout {
+            status: RoundTripStatus {
+                marked: true,
+                valid: false,
+            },
+            version: None,
+            frame_count: None,
+        });
+    }
+    let version = versions.iter().next().copied();
+    if version == Some(FRAME_GROUP_MARKER_VERSION) {
+        let mut frame_count = None;
+        let mut frames = BTreeSet::new();
+        let mut copies = BTreeMap::<u32, BTreeSet<u32>>::new();
+        let mut valid = true;
+        for marker in markers {
+            if marker.variant_count == 0 || marker.logical_layer_id == 0 {
+                valid = false;
+                continue;
+            }
+            if marker.variant_index == 0 || marker.variant_index > marker.variant_count {
+                valid = false;
+            }
+            if let Some(existing) = frame_count {
+                valid &= existing == marker.variant_count;
+            } else {
+                frame_count = Some(marker.variant_count);
+            }
+            match marker.role {
+                MarkerRole::FrameGroup => {
+                    valid &= frames.insert(marker.variant_index);
+                }
+                MarkerRole::LayerCopy => {
+                    valid &= copies
+                        .entry(marker.logical_layer_id)
+                        .or_default()
+                        .insert(marker.variant_index);
+                }
+                _ => valid = false,
+            }
+        }
+        if let Some(count) = frame_count {
+            valid &=
+                frames.len() == count as usize && (1..=count).all(|index| frames.contains(&index));
+            valid &= !copies.is_empty();
+            valid &= copies.values().all(|indices| {
+                indices.len() == count as usize && (1..=count).all(|index| indices.contains(&index))
+            });
+        } else {
+            valid = false;
+        }
+        return Ok(RoundTripLayout {
+            status: RoundTripStatus {
+                marked: true,
+                valid,
+            },
+            version,
+            frame_count,
         });
     }
     let mut wrappers = BTreeMap::<u32, u32>::new();
@@ -173,6 +266,7 @@ pub fn inspect(bytes: &[u8]) -> Result<RoundTripStatus, InspectionError> {
                         .or_default()
                         .insert(marker.variant_index);
             }
+            _ => valid = false,
         }
     }
     valid &= wrappers.iter().all(|(id, count)| {
@@ -181,7 +275,11 @@ pub fn inspect(bytes: &[u8]) -> Result<RoundTripStatus, InspectionError> {
         })
     });
     valid &= variants.keys().all(|id| wrappers.contains_key(id));
-    Ok(RoundTripStatus { marked, valid })
+    Ok(RoundTripLayout {
+        status: RoundTripStatus { marked, valid },
+        version,
+        frame_count: None,
+    })
 }
 
 fn scan_extra(extra: &[u8]) -> Vec<LayerMarker> {
@@ -219,6 +317,7 @@ fn scan_extra(extra: &[u8]) -> Vec<LayerMarker> {
                 markers.push(marker);
             } else {
                 markers.push(LayerMarker {
+                    version: 0,
                     role: MarkerRole::Wrapper,
                     logical_layer_id: 0,
                     variant_index: 0,

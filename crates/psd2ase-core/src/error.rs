@@ -35,6 +35,8 @@ pub enum ConversionError {
     OutputExists(PathBuf),
     /// Reading and normalizing the input failed before writing started.
     InputInspection(String),
+    /// Converter-owned frame-group metadata needs a user-selected recovery strategy.
+    RoundTripRecoveryRequired(String),
     /// Mapping the normalized document to Aseprite failed.
     Writer(String),
     /// The encoded file failed post-write structural validation.
@@ -54,6 +56,9 @@ impl Display for ConversionError {
                 write!(formatter, "output already exists: {}", path.display())
             }
             Self::InputInspection(error) => write!(formatter, "could not inspect input: {error}"),
+            Self::RoundTripRecoveryRequired(error) => {
+                write!(formatter, "round-trip recovery required: {error}")
+            }
             Self::Writer(error) => write!(formatter, "could not write Aseprite output: {error}"),
             Self::OutputValidation(error) => {
                 write!(formatter, "Aseprite output validation failed: {error}")

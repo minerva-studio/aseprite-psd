@@ -35,6 +35,8 @@ pub enum LayerAssociation {
     Preserve,
     /// Infer logical tracks and remove frame-container groups.
     Auto(AutoAssociationOptions),
+    /// Prefer exact converter round-trip restoration, then fall back to automatic association.
+    AutoForRoundTrip,
 }
 
 /// Options used when automatic logical-layer association is enabled.
@@ -49,16 +51,23 @@ pub struct AutoAssociationOptions {
 }
 
 /// Selects the automatic identity-association strategy and its valid layout policy.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssociationStrategy {
     /// Reproduce the compact association behavior from the ordering baseline.
-    #[default]
     Compact,
     /// Use the conservative multilingual family and candidate-folder planner.
     Conservative {
         /// Selects whether uncertain tracks are grouped for review.
         uncertain_layers: UncertainLayerMode,
     },
+}
+
+impl Default for AssociationStrategy {
+    fn default() -> Self {
+        Self::Conservative {
+            uncertain_layers: UncertainLayerMode::Group,
+        }
+    }
 }
 
 impl AssociationStrategy {
@@ -390,6 +399,16 @@ pub(crate) fn build_layer_write_plan_with_metadata(
     options: AutoAssociationOptions,
     preserve_photoshop_metadata: bool,
 ) -> Result<LayerWritePlan, String> {
+    build_layer_write_plan_with_context(document, options, preserve_photoshop_metadata, true)
+}
+
+/// Builds an automatic plan with source-specific generic identity evidence policy.
+pub(crate) fn build_layer_write_plan_with_context(
+    document: &NormalizedDocument,
+    options: AutoAssociationOptions,
+    preserve_photoshop_metadata: bool,
+    allow_inferred_cross_source_matches: bool,
+) -> Result<LayerWritePlan, String> {
     let strategy = options.strategy;
     let z_order_mode = options.z_order;
     let stable_order_mode = options.stable_order;
@@ -421,10 +440,8 @@ pub(crate) fn build_layer_write_plan_with_metadata(
     let frames = &mut observation_store.frames;
     for frame in frames.iter_mut() {
         frame.sort_by_key(|observation| observation.source_order);
-        if matches!(strategy, AssociationStrategy::Conservative { .. }) {
-            for (source_order, observation) in frame.iter_mut().enumerate() {
-                observation.source_order = source_order;
-            }
+        for (source_order, observation) in frame.iter_mut().enumerate() {
+            observation.source_order = source_order;
         }
     }
 
@@ -461,7 +478,7 @@ pub(crate) fn build_layer_write_plan_with_metadata(
         document.frames.len(),
     );
     engine.seed_anchor();
-    engine.associate(strategy);
+    engine.associate(strategy, z_order_mode, allow_inferred_cross_source_matches);
     let mut association = engine.into_output();
     let frames = &association.observations.frames;
     let tracks = &mut association.tracks;
@@ -504,19 +521,20 @@ pub(crate) fn build_layer_write_plan_with_metadata(
     });
     let mut group_paths = choose_group_paths(tracks, document, &mut warnings);
     flatten_redundant_common_root(&mut group_paths, tracks, document, selectors, &mut warnings);
-    let (candidate_groups, candidate_group_paths) =
-        if matches!(strategy, AssociationStrategy::Conservative { .. }) {
-            plan_candidate_groups(
-                tracks,
-                decisions,
-                &track_order,
-                selectors,
-                uncertain_layer_mode,
-                &mut warnings,
-            )
-        } else {
-            (Vec::new(), HashMap::new())
-        };
+    let (candidate_groups, candidate_group_paths) = if allow_inferred_cross_source_matches
+        && matches!(strategy, AssociationStrategy::Conservative { .. })
+    {
+        plan_candidate_groups(
+            tracks,
+            decisions,
+            &track_order,
+            selectors,
+            uncertain_layer_mode,
+            &mut warnings,
+        )
+    } else {
+        (Vec::new(), HashMap::new())
+    };
     let root_nodes = build_nodes(&group_paths, &track_order, &candidate_group_paths);
     validate_candidate_group_topology(&root_nodes, &candidate_groups)?;
     let mut plan = LayerWritePlan {

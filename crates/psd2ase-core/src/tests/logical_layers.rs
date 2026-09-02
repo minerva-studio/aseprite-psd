@@ -19,13 +19,18 @@ fn build_layer_write_plan(document: &NormalizedDocument) -> Result<LayerWritePla
 }
 
 #[test]
-fn default_plan_uses_compact_strategy_without_candidate_folders() {
+fn default_plan_uses_conservative_strategy() {
     let plan = super::build_layer_write_plan(
         &document(vec![pixel(1, "rear foot", 0, [1, 2, 3, 255])]),
         AutoAssociationOptions::default(),
     )
-    .expect("compact association should succeed");
-    assert_eq!(plan.report.strategy, AssociationStrategy::Compact);
+    .expect("conservative association should succeed");
+    assert_eq!(
+        plan.report.strategy,
+        AssociationStrategy::Conservative {
+            uncertain_layers: UncertainLayerMode::Group,
+        }
+    );
     assert!(plan.report.candidate_groups.is_empty());
 }
 
@@ -231,6 +236,107 @@ fn top_level_frame_container_with_children(
             },
         ],
     }
+}
+
+/// Builds a deterministic frame-container document for solver invariant checks.
+fn generated_solver_document(seed: u32) -> (NormalizedDocument, Vec<u32>, Vec<u32>) {
+    let frame_count = 2 + seed as usize % 2;
+    let mut source_ids = Vec::new();
+    let mut metadata_locked_ids = Vec::new();
+    let mut groups = Vec::new();
+    let mut next_id = 1u32;
+    for frame_index in 0..frame_count {
+        let layer_count = 1 + ((seed.rotate_left(frame_index as u32) >> 3) as usize % 2);
+        let mut children = Vec::new();
+        for layer_index in 0..layer_count {
+            let name = match (seed as usize + frame_index * 3 + layer_index) % 4 {
+                0 => format!("role {}", layer_index % 2),
+                1 => format!("role {} copy", layer_index % 2),
+                2 => format!("Layer {}", layer_index + 1),
+                _ => format!("图层 {}", layer_index + 1),
+            };
+            let x = if (seed >> (layer_index % 16)) & 1 == 0 {
+                layer_index as i32
+            } else {
+                0
+            };
+            let mut child = pixel(
+                next_id,
+                &name,
+                x,
+                [next_id as u8, frame_index as u8, layer_index as u8, 255],
+            );
+            child.frame_states = (0..frame_count)
+                .map(|index| NormalizedLayerFrameState {
+                    frame_index: index as u32,
+                    record_present: true,
+                    enabled: true,
+                    explicit_enable: true,
+                    offset: None,
+                    reference_point: None,
+                    opacity: None,
+                })
+                .collect();
+            if seed.wrapping_add(next_id).is_multiple_of(17) {
+                child.frame_states[frame_index].reference_point =
+                    Some(crate::AnimationPoint { x: 3.0, y: 5.0 });
+                metadata_locked_ids.push(next_id);
+            }
+            source_ids.push(next_id);
+            children.push(child);
+            next_id += 1;
+        }
+        let bounds = children[0].bounds;
+        groups.push(NormalizedLayer {
+            id: 10_000 + frame_index as u32,
+            name: format!("frame {}", frame_index + 1),
+            kind: NormalizedLayerKind::Group,
+            bounds,
+            opacity: None,
+            blend_mode: Some("pass through".to_string()),
+            hidden: Some(false),
+            pixels: None,
+            children,
+            frame_states: (0..frame_count)
+                .map(|index| NormalizedLayerFrameState {
+                    frame_index: index as u32,
+                    record_present: true,
+                    enabled: index == frame_index,
+                    explicit_enable: true,
+                    offset: None,
+                    reference_point: None,
+                    opacity: None,
+                })
+                .collect(),
+        });
+    }
+    let mut generated = document(groups);
+    generated.frames = (0..frame_count)
+        .map(|index| NormalizedFrame {
+            index: index as u32,
+            source_id: Some(index as u32),
+            duration_ms: Some(100),
+            dispose: None,
+        })
+        .collect();
+    (generated, source_ids, metadata_locked_ids)
+}
+
+/// Returns the stable source-to-track mapping used for determinism assertions.
+fn source_track_mapping(plan: &LayerWritePlan) -> Vec<(u32, usize)> {
+    let mut mapping = plan
+        .tracks
+        .iter()
+        .flat_map(|track| {
+            track
+                .cels
+                .iter()
+                .flatten()
+                .map(move |cel| (cel.source_layer_id, track.id))
+        })
+        .collect::<Vec<_>>();
+    mapping.sort_unstable();
+    mapping
 }
 
 /// Creates a two-frame group whose child order can differ by frame.
@@ -589,58 +695,163 @@ fn generic_renamed_observation_stays_separate_from_named_track() {
 }
 
 #[test]
-fn uncertain_candidate_is_grouped_with_its_anchor_without_merging_tracks() {
+fn single_new_generic_can_fill_a_structurally_exclusive_slot() {
     let first =
         top_level_frame_container(10, "frame 1", 0, pixel(1, "rear foot", 0, [1, 2, 3, 255]));
     let second =
         top_level_frame_container(11, "frame 2", 1, pixel(2, "Layer 5", 0, [4, 5, 6, 255]));
     let plan = build_layer_write_plan(&two_frame_document(vec![first, second]))
-        .expect("candidate grouping should succeed");
-    assert_eq!(plan.tracks.len(), 2);
-    let group = plan
-        .report
-        .candidate_groups
-        .iter()
-        .find(|group| group.name == "候选 - rear foot")
-        .expect("rear-foot candidate group should be reported");
-    assert!(group.emitted);
-    assert_eq!(group.member_track_ids.len(), 2);
-    assert!(group.complete_interval);
-    assert!(group.relations.iter().any(|relation| {
-        relation.relation == CandidateTrackRelation::StructuralMutualExclusion
-            && relation.co_visible_frames.is_empty()
-    }));
-    assert!(matches!(
-        plan.root_nodes.first(),
-        Some(PlannedNode::Group { name, .. }) if name == "候选 - rear foot"
-    ));
-    let candidate_folders = plan
-        .root_nodes
-        .iter()
-        .filter_map(|node| match node {
-            PlannedNode::Group {
-                name,
-                source_layer_id: None,
-                children,
-            } if name == "候选 - rear foot" => Some(children),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(candidate_folders.len(), 1);
-    assert_eq!(
-        candidate_folders[0],
-        &vec![
-            PlannedNode::Track { track_id: 0 },
-            PlannedNode::Track { track_id: 1 },
-        ]
-    );
+        .expect("single generic replacement should associate");
+    assert_eq!(plan.tracks.len(), 1);
     assert!(plan.report.decisions.iter().any(|decision| {
         decision.original_name == "Layer 5"
-            && plan
-                .tracks
-                .get(decision.track_id)
-                .is_some_and(|track| track.name == "Layer 5")
+            && decision
+                .evidence
+                .iter()
+                .any(|value| value == "structural-empty-slot")
     }));
+}
+
+#[test]
+fn conservative_protects_a_batch_of_new_generic_effects() {
+    let first =
+        top_level_frame_container(10, "frame 1", 0, pixel(1, "backpack", 0, [1, 2, 3, 255]));
+    let effects = top_level_frame_container_with_children(
+        11,
+        "frame 2",
+        1,
+        vec![
+            pixel(2, "Layer 7", 0, [4, 5, 6, 255]),
+            pixel(3, "Layer 8", 1, [7, 8, 9, 255]),
+        ],
+    );
+    let document = two_frame_document(vec![first, effects]);
+
+    let compact = super::build_layer_write_plan(
+        &document,
+        AutoAssociationOptions {
+            strategy: AssociationStrategy::Compact,
+            ..AutoAssociationOptions::default()
+        },
+    )
+    .expect("compact association should use the safe empty slot");
+    assert_eq!(compact.tracks.len(), 2);
+
+    let conservative = build_layer_write_plan(&document)
+        .expect("conservative association should protect the new effect batch");
+    assert_eq!(conservative.tracks.len(), 3);
+    assert_eq!(
+        conservative
+            .report
+            .decisions
+            .iter()
+            .filter(|decision| {
+                decision
+                    .evidence
+                    .iter()
+                    .any(|value| value == "new-generic-batch-protected")
+            })
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn synthetic_top_level_frames_require_exact_source_identity() {
+    let first = top_level_frame_container(10, "frame 1", 0, pixel(1, "Layer 1", 0, [1, 2, 3, 255]));
+    let second =
+        top_level_frame_container(11, "frame 2", 1, pixel(2, "Layer 1", 0, [1, 2, 3, 255]));
+    let document = two_frame_document(vec![first, second]);
+
+    let plan = super::build_layer_write_plan_with_context(
+        &document,
+        AutoAssociationOptions::default(),
+        false,
+        false,
+    )
+    .expect("synthetic frame association should preserve distinct sources");
+
+    assert_eq!(plan.tracks.len(), 2);
+    assert!(plan.report.candidate_groups.is_empty());
+    assert!(plan.report.decisions.iter().any(|decision| {
+        decision.frame_index == 1
+            && decision
+                .evidence
+                .iter()
+                .any(|value| value == "synthetic-frame identity unproven")
+    }));
+}
+
+#[test]
+fn generated_solver_cases_preserve_core_invariants() {
+    for seed in 0..256u32 {
+        let (document, mut expected_sources, metadata_locked_ids) = generated_solver_document(seed);
+        let compact_options = AutoAssociationOptions {
+            strategy: AssociationStrategy::Compact,
+            ..AutoAssociationOptions::default()
+        };
+        let conservative_options = AutoAssociationOptions::default();
+        let compact = super::build_layer_write_plan_with_metadata(&document, compact_options, true)
+            .unwrap_or_else(|error| panic!("seed {seed} compact failed: {error}"));
+        let conservative =
+            super::build_layer_write_plan_with_metadata(&document, conservative_options, true)
+                .unwrap_or_else(|error| panic!("seed {seed} conservative failed: {error}"));
+        expected_sources.sort_unstable();
+        for (strategy, plan) in [("compact", &compact), ("conservative", &conservative)] {
+            let mut actual_sources = source_track_mapping(plan)
+                .into_iter()
+                .map(|(source, _)| source)
+                .collect::<Vec<_>>();
+            actual_sources.sort_unstable();
+            assert_eq!(
+                actual_sources, expected_sources,
+                "seed {seed} {strategy} must cover every observation exactly once"
+            );
+            assert!(
+                plan.tracks
+                    .iter()
+                    .all(|track| track.cels.len() == document.frames.len()),
+                "seed {seed} {strategy} produced an invalid frame span"
+            );
+            for locked_id in &metadata_locked_ids {
+                let containing = plan
+                    .tracks
+                    .iter()
+                    .find(|track| {
+                        track
+                            .cels
+                            .iter()
+                            .flatten()
+                            .any(|cel| cel.source_layer_id == *locked_id)
+                    })
+                    .unwrap_or_else(|| panic!("seed {seed} lost metadata source {locked_id}"));
+                assert!(
+                    containing
+                        .cels
+                        .iter()
+                        .flatten()
+                        .all(|cel| cel.source_layer_id == *locked_id),
+                    "seed {seed} {strategy} merged metadata source {locked_id}"
+                );
+            }
+        }
+        assert!(
+            conservative.tracks.len() >= compact.tracks.len(),
+            "seed {seed} conservative became more aggressive: {} < {}",
+            conservative.tracks.len(),
+            compact.tracks.len()
+        );
+        if seed % 64 == 0 {
+            let compact_repeat =
+                super::build_layer_write_plan_with_metadata(&document, compact_options, true)
+                    .unwrap_or_else(|error| panic!("seed {seed} compact repeat failed: {error}"));
+            assert_eq!(
+                source_track_mapping(&compact),
+                source_track_mapping(&compact_repeat),
+                "seed {seed} compact mapping was not deterministic"
+            );
+        }
+    }
 }
 
 #[test]
@@ -827,7 +1038,7 @@ fn non_contiguous_candidate_interval_is_rejected_as_a_whole() {
 }
 
 #[test]
-fn flat_uncertain_layout_keeps_candidate_tracks_at_root() {
+fn flat_layout_keeps_a_merged_single_generic_at_root() {
     let first =
         top_level_frame_container(10, "frame 1", 0, pixel(1, "rear foot", 0, [1, 2, 3, 255]));
     let second =
@@ -846,12 +1057,8 @@ fn flat_uncertain_layout_keeps_candidate_tracks_at_root() {
     assert!(plan.root_nodes.iter().all(|node| {
         !matches!(node, PlannedNode::Group { name, .. } if name.starts_with("候选 - "))
     }));
-    assert!(
-        plan.report
-            .candidate_groups
-            .iter()
-            .any(|group| group.name == "候选 - rear foot" && !group.emitted)
-    );
+    assert_eq!(plan.tracks.len(), 1);
+    assert!(plan.report.candidate_groups.is_empty());
 }
 
 #[test]
@@ -958,8 +1165,8 @@ fn consensus_prefers_repeated_overlapping_order() {
 }
 
 #[test]
-fn strict_order_rejects_an_unresolved_tie() {
-    let error = super::build_layer_write_plan(
+fn strict_order_splits_a_track_instead_of_changing_effective_order() {
+    let plan = super::build_layer_write_plan(
         &two_frame_order_document(false),
         AutoAssociationOptions {
             strategy: AssociationStrategy::Conservative {
@@ -969,8 +1176,13 @@ fn strict_order_rejects_an_unresolved_tie() {
             ..AutoAssociationOptions::default()
         },
     )
-    .expect_err("strict mode must reject a one-to-one order tie");
-    assert!(error.contains("stable order unresolved"));
+    .expect("strict mode should preserve order by splitting the unsafe association");
+    assert_eq!(plan.tracks.len(), 3);
+    assert!(
+        plan.tracks
+            .iter()
+            .all(|track| { track.cels.iter().flatten().all(|cel| cel.z_index == 0) })
+    );
 }
 
 #[test]
@@ -1021,7 +1233,7 @@ fn non_overlapping_order_changes_do_not_add_z_indices() {
 }
 
 #[test]
-fn stable_order_ignores_frame_order_changes() {
+fn stable_order_splits_effective_order_changes() {
     let plan = build_layer_write_plan(&two_frame_order_document(false))
         .expect("association should succeed");
     assert_eq!(plan.report.z_order_mode, LayerZOrderMode::Stable);
@@ -1031,17 +1243,7 @@ fn stable_order_ignores_frame_order_changes() {
             .iter()
             .all(|track| track.cels.iter().flatten().all(|cel| cel.z_index == 0))
     );
-    assert!(!plan.report.z_order_diagnostics.is_empty());
+    assert!(plan.report.z_order_diagnostics.is_empty());
+    assert_eq!(plan.tracks.len(), 3);
     assert!(!plan.report.stable_order_diagnostics.is_empty());
-    assert!(
-        plan.root_nodes
-            .iter()
-            .all(|node| matches!(node, PlannedNode::Track { .. }))
-    );
-    assert!(
-        plan.report
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("common wrapper group root"))
-    );
 }

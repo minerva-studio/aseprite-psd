@@ -115,6 +115,11 @@ function Process.new(plugin)
     return result == true or result == 0 or (reason == "exit" and code == 0)
   end
 
+  --- Returns whether a converter process requested round-trip recovery.
+  local function is_recovery_exit(result, reason, code)
+    return result == 4 or (reason == "exit" and code == 4)
+  end
+
   --- Builds the converter argument list for the selected conversion policy.
   local function build_arguments(binary, input, output, options)
     local arguments = {
@@ -131,10 +136,14 @@ function Process.new(plugin)
     if options.overwrite then
       table.insert(arguments, "--overwrite")
     end
+    table.insert(arguments, "--frame-source")
+    table.insert(arguments, options.frame_source or "auto")
     if options.preserve_photoshop_metadata then
       table.insert(arguments, "--preserve-photoshop-metadata")
     end
-    if options.link_identical_cels and options.layer_association == "auto" then
+    local roundtrip = options.layer_association == "roundtrip"
+      or (options.layer_association == "auto" and options.use_roundtrip_metadata == true)
+    if options.link_identical_cels and options.layer_association == "auto" and not roundtrip then
       table.insert(arguments, "--linked-cels")
       table.insert(arguments, "identical")
     end
@@ -146,7 +155,10 @@ function Process.new(plugin)
       table.insert(arguments, "--jitter-profile")
       table.insert(arguments, options.jitter_profile)
     end
-    if options.layer_association == "auto" then
+    if roundtrip then
+      table.insert(arguments, "--layer-association")
+      table.insert(arguments, "roundtrip")
+    elseif options.layer_association == "auto" then
       table.insert(arguments, "--layer-association")
       table.insert(arguments, "auto")
       table.insert(arguments, "--association-strategy")
@@ -172,7 +184,8 @@ function Process.new(plugin)
     report,
     active_frame_index,
     compression,
-    embed_roundtrip_metadata)
+    embed_roundtrip_metadata,
+    include_empty_layers)
     local arguments = {
       binary,
       "export",
@@ -196,6 +209,8 @@ function Process.new(plugin)
       table.insert(arguments, "--roundtrip-metadata")
       table.insert(arguments, "off")
     end
+    table.insert(arguments, "--empty-layers")
+    table.insert(arguments, include_empty_layers == true and "include" or "omit")
     return arguments
   end
 
@@ -260,6 +275,10 @@ function Process.new(plugin)
       if detail == "" then
         detail = "The converter exited without diagnostic output."
       end
+      if is_recovery_exit(result, reason, code) then
+        remove_file(log_filename)
+        return detail, 4
+      end
       remove_file(log_filename)
       error(string.format(
         "psd2ase %s failed (%s).\n\n%s",
@@ -281,14 +300,6 @@ function Process.new(plugin)
     return run_process(binary, arguments, nil, "inspection")
   end
 
-  --- Returns whether a PSD carries a valid converter-owned round-trip marker.
-  local function is_roundtrip_document(binary, input)
-    local success, diagnostics = pcall(function()
-      return run_diagnostics(binary, { binary, "inspect", input })
-    end)
-    return success and diagnostics:find("roundtrip metadata: true", 1, true) ~= nil
-  end
-
   --- Runs the PSD import subcommand through the common converter launcher.
   local function run_conversion(binary, input, output, options)
     if not app.fs.isFile(input) then
@@ -306,7 +317,8 @@ function Process.new(plugin)
     report,
     active_frame_index,
     compression,
-    embed_roundtrip_metadata)
+    embed_roundtrip_metadata,
+    include_empty_layers)
     if not app.fs.isFile(input) or not app.fs.isFile(composite) then
       error("Aseprite export snapshots were not created.")
     end
@@ -320,7 +332,8 @@ function Process.new(plugin)
         report,
         active_frame_index,
         compression,
-        embed_roundtrip_metadata),
+        embed_roundtrip_metadata,
+        include_empty_layers),
       output,
       "conversion")
   end
@@ -346,7 +359,6 @@ function Process.new(plugin)
     binary = converter_path(),
     build_arguments = build_arguments,
     build_export_arguments = build_export_arguments,
-    is_roundtrip_document = is_roundtrip_document,
     read_file = read_file,
     write_file = write_file,
     remove_file = remove_file,

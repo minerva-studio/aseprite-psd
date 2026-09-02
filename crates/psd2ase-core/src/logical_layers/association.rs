@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::rc::Rc;
 
@@ -6,10 +6,10 @@ use super::matching::find_best_weighted_matching;
 use super::observation::{
     FrameContainerInfo, LayerEvidence, Observation, ObservationId, ObservationStore,
 };
-use super::report::format_copy_suffixes;
+use super::ordering::alpha_overlap;
 use super::{
     AssociationDecision, AssociationDecisionStatus, AssociationExclusionKind, AssociationPhase,
-    AssociationStrategy, CopySuffixMatch, GroupSegment, PlannedCel,
+    AssociationStrategy, CopySuffixMatch, GroupSegment, LayerZOrderMode, PlannedCel,
 };
 use crate::layer_names::{CopySuffixCatalog, ParsedLayerName};
 
@@ -63,7 +63,6 @@ pub(super) struct AssociationEngine<'doc> {
     pub(super) selectors: HashMap<u32, FrameContainerInfo>,
     pub(super) tracks: Vec<TrackBuilder<'doc>>,
     pub(super) decisions: Vec<AssociationDecision>,
-    pub(super) preassigned: HashMap<(usize, u32), usize>,
     pub(super) anchor_frame: usize,
     pub(super) frame_count: usize,
 }
@@ -74,32 +73,6 @@ pub(super) struct AssociationOutput<'doc> {
     pub(super) selectors: HashMap<u32, FrameContainerInfo>,
     pub(super) tracks: Vec<TrackBuilder<'doc>>,
     pub(super) decisions: Vec<AssociationDecision>,
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct AssignmentMetadata {
-    pub(super) score: u16,
-    pub(super) margin: u16,
-    pub(super) phase: AssociationPhase,
-    pub(super) matching_tie: bool,
-}
-
-pub(super) struct FamilyAssignmentContext<'state, 'doc> {
-    pub(super) tracks: &'state mut Vec<TrackBuilder<'doc>>,
-    pub(super) frame_count: usize,
-    pub(super) selectors: &'state HashMap<u32, FrameContainerInfo>,
-    pub(super) decisions: &'state mut Vec<AssociationDecision>,
-    pub(super) preassigned: &'state mut HashMap<(usize, u32), usize>,
-}
-
-pub(super) struct FamilyMatching {
-    pub(super) assignments: Vec<(usize, usize)>,
-    pub(super) tied_observations: HashSet<usize>,
-}
-
-pub(super) struct GlobalFamilyMatching {
-    pub(super) assignments: Vec<((usize, usize), usize)>,
-    pub(super) tied_observations: HashSet<(usize, usize)>,
 }
 
 impl<'doc> AssociationEngine<'doc> {
@@ -115,7 +88,6 @@ impl<'doc> AssociationEngine<'doc> {
             selectors,
             tracks: Vec::new(),
             decisions: Vec::new(),
-            preassigned: HashMap::new(),
             anchor_frame,
             frame_count,
         }
@@ -156,19 +128,12 @@ impl<'doc> AssociationEngine<'doc> {
     }
 
     /// Runs the configured association strategy over every non-anchor frame.
-    pub(super) fn associate(&mut self, strategy: AssociationStrategy) {
-        if matches!(strategy, AssociationStrategy::Conservative { .. }) {
-            associate_families_globally(
-                &self.observations.frames,
-                self.anchor_frame,
-                &mut self.tracks,
-                self.frame_count,
-                &self.selectors,
-                &mut self.decisions,
-                &mut self.preassigned,
-            );
-        }
-
+    pub(super) fn associate(
+        &mut self,
+        strategy: AssociationStrategy,
+        z_order_mode: LayerZOrderMode,
+        allow_inferred_cross_source_matches: bool,
+    ) {
         let mut frame_order = (0..self.observations.frames.len()).collect::<Vec<_>>();
         frame_order.sort_by_key(|frame_index| {
             if *frame_index == self.anchor_frame {
@@ -182,22 +147,24 @@ impl<'doc> AssociationEngine<'doc> {
             if frame_index == self.anchor_frame {
                 continue;
             }
-            match strategy {
-                AssociationStrategy::Compact => associate_frame_compact(
+            if !allow_inferred_cross_source_matches {
+                associate_frame_by_source_identity(
                     &self.observations.frames[frame_index],
                     &mut self.tracks,
                     self.frame_count,
                     &mut self.decisions,
-                ),
-                AssociationStrategy::Conservative { .. } => associate_frame(
-                    &self.observations.frames[frame_index],
-                    &mut self.tracks,
-                    self.frame_count,
-                    &self.selectors,
-                    &mut self.decisions,
-                    &self.preassigned,
-                ),
+                );
+                continue;
             }
+            associate_frame_compact(
+                &self.observations.frames[frame_index],
+                &mut self.tracks,
+                self.frame_count,
+                &self.selectors,
+                matches!(strategy, AssociationStrategy::Conservative { .. }),
+                z_order_mode == LayerZOrderMode::Auto,
+                &mut self.decisions,
+            );
         }
     }
 
@@ -212,365 +179,78 @@ impl<'doc> AssociationEngine<'doc> {
     }
 }
 
-fn associate_families_globally<'doc>(
-    frames: &[Vec<Observation<'doc>>],
-    anchor_frame: usize,
+/// Associates only observations carrying the exact same PSD source-layer identity.
+fn associate_frame_by_source_identity<'doc>(
+    observations: &[Observation<'doc>],
     tracks: &mut Vec<TrackBuilder<'doc>>,
     frame_count: usize,
-    selectors: &HashMap<u32, FrameContainerInfo>,
     decisions: &mut Vec<AssociationDecision>,
-    preassigned: &mut HashMap<(usize, u32), usize>,
 ) {
-    let mut families = BTreeMap::<String, Vec<(usize, usize)>>::new();
-    for (frame_index, observations) in frames.iter().enumerate() {
-        if frame_index == anchor_frame {
-            continue;
-        }
-        for (observation_index, observation) in observations.iter().enumerate() {
-            if !observation.generic_name {
-                families
-                    .entry(observation.name_key.clone())
-                    .or_default()
-                    .push((frame_index, observation_index));
-            }
-        }
-    }
-
-    for (family_key, family_observations) in families {
-        let mut all_family_observations = frames
+    for observation in observations {
+        let matching_tracks = tracks
             .iter()
-            .enumerate()
-            .flat_map(|(frame_index, observations)| {
-                observations
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, observation)| {
-                        !observation.generic_name && observation.name_key == family_key
-                    })
-                    .map(move |(observation_index, _)| (frame_index, observation_index))
+            .filter(|track| {
+                track.cels[observation.frame_index].is_none()
+                    && track
+                        .observations
+                        .iter()
+                        .all(|previous| previous.source_layer_id == observation.source_layer_id)
             })
-            .collect::<Vec<_>>();
-        all_family_observations.sort_unstable();
-
-        let existing_tracks = tracks
-            .iter()
-            .filter(|track| !track.generic_name && track.name_key == family_key)
             .map(|track| track.id)
             .collect::<Vec<_>>();
-        let max_instances = frames
-            .iter()
-            .map(|observations| {
-                observations
-                    .iter()
-                    .filter(|observation| {
-                        !observation.generic_name && observation.name_key == family_key
-                    })
-                    .count()
-            })
-            .max()
-            .unwrap_or(0);
-        let required_slots = max_instances.saturating_sub(existing_tracks.len());
-        let representative = all_family_observations
-            .first()
-            .map(|(frame_index, observation_index)| &frames[*frame_index][*observation_index]);
-        let representative = all_family_observations
-            .iter()
-            .map(|(frame_index, observation_index)| &frames[*frame_index][*observation_index])
-            .find(|observation| !observation.copy_suffixes.is_empty())
-            .or(representative);
-        for _ in 0..required_slots {
-            if let Some(observation) = representative {
-                let track_id = tracks.len();
-                tracks.push(new_track(track_id, observation, frame_count));
-            }
-        }
-
-        let family_tracks = tracks
-            .iter()
-            .filter(|track| !track.generic_name && track.name_key == family_key)
-            .map(|track| track.id)
-            .collect::<Vec<_>>();
-        let mut candidate_map = HashMap::<(usize, usize), Vec<(usize, u16)>>::new();
-        for (frame_index, observation_index) in &family_observations {
-            let observation = &frames[*frame_index][*observation_index];
-            let mut candidates = family_tracks
-                .iter()
-                .filter(|track_id| tracks[**track_id].cels[*frame_index].is_none())
-                .filter(|track_id| identity_allowed(observation, &tracks[**track_id]))
-                .map(|track_id| {
-                    (
-                        *track_id,
-                        candidate_score(
-                            observation,
-                            &tracks[*track_id],
-                            &frames[*frame_index],
-                            selectors,
-                        ),
-                    )
-                })
-                .filter(|(_, score)| *score >= 40)
-                .collect::<Vec<_>>();
-            candidates
-                .sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-            candidate_map.insert((*frame_index, *observation_index), candidates);
-        }
-
-        let mut locked = HashMap::<(usize, usize), usize>::new();
-        let mut locked_tracks = HashSet::<(usize, usize)>::new();
-        for key in &family_observations {
-            let observation = &frames[key.0][key.1];
-            let exact_candidates = candidate_map
-                .get(key)
-                .into_iter()
-                .flatten()
-                .filter(|(track_id, _)| {
-                    !tracks[*track_id].observations.is_empty()
-                        && tracks[*track_id].normalized_name == observation.normalized_name
-                })
-                .map(|(track_id, _)| *track_id)
-                .collect::<Vec<_>>();
-            if exact_candidates.len() == 1 && locked_tracks.insert((key.0, exact_candidates[0])) {
-                locked.insert(*key, exact_candidates[0]);
-            }
-        }
-        for (key, candidates) in &mut candidate_map {
-            candidates.retain(|(track_id, _)| !locked_tracks.contains(&(key.0, *track_id)));
-        }
-        let matching_observations = family_observations
-            .iter()
-            .filter(|key| !locked.contains_key(key))
-            .copied()
-            .collect::<Vec<_>>();
-        let matching = find_best_global_family_matching(&matching_observations, &candidate_map);
-        let selected = matching
-            .assignments
-            .iter()
-            .copied()
-            .collect::<HashMap<_, _>>();
-        for (frame_index, observation_index) in family_observations {
-            let observation = &frames[frame_index][observation_index];
-            let instance_count = frames[frame_index]
-                .iter()
-                .filter(|candidate| candidate.name_key == observation.name_key)
-                .count();
-            let candidates = candidate_map
-                .get(&(frame_index, observation_index))
-                .cloned()
-                .unwrap_or_default();
-            let selected_track = locked
-                .get(&(frame_index, observation_index))
-                .copied()
-                .or_else(|| selected.get(&(frame_index, observation_index)).copied());
-            let Some(track_id) = selected_track else {
-                create_family_new_track(
-                    &mut FamilyAssignmentContext {
-                        tracks,
-                        frame_count,
-                        selectors,
-                        decisions,
-                        preassigned,
-                    },
-                    observation,
-                    &candidates,
-                    false,
-                    instance_count,
-                    max_instances > 1,
-                );
-                continue;
-            };
-            let is_locked = locked.contains_key(&(frame_index, observation_index));
-            let score = candidates
-                .iter()
-                .find(|(candidate, _)| *candidate == track_id)
-                .map_or(if is_locked { 100 } else { 0 }, |(_, score)| *score);
-            let second = candidates
-                .iter()
-                .filter(|(candidate, _)| *candidate != track_id)
-                .map(|(_, score)| *score)
-                .max()
-                .unwrap_or(0);
-            let exact_name = candidates
-                .iter()
-                .filter(|(candidate, _)| {
-                    tracks[*candidate].normalized_name == observation.normalized_name
-                })
-                .count()
-                == 1;
-            let exact_pixels = tracks[track_id].observations.iter().any(|previous| {
-                previous.width == observation.width
-                    && previous.height == observation.height
-                    && previous.pixels == observation.pixels
-            });
-            let new_slot = tracks[track_id].observations.is_empty();
-            let tied = matching
-                .tied_observations
-                .contains(&(frame_index, observation_index));
-            let multi_instance_family = max_instances > 1;
-            if is_locked
-                || (new_slot && tied)
-                || exact_name
-                || (multi_instance_family && exact_pixels)
-                || (!multi_instance_family && score >= 75 && score.saturating_sub(second) >= 15)
-            {
-                let phase = if new_slot {
-                    AssociationPhase::NewTrack
-                } else {
-                    AssociationPhase::Family
-                };
-                let status = if phase == AssociationPhase::NewTrack {
-                    AssociationDecisionStatus::NewTrack
-                } else {
-                    AssociationDecisionStatus::Inferred
-                };
-                record_family_assignment(
-                    &mut FamilyAssignmentContext {
-                        tracks,
-                        frame_count,
-                        selectors,
-                        decisions,
-                        preassigned,
-                    },
-                    observation,
-                    track_id,
-                    AssignmentMetadata {
-                        score,
-                        margin: score.saturating_sub(second),
-                        phase,
-                        matching_tie: tied,
-                    },
-                    status,
-                    &candidates,
-                    instance_count,
-                );
-            } else {
-                create_family_new_track(
-                    &mut FamilyAssignmentContext {
-                        tracks,
-                        frame_count,
-                        selectors,
-                        decisions,
-                        preassigned,
-                    },
-                    observation,
-                    &candidates,
-                    tied,
-                    instance_count,
-                    max_instances > 1,
-                );
-            }
-        }
-    }
-}
-
-fn record_family_assignment<'doc>(
-    context: &mut FamilyAssignmentContext<'_, 'doc>,
-    observation: &Observation<'doc>,
-    track_id: usize,
-    metadata: AssignmentMetadata,
-    status: AssociationDecisionStatus,
-    candidates: &[(usize, u16)],
-    instance_count: usize,
-) {
-    record_assignment(
-        &mut context.tracks[track_id],
-        observation,
-        PlannedCel {
-            source_layer_id: observation.source_layer_id,
-            source_frame_index: observation.frame_index as u32,
-            z_index: 0,
-        },
-    );
-    context.preassigned.insert(
-        (observation.frame_index, observation.source_layer_id),
-        track_id,
-    );
-    let mut association_decision = decision(
-        observation,
-        track_id,
-        status,
-        metadata.score,
-        metadata.margin,
-        evidence_for(
-            observation,
-            &context.tracks[track_id],
-            metadata.score,
-            context.selectors,
-        ),
-        candidate_names(candidates, context.tracks, track_id),
-    );
-    association_decision.association_phase = metadata.phase;
-    association_decision.same_frame_instance_count = instance_count;
-    association_decision.matching_tie = metadata.matching_tie;
-    association_decision.exclusion_evidence =
-        exclusion_evidence(observation, &context.tracks[track_id], context.selectors);
-    context.decisions.push(association_decision);
-}
-
-fn create_family_new_track<'doc>(
-    context: &mut FamilyAssignmentContext<'_, 'doc>,
-    observation: &Observation<'doc>,
-    candidates: &[(usize, u16)],
-    matching_tie: bool,
-    instance_count: usize,
-    conservative_multi_instance: bool,
-) {
-    let track_id = context.tracks.len();
-    context
-        .tracks
-        .push(new_track(track_id, observation, context.frame_count));
-    let mut association_decision = decision(
-        observation,
-        track_id,
-        if candidates.is_empty() && !matching_tie {
-            AssociationDecisionStatus::NewTrack
+        let (track_id, status, evidence) = if matching_tracks.len() == 1 {
+            (
+                matching_tracks[0],
+                AssociationDecisionStatus::Strong,
+                vec!["exact source-layer identity".to_string()],
+            )
         } else {
-            AssociationDecisionStatus::Ambiguous
-        },
-        candidates.first().map_or(0, |(_, score)| *score),
-        candidates
-            .first()
-            .zip(candidates.get(1))
-            .map_or(0, |((_, best), (_, second))| best.saturating_sub(*second)),
-        vec!["family association created a separate track".to_string()],
-        candidate_names(candidates, context.tracks, track_id),
-    );
-    association_decision.association_phase = AssociationPhase::NewTrack;
-    association_decision.same_frame_instance_count = instance_count;
-    association_decision.matching_tie = matching_tie;
-    association_decision.rejection_reasons = rejection_reasons(
-        candidates,
-        association_decision.status,
-        matching_tie,
-        instance_count,
-    );
-    if conservative_multi_instance {
-        association_decision
-            .rejection_reasons
-            .push("multi-instance family lacked exact identity evidence".to_string());
+            let track_id = tracks.len();
+            tracks.push(new_track(track_id, observation, frame_count));
+            (
+                track_id,
+                AssociationDecisionStatus::NewTrack,
+                vec!["synthetic-frame identity unproven".to_string()],
+            )
+        };
+        let mut association_decision = decision(
+            observation,
+            track_id,
+            status,
+            if status == AssociationDecisionStatus::Strong {
+                100
+            } else {
+                0
+            },
+            100,
+            evidence,
+            Vec::new(),
+        );
+        association_decision.association_phase = if status == AssociationDecisionStatus::Strong {
+            AssociationPhase::Family
+        } else {
+            AssociationPhase::NewTrack
+        };
+        decisions.push(association_decision);
+        record_assignment(
+            &mut tracks[track_id],
+            observation,
+            PlannedCel {
+                source_layer_id: observation.source_layer_id,
+                source_frame_index: observation.frame_index as u32,
+                z_index: 0,
+            },
+        );
     }
-    association_decision.exclusion_evidence =
-        exclusion_evidence(observation, &context.tracks[track_id], context.selectors);
-    context.decisions.push(association_decision);
-    record_assignment(
-        &mut context.tracks[track_id],
-        observation,
-        PlannedCel {
-            source_layer_id: observation.source_layer_id,
-            source_frame_index: observation.frame_index as u32,
-            z_index: 0,
-        },
-    );
-    context.preassigned.insert(
-        (observation.frame_index, observation.source_layer_id),
-        track_id,
-    );
 }
 
-/// Associates one frame using the compact baseline algorithm from 651eb65.
 fn associate_frame_compact<'doc>(
     observations: &[Observation<'doc>],
     tracks: &mut Vec<TrackBuilder<'doc>>,
     frame_count: usize,
+    selectors: &HashMap<u32, FrameContainerInfo>,
+    protect_new_generic_batches: bool,
+    allow_order_crossings: bool,
     decisions: &mut Vec<AssociationDecision>,
 ) {
     if observations.is_empty() {
@@ -579,6 +259,26 @@ fn associate_frame_compact<'doc>(
     let mut assigned = vec![None; observations.len()];
     let mut used_tracks = HashSet::new();
     let mut strong_assignments = HashSet::new();
+    // Conservative mode treats several previously unseen generic names that
+    // appear together as a new effect batch, rather than letting empty slots
+    // in unrelated named tracks define their identities.
+    let new_generic_observations = observations
+        .iter()
+        .enumerate()
+        .filter(|(_, observation)| {
+            observation.generic_name
+                && !decisions
+                    .iter()
+                    .any(|decision| decision.normalized_name == observation.normalized_name)
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let protected_generic_observations =
+        if protect_new_generic_batches && new_generic_observations.len() >= 2 {
+            new_generic_observations.into_iter().collect::<HashSet<_>>()
+        } else {
+            HashSet::new()
+        };
 
     for (observation_index, observation) in observations.iter().enumerate() {
         if observation.generic_name {
@@ -588,8 +288,16 @@ fn associate_frame_compact<'doc>(
             .iter()
             .filter(|track| {
                 !used_tracks.contains(&track.id)
-                    && track.name_key == observation.name_key
+                    && track.normalized_name == observation.normalized_name
                     && identity_allowed(observation, track)
+                    && candidate_order_safe(
+                        observation_index,
+                        track.id,
+                        observations,
+                        tracks,
+                        &assigned,
+                        allow_order_crossings,
+                    )
             })
             .map(|track| track.id)
             .collect::<Vec<_>>();
@@ -602,7 +310,9 @@ fn associate_frame_compact<'doc>(
     }
 
     for (observation_index, observation) in observations.iter().enumerate() {
-        if assigned[observation_index].is_some() {
+        if assigned[observation_index].is_some()
+            || protected_generic_observations.contains(&observation_index)
+        {
             continue;
         }
         let candidates = tracks
@@ -615,6 +325,14 @@ fn associate_frame_compact<'doc>(
                             && previous.pixels == observation.pixels
                     })
                     && identity_allowed(observation, track)
+                    && candidate_order_safe(
+                        observation_index,
+                        track.id,
+                        observations,
+                        tracks,
+                        &assigned,
+                        allow_order_crossings,
+                    )
             })
             .map(|track| track.id)
             .collect::<Vec<_>>();
@@ -643,9 +361,23 @@ fn associate_frame_compact<'doc>(
     let mut candidate_map = HashMap::new();
     for observation_index in &residual_observations {
         let observation = &observations[*observation_index];
+        if protected_generic_observations.contains(observation_index) {
+            candidate_map.insert(*observation_index, Vec::new());
+            continue;
+        }
         let mut candidates = residual_tracks
             .iter()
-            .filter(|track_id| identity_allowed(observation, &tracks[**track_id]))
+            .filter(|track_id| {
+                compact_candidate_allowed(observation, &tracks[**track_id], selectors)
+                    && candidate_order_safe(
+                        *observation_index,
+                        **track_id,
+                        observations,
+                        tracks,
+                        &assigned,
+                        allow_order_crossings,
+                    )
+            })
             .map(|track_id| {
                 (
                     *track_id,
@@ -657,37 +389,17 @@ fn associate_frame_compact<'doc>(
         candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         candidate_map.insert(*observation_index, candidates);
     }
-    let solutions = if residual_observations.len() == 1
-        && residual_tracks.len() == 1
-        && candidate_map
-            .get(&residual_observations[0])
-            .is_some_and(|candidates| !candidates.is_empty())
-    {
-        vec![vec![(residual_observations[0], residual_tracks[0])]]
+    let (residual_assignments, matching_ties) =
+        find_best_weighted_matching(&residual_observations, &candidate_map, |_, track| track);
+    let residual_assignments = if allow_order_crossings {
+        residual_assignments
     } else {
-        find_unique_matchings(&residual_observations, &candidate_map, 2)
+        resolve_order_crossings(residual_assignments, observations, tracks, &candidate_map)
     };
-    if solutions.len() == 1 {
-        for (observation_index, track_id) in &solutions[0] {
-            let candidates = candidate_map
-                .get(observation_index)
-                .cloned()
-                .unwrap_or_default();
-            let best = candidates
-                .iter()
-                .find(|(candidate, _)| candidate == track_id)
-                .map(|(_, score)| *score);
-            let second = candidates
-                .iter()
-                .find(|(candidate, _)| candidate != track_id)
-                .map_or(0, |(_, score)| *score);
-            let is_unique_residual = residual_observations.len() == 1 && residual_tracks.len() == 1;
-            if is_unique_residual
-                || best.is_some_and(|score| score >= 75 && score.saturating_sub(second) >= 15)
-            {
-                assigned[*observation_index] = Some(*track_id);
-                used_tracks.insert(*track_id);
-            }
+    for (observation_index, track_id) in residual_assignments {
+        if !matching_ties.contains(&observation_index) {
+            assigned[observation_index] = Some(track_id);
+            used_tracks.insert(track_id);
         }
     }
 
@@ -725,6 +437,21 @@ fn associate_frame_compact<'doc>(
                 } else {
                     AssociationPhase::Residual
                 };
+            if !strong_assignments.contains(&observation_index) {
+                association_decision
+                    .evidence
+                    .push("order-safe global assignment".to_string());
+            }
+            association_decision.exclusion_evidence =
+                exclusion_evidence(observation, &tracks[track_id], selectors);
+            if observation.generic_name
+                && association_decision.exclusion_evidence
+                    == AssociationExclusionKind::StructuralMutualExclusion
+            {
+                association_decision
+                    .evidence
+                    .push("structural-empty-slot".to_string());
+            }
             decisions.push(association_decision);
             track_id
         } else {
@@ -739,12 +466,11 @@ fn associate_frame_compact<'doc>(
                 .map_or(score, |((_, best), (_, second))| {
                     best.saturating_sub(*second)
                 });
-            let status =
-                if !candidates.is_empty() && (solutions.len() > 1 || score < 75 || margin < 15) {
-                    AssociationDecisionStatus::Ambiguous
-                } else {
-                    AssociationDecisionStatus::NewTrack
-                };
+            let status = if !candidates.is_empty() && matching_ties.contains(&observation_index) {
+                AssociationDecisionStatus::Ambiguous
+            } else {
+                AssociationDecisionStatus::NewTrack
+            };
             let track_id = tracks.len();
             tracks.push(new_track(track_id, observation, frame_count));
             let mut association_decision = decision(
@@ -753,7 +479,9 @@ fn associate_frame_compact<'doc>(
                 status,
                 score,
                 margin,
-                if status == AssociationDecisionStatus::Ambiguous {
+                if protected_generic_observations.contains(&observation_index) {
+                    vec!["new-generic-batch-protected".to_string()]
+                } else if status == AssociationDecisionStatus::Ambiguous {
                     vec!["candidate margin below safe threshold".to_string()]
                 } else {
                     vec!["no safe existing track".to_string()]
@@ -776,6 +504,114 @@ fn associate_frame_compact<'doc>(
     }
 }
 
+/// Allows global named candidates while keeping generic and metadata identities conservative.
+fn compact_candidate_allowed(
+    observation: &Observation,
+    track: &TrackBuilder,
+    selectors: &HashMap<u32, FrameContainerInfo>,
+) -> bool {
+    if !identity_allowed(observation, track) {
+        return false;
+    }
+    if observation.generic_name || track.generic_name {
+        return exclusion_evidence(observation, track, selectors)
+            == AssociationExclusionKind::StructuralMutualExclusion;
+    }
+    true
+}
+
+/// Rejects order crossings that can change pixels in the current frame.
+fn candidate_order_safe(
+    observation_index: usize,
+    track_id: usize,
+    observations: &[Observation],
+    tracks: &[TrackBuilder],
+    assigned: &[Option<usize>],
+    allow_order_crossings: bool,
+) -> bool {
+    if allow_order_crossings {
+        return true;
+    }
+    let candidate_order = median_order(&tracks[track_id]).unwrap_or(observation_index as i32);
+    assigned
+        .iter()
+        .enumerate()
+        .filter_map(|(other_index, other_track)| other_track.map(|track| (other_index, track)))
+        .all(|(other_index, other_track)| {
+            let other_order = median_order(&tracks[other_track]).unwrap_or(other_index as i32);
+            let source_relation = observation_index.cmp(&other_index);
+            let track_relation = candidate_order.cmp(&other_order);
+            source_relation == track_relation
+                || source_relation == std::cmp::Ordering::Equal
+                || track_relation == std::cmp::Ordering::Equal
+                || !alpha_overlap(&observations[observation_index], &observations[other_index])
+        })
+}
+
+/// Removes or swaps residual assignments whose effective layer order would change pixels.
+fn resolve_order_crossings(
+    mut assignments: Vec<(usize, usize)>,
+    observations: &[Observation],
+    tracks: &[TrackBuilder],
+    candidates: &HashMap<usize, Vec<(usize, u16)>>,
+) -> Vec<(usize, usize)> {
+    loop {
+        let mut changed = false;
+        'pairs: for left in 0..assignments.len() {
+            for right in left + 1..assignments.len() {
+                let (left_observation, left_track) = assignments[left];
+                let (right_observation, right_track) = assignments[right];
+                let source_crosses = left_observation.cmp(&right_observation)
+                    != median_order(&tracks[left_track]).cmp(&median_order(&tracks[right_track]));
+                if !source_crosses
+                    || !alpha_overlap(
+                        &observations[left_observation],
+                        &observations[right_observation],
+                    )
+                {
+                    continue;
+                }
+                let can_swap = candidates
+                    .get(&left_observation)
+                    .is_some_and(|values| values.iter().any(|(track, _)| *track == right_track))
+                    && candidates
+                        .get(&right_observation)
+                        .is_some_and(|values| values.iter().any(|(track, _)| *track == left_track));
+                if can_swap {
+                    assignments[left].1 = right_track;
+                    assignments[right].1 = left_track;
+                } else {
+                    let left_score = candidate_edge_score(candidates, left_observation, left_track);
+                    let right_score =
+                        candidate_edge_score(candidates, right_observation, right_track);
+                    assignments.remove(if left_score <= right_score {
+                        left
+                    } else {
+                        right
+                    });
+                }
+                changed = true;
+                break 'pairs;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    assignments
+}
+
+fn candidate_edge_score(
+    candidates: &HashMap<usize, Vec<(usize, u16)>>,
+    observation: usize,
+    track: usize,
+) -> u16 {
+    candidates
+        .get(&observation)
+        .and_then(|values| values.iter().find(|(candidate, _)| *candidate == track))
+        .map_or(0, |(_, score)| *score)
+}
+
 /// Scores a compact-mode candidate with the historical 651eb65 weights.
 fn compact_candidate_score(
     observation: &Observation,
@@ -783,8 +619,10 @@ fn compact_candidate_score(
     frame_observations: &[Observation],
 ) -> u16 {
     let name_available = !observation.generic_name && !track.generic_name;
-    let name = if name_available && observation.name_key == track.name_key {
-        30
+    let name = if name_available && observation.normalized_name == track.normalized_name {
+        20
+    } else if name_available && observation.name_key == track.name_key {
+        5
     } else {
         0
     };
@@ -816,7 +654,7 @@ fn compact_candidate_score(
         0
     };
     let score = u32::from(name + group_match + order + geometry + pixels);
-    let available_weight = if name_available { 100 } else { 70 };
+    let available_weight = if name_available { 90 } else { 70 };
     ((score * 100) / available_weight).min(100) as u16
 }
 
@@ -827,8 +665,10 @@ fn compact_evidence_for(
     score: u16,
 ) -> Vec<String> {
     let mut evidence = Vec::new();
-    if !observation.generic_name && observation.name_key == track.name_key {
+    if !observation.generic_name && observation.normalized_name == track.normalized_name {
         evidence.push("normalized name".to_string());
+    } else if !observation.generic_name && observation.name_key == track.name_key {
+        evidence.push("copy-name family".to_string());
     }
     if track
         .group_paths
@@ -850,569 +690,11 @@ fn compact_evidence_for(
     evidence
 }
 
-fn associate_frame<'doc>(
-    observations: &[Observation<'doc>],
-    tracks: &mut Vec<TrackBuilder<'doc>>,
-    frame_count: usize,
-    selectors: &HashMap<u32, FrameContainerInfo>,
-    decisions: &mut Vec<AssociationDecision>,
-    preassigned: &HashMap<(usize, u32), usize>,
-) {
-    if observations.is_empty() {
-        return;
-    }
-    let mut assigned = observations
-        .iter()
-        .map(|observation| {
-            preassigned
-                .get(&(observation.frame_index, observation.source_layer_id))
-                .copied()
-        })
-        .collect::<Vec<_>>();
-    let mut assignment_metadata = vec![None; observations.len()];
-    let mut used_tracks = assigned.iter().flatten().copied().collect::<HashSet<_>>();
-    let mut candidate_map = HashMap::<usize, Vec<(usize, u16)>>::new();
-    let mut family_handled = HashSet::new();
-    let mut matching_ties = HashSet::new();
-
-    // Lock an exact normalized name only when it identifies one currently
-    // available track. This remains a strong signal without consuming one of
-    // several same-frame family instances arbitrarily.
-    for (observation_index, observation) in observations.iter().enumerate() {
-        if observation.generic_name {
-            continue;
-        }
-        let candidates = tracks
-            .iter()
-            .filter(|track| {
-                !used_tracks.contains(&track.id)
-                    && track.cels[observation.frame_index].is_none()
-                    && !track.generic_name
-                    && observation.normalized_name == track.normalized_name
-                    && identity_allowed(observation, track)
-            })
-            .map(|track| track.id)
-            .collect::<Vec<_>>();
-        candidate_map.insert(
-            observation_index,
-            candidates.iter().map(|track_id| (*track_id, 100)).collect(),
-        );
-        if candidates.len() == 1 {
-            let track_id = candidates[0];
-            assigned[observation_index] = Some(track_id);
-            used_tracks.insert(track_id);
-            assignment_metadata[observation_index] = Some(AssignmentMetadata {
-                score: 100,
-                margin: 100,
-                phase: AssociationPhase::Family,
-                matching_tie: false,
-            });
-        }
-    }
-
-    // Exact pixels can identify a track even when a drawing tool renamed the
-    // layer. It is deliberately performed before family matching.
-    for (observation_index, observation) in observations.iter().enumerate() {
-        if assigned[observation_index].is_some() {
-            continue;
-        }
-        let candidates = tracks
-            .iter()
-            .filter(|track| {
-                !used_tracks.contains(&track.id)
-                    && track.observations.iter().any(|previous| {
-                        previous.width == observation.width
-                            && previous.height == observation.height
-                            && previous.pixels == observation.pixels
-                    })
-                    && identity_allowed(observation, track)
-            })
-            .map(|track| track.id)
-            .collect::<Vec<_>>();
-        candidate_map.insert(
-            observation_index,
-            candidates.iter().map(|track_id| (*track_id, 100)).collect(),
-        );
-        if candidates.len() == 1 {
-            let track_id = candidates[0];
-            assigned[observation_index] = Some(track_id);
-            used_tracks.insert(track_id);
-            assignment_metadata[observation_index] = Some(AssignmentMetadata {
-                score: 100,
-                margin: 100,
-                phase: AssociationPhase::ExactPixels,
-                matching_tie: false,
-            });
-        }
-    }
-
-    // Match every non-generic name family as a small assignment problem. The
-    // family is processed as a whole so two observations cannot greedily
-    // consume the same logical slot across frames.
-    let mut families = BTreeMap::<String, Vec<usize>>::new();
-    for (index, observation) in observations.iter().enumerate() {
-        if assigned[index].is_none() && !observation.generic_name {
-            families
-                .entry(observation.name_key.clone())
-                .or_default()
-                .push(index);
-        }
-    }
-    for (family_key, family_observations) in families {
-        let available_tracks = tracks
-            .iter()
-            .filter(|track| {
-                !used_tracks.contains(&track.id)
-                    && !track.generic_name
-                    && track.name_key == family_key
-                    && track.cels[observations[family_observations[0]].frame_index].is_none()
-                    && identity_allowed(&observations[family_observations[0]], track)
-            })
-            .map(|track| track.id)
-            .collect::<Vec<_>>();
-        for observation_index in &family_observations {
-            let observation = &observations[*observation_index];
-            let mut candidates = available_tracks
-                .iter()
-                .filter(|track_id| {
-                    tracks[**track_id].cels[observation.frame_index].is_none()
-                        && copy_family_candidate_allowed(observation, &tracks[**track_id])
-                })
-                .map(|track_id| {
-                    (
-                        *track_id,
-                        candidate_score(observation, &tracks[*track_id], observations, selectors),
-                    )
-                })
-                .filter(|(_, score)| *score >= 40)
-                .collect::<Vec<_>>();
-            candidates
-                .sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-            candidate_map.insert(*observation_index, candidates);
-            if !available_tracks.is_empty() || !observation.copy_suffixes.is_empty() {
-                family_handled.insert(*observation_index);
-            }
-        }
-
-        let matching = find_best_family_matching(&family_observations, &candidate_map);
-        matching_ties.extend(matching.tied_observations.iter().copied());
-        for (observation_index, track_id) in matching.assignments {
-            if matching.tied_observations.contains(&observation_index) {
-                continue;
-            }
-            let candidates = candidate_map
-                .get(&observation_index)
-                .cloned()
-                .unwrap_or_default();
-            let score = candidates
-                .iter()
-                .find(|(candidate, _)| *candidate == track_id)
-                .map_or(0, |(_, score)| *score);
-            let second = candidates
-                .iter()
-                .filter(|(candidate, _)| *candidate != track_id)
-                .map(|(_, score)| *score)
-                .max()
-                .unwrap_or(0);
-            let exact_name = candidates
-                .iter()
-                .filter(|(candidate, _)| {
-                    tracks[*candidate].normalized_name
-                        == observations[observation_index].normalized_name
-                })
-                .count()
-                == 1;
-            if exact_name || (score >= 75 && score.saturating_sub(second) >= 15) {
-                assigned[observation_index] = Some(track_id);
-                used_tracks.insert(track_id);
-                assignment_metadata[observation_index] = Some(AssignmentMetadata {
-                    score,
-                    margin: score.saturating_sub(second),
-                    phase: AssociationPhase::Family,
-                    matching_tie: false,
-                });
-            }
-        }
-    }
-
-    let residual_observations = observations
-        .iter()
-        .enumerate()
-        .filter(|(index, observation)| {
-            assigned[*index].is_none()
-                && !family_handled.contains(index)
-                && (observation.generic_name || observation.copy_suffixes.is_empty())
-        })
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    let residual_tracks = tracks
-        .iter()
-        .filter(|track| {
-            !used_tracks.contains(&track.id) && track.cels[observations[0].frame_index].is_none()
-        })
-        .map(|track| track.id)
-        .collect::<Vec<_>>();
-
-    for observation_index in &residual_observations {
-        let observation = &observations[*observation_index];
-        let mut candidates = residual_tracks
-            .iter()
-            .filter(|track_id| copy_family_candidate_allowed(observation, &tracks[**track_id]))
-            .map(|track_id| {
-                let score =
-                    candidate_score(observation, &tracks[*track_id], observations, selectors);
-                (*track_id, score)
-            })
-            .filter(|(_, score)| *score >= 40)
-            .collect::<Vec<_>>();
-        candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        candidate_map.insert(*observation_index, candidates);
-    }
-    let solutions = if residual_observations.len() == 1 && residual_tracks.len() == 1 {
-        if candidate_map
-            .get(&residual_observations[0])
-            .is_some_and(|candidates| !candidates.is_empty())
-        {
-            vec![vec![(residual_observations[0], residual_tracks[0])]]
-        } else {
-            Vec::new()
-        }
-    } else {
-        find_unique_matchings(&residual_observations, &candidate_map, 2)
-    };
-    if solutions.len() == 1 {
-        for (observation_index, track_id) in &solutions[0] {
-            let candidates = candidate_map
-                .get(observation_index)
-                .cloned()
-                .unwrap_or_default();
-            let best = candidates
-                .iter()
-                .find(|(candidate, _)| candidate == track_id)
-                .map(|(_, score)| *score);
-            let second = candidates
-                .iter()
-                .find(|(candidate, _)| candidate != track_id)
-                .map_or(0, |(_, score)| *score);
-            let is_unique_residual = residual_observations.len() == 1 && residual_tracks.len() == 1;
-            if is_unique_residual
-                || best.is_some_and(|score| score >= 75 && score.saturating_sub(second) >= 15)
-            {
-                assigned[*observation_index] = Some(*track_id);
-                used_tracks.insert(*track_id);
-                let candidates = candidate_map
-                    .get(observation_index)
-                    .cloned()
-                    .unwrap_or_default();
-                let score = candidates
-                    .iter()
-                    .find(|(candidate, _)| candidate == track_id)
-                    .map_or(100, |(_, score)| *score);
-                let second = candidates
-                    .iter()
-                    .filter(|(candidate, _)| candidate != track_id)
-                    .map(|(_, score)| *score)
-                    .max()
-                    .unwrap_or(0);
-                assignment_metadata[*observation_index] = Some(AssignmentMetadata {
-                    score,
-                    margin: score.saturating_sub(second),
-                    phase: AssociationPhase::Residual,
-                    matching_tie: false,
-                });
-            }
-        }
-    }
-
-    for (observation_index, observation) in observations.iter().enumerate() {
-        if preassigned.contains_key(&(observation.frame_index, observation.source_layer_id)) {
-            continue;
-        }
-        let track_id = if let Some(track_id) = assigned[observation_index] {
-            let candidates = candidate_map
-                .get(&observation_index)
-                .cloned()
-                .unwrap_or_default();
-            let metadata = assignment_metadata[observation_index].unwrap_or(AssignmentMetadata {
-                score: candidates
-                    .iter()
-                    .find(|(candidate, _)| *candidate == track_id)
-                    .map_or(100, |(_, value)| *value),
-                margin: 100,
-                phase: AssociationPhase::Residual,
-                matching_tie: false,
-            });
-            let status = if matches!(
-                metadata.phase,
-                AssociationPhase::Anchor | AssociationPhase::ExactPixels
-            ) {
-                AssociationDecisionStatus::Strong
-            } else {
-                AssociationDecisionStatus::Inferred
-            };
-            let evidence = evidence_for(observation, &tracks[track_id], metadata.score, selectors);
-            let exclusion = exclusion_evidence(observation, &tracks[track_id], selectors);
-            let mut association_decision = decision(
-                observation,
-                track_id,
-                status,
-                metadata.score,
-                metadata.margin,
-                evidence,
-                candidate_names(&candidates, tracks, track_id),
-            );
-            association_decision.association_phase = metadata.phase;
-            association_decision.same_frame_instance_count = observations
-                .iter()
-                .filter(|candidate| candidate.name_key == observation.name_key)
-                .count();
-            association_decision.matching_tie =
-                metadata.matching_tie || matching_ties.contains(&observation_index);
-            association_decision.rejection_reasons = rejection_reasons(
-                &candidates,
-                status,
-                association_decision.matching_tie,
-                association_decision.same_frame_instance_count,
-            );
-            association_decision.exclusion_evidence = exclusion;
-            decisions.push(association_decision);
-            track_id
-        } else {
-            let candidates = candidate_map
-                .get(&observation_index)
-                .cloned()
-                .unwrap_or_default();
-            let score = candidates.first().map_or(0, |(_, score)| *score);
-            let margin = candidates
-                .first()
-                .zip(candidates.get(1))
-                .map_or(score, |((_, best), (_, second))| {
-                    best.saturating_sub(*second)
-                });
-            let status =
-                if !candidates.is_empty() && (solutions.len() > 1 || score < 75 || margin < 15) {
-                    AssociationDecisionStatus::Ambiguous
-                } else {
-                    AssociationDecisionStatus::NewTrack
-                };
-            let track_id = tracks.len();
-            tracks.push(new_track(track_id, observation, frame_count));
-            let mut association_decision = decision(
-                observation,
-                track_id,
-                status,
-                score,
-                margin,
-                if status == AssociationDecisionStatus::Ambiguous {
-                    vec!["candidate margin below safe threshold".to_string()]
-                } else {
-                    vec!["no safe existing track".to_string()]
-                },
-                candidate_names(&candidates, tracks, track_id),
-            );
-            association_decision.association_phase = AssociationPhase::NewTrack;
-            association_decision.same_frame_instance_count = observations
-                .iter()
-                .filter(|candidate| candidate.name_key == observation.name_key)
-                .count();
-            association_decision.matching_tie =
-                solutions.len() > 1 || matching_ties.contains(&observation_index);
-            association_decision.rejection_reasons = rejection_reasons(
-                &candidates,
-                status,
-                association_decision.matching_tie,
-                association_decision.same_frame_instance_count,
-            );
-            decisions.push(association_decision);
-            track_id
-        };
-        record_assignment(
-            &mut tracks[track_id],
-            observation,
-            PlannedCel {
-                source_layer_id: observation.source_layer_id,
-                source_frame_index: observation.frame_index as u32,
-                z_index: 0,
-            },
-        );
-    }
-}
-
-fn find_unique_matchings(
-    observations: &[usize],
-    candidates: &HashMap<usize, Vec<(usize, u16)>>,
-    limit: usize,
-) -> Vec<Vec<(usize, usize)>> {
-    fn visit(
-        position: usize,
-        observations: &[usize],
-        candidates: &HashMap<usize, Vec<(usize, u16)>>,
-        used: &mut HashSet<usize>,
-        current: &mut Vec<(usize, usize)>,
-        solutions: &mut Vec<Vec<(usize, usize)>>,
-        limit: usize,
-    ) {
-        if solutions.len() >= limit {
-            return;
-        }
-        if position == observations.len() {
-            solutions.push(current.clone());
-            return;
-        }
-        let observation = observations[position];
-        for (track_id, _) in candidates.get(&observation).into_iter().flatten() {
-            if used.insert(*track_id) {
-                current.push((observation, *track_id));
-                visit(
-                    position + 1,
-                    observations,
-                    candidates,
-                    used,
-                    current,
-                    solutions,
-                    limit,
-                );
-                current.pop();
-                used.remove(track_id);
-            }
-        }
-    }
-
-    let mut solutions = Vec::new();
-    visit(
-        0,
-        observations,
-        candidates,
-        &mut HashSet::new(),
-        &mut Vec::new(),
-        &mut solutions,
-        limit,
-    );
-    solutions
-}
-
-/// Finds the highest-scoring one-to-one assignment for one name family.
-fn find_best_family_matching(
-    observations: &[usize],
-    candidates: &HashMap<usize, Vec<(usize, u16)>>,
-) -> FamilyMatching {
-    let (assignments, tied_observations) =
-        find_best_weighted_matching(observations, candidates, |_, track| track);
-    FamilyMatching {
-        assignments,
-        tied_observations,
-    }
-}
-
-/// Finds a maximum-weight family assignment while enforcing one track per
-/// frame. The key also keeps observations from different frames independent.
-fn find_best_global_family_matching(
-    observations: &[(usize, usize)],
-    candidates: &HashMap<(usize, usize), Vec<(usize, u16)>>,
-) -> GlobalFamilyMatching {
-    let (assignments, tied_observations) =
-        find_best_weighted_matching(observations, candidates, |observation, track| {
-            (observation.0, track)
-        });
-    GlobalFamilyMatching {
-        assignments,
-        tied_observations,
-    }
-}
-
-fn candidate_score(
-    observation: &Observation,
-    track: &TrackBuilder,
-    frame_observations: &[Observation],
-    selectors: &HashMap<u32, FrameContainerInfo>,
-) -> u16 {
-    let exclusion = exclusion_evidence(observation, track, selectors);
-    let name_available = !observation.generic_name && !track.generic_name;
-    let name = name_match_score(observation, track);
-    let group_match = track
-        .group_paths
-        .iter()
-        .map(|path| group_similarity(&observation.group_path, path))
-        .max()
-        .unwrap_or(0);
-    let rank = frame_observations
-        .iter()
-        .position(|candidate| candidate.source_layer_id == observation.source_layer_id)
-        .unwrap_or(0) as i32;
-    let median = median_order(track).unwrap_or(rank);
-    let order = if exclusion == AssociationExclusionKind::StructuralMutualExclusion {
-        0
-    } else {
-        20u16.saturating_sub((rank - median).unsigned_abs().min(5) as u16 * 4)
-    };
-
-    let geometry = track
-        .observations
-        .iter()
-        .map(|previous| geometry_similarity(observation, previous))
-        .max()
-        .unwrap_or(0);
-
-    let pixels = if track.observations.iter().any(|previous| {
-        previous.width == observation.width
-            && previous.height == observation.height
-            && previous.pixels == observation.pixels
-    }) {
-        10
-    } else {
-        0
-    };
-    let exclusion_score = match exclusion {
-        AssociationExclusionKind::StructuralMutualExclusion => 30,
-        AssociationExclusionKind::ObservedDisjoint => 5,
-        AssociationExclusionKind::None | AssociationExclusionKind::CoVisible => 0,
-    };
-    let score = u32::from(name + group_match + order + geometry + pixels + exclusion_score);
-    let available_weight = if !name_available {
-        70
-    } else if observation.copy_suffixes.is_empty() && track.copy_suffixes.is_empty() {
-        100
-    } else {
-        85
-    };
-    ((score * 100) / available_weight).min(100) as u16
-}
-
-fn copy_family_candidate_allowed(observation: &Observation, track: &TrackBuilder) -> bool {
-    if !identity_allowed(observation, track) {
-        return false;
-    }
-    if observation.generic_name || track.generic_name {
-        // Generic names may bridge an accidental rename only when both sides
-        // retain a persistent structural parent.  A bare top-level generic
-        // layer remains a separate candidate instead of becoming a semantic
-        // role by elimination.
-        return !observation.group_path.is_empty()
-            && track
-                .group_paths
-                .iter()
-                .any(|path| path == &observation.group_path);
-    }
-    observation.name_key == track.name_key
-}
-
-/// Prevents automatic association from merging unrelated Photoshop metadata sources.
 fn identity_allowed(observation: &Observation, track: &TrackBuilder) -> bool {
     (!observation.metadata_locked && !track.metadata_locked)
         || (observation.metadata_locked
             && track.metadata_locked
             && observation.source_layer_id == track.representative_source_layer_id)
-}
-
-fn name_match_score(observation: &Observation, track: &TrackBuilder) -> u16 {
-    if observation.generic_name || track.generic_name || observation.name_key != track.name_key {
-        return 0;
-    }
-    if observation.normalized_name == track.normalized_name {
-        30
-    } else {
-        15
-    }
 }
 
 fn exclusion_evidence(
@@ -1512,53 +794,6 @@ fn median_order(track: &TrackBuilder) -> Option<i32> {
     values.get(values.len() / 2).copied()
 }
 
-fn evidence_for(
-    observation: &Observation,
-    track: &TrackBuilder,
-    score: u16,
-    selectors: &HashMap<u32, FrameContainerInfo>,
-) -> Vec<String> {
-    let mut evidence = Vec::new();
-    if !observation.generic_name
-        && !track.generic_name
-        && observation.normalized_name == track.normalized_name
-    {
-        evidence.push("normalized name".to_string());
-    } else if name_match_score(observation, track) > 0 {
-        evidence.push(format!(
-            "copy-name family ({})",
-            format_copy_suffixes(&observation.copy_suffixes)
-        ));
-    }
-    if track
-        .group_paths
-        .iter()
-        .any(|path| group_similarity(&observation.group_path, path) >= 20)
-    {
-        evidence.push("persistent group path".to_string());
-    }
-    if track.observations.iter().any(|previous| {
-        previous.width == observation.width
-            && previous.height == observation.height
-            && previous.pixels == observation.pixels
-    }) {
-        evidence.push("exact RGBA pixels".to_string());
-    }
-    if score >= 40 {
-        evidence.push("geometry/order context".to_string());
-    }
-    match exclusion_evidence(observation, track, selectors) {
-        AssociationExclusionKind::ObservedDisjoint => {
-            evidence.push("observed frame-disjoint hint".to_string());
-        }
-        AssociationExclusionKind::StructuralMutualExclusion => {
-            evidence.push("structural frame-container exclusion hint".to_string());
-        }
-        AssociationExclusionKind::None | AssociationExclusionKind::CoVisible => {}
-    }
-    evidence
-}
-
 pub(super) fn candidate_names(
     candidates: &[(usize, u16)],
     tracks: &[TrackBuilder],
@@ -1642,38 +877,6 @@ pub(super) fn decision(
         evidence,
         alternatives,
     }
-}
-
-pub(super) fn rejection_reasons(
-    candidates: &[(usize, u16)],
-    status: AssociationDecisionStatus,
-    matching_tie: bool,
-    same_frame_instance_count: usize,
-) -> Vec<String> {
-    let mut reasons = Vec::new();
-    if same_frame_instance_count > 1 {
-        reasons.push(format!(
-            "same name family has {same_frame_instance_count} observations in this frame"
-        ));
-    }
-    if matching_tie {
-        reasons.push("family matching has multiple optimal assignments".to_string());
-    }
-    if candidates.len() > 1 {
-        reasons.push("multiple existing family candidates remain".to_string());
-    }
-    let candidate_margin = candidates.first().zip(candidates.get(1)).map_or_else(
-        || candidates.first().map_or(0, |(_, score)| *score),
-        |((_, best), (_, second))| best.saturating_sub(*second),
-    );
-    if status == AssociationDecisionStatus::Ambiguous
-        && candidates
-            .first()
-            .is_some_and(|(_, score)| *score < 75 || candidate_margin < 15)
-    {
-        reasons.push("candidate score or margin is below the safe threshold".to_string());
-    }
-    reasons
 }
 
 pub(super) fn parse_layer_name(name: &str) -> ParsedLayerName {

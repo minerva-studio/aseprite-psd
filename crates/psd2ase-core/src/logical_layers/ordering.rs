@@ -87,7 +87,9 @@ pub(super) fn stable_track_order(
         let winner = forward.max(reverse);
         let loser = forward.min(reverse);
         let total = winner + loser;
-        let confident = winner >= 2 && winner >= loser + 2 && winner * 3 >= total * 2;
+        let unanimous = winner > 0 && loser == 0;
+        let confident =
+            unanimous || (winner >= 2 && winner >= loser + 2 && winner * 3 >= total * 2);
         if !confident {
             let message = format!(
                 "stable order unresolved for tracks {} ({}) and {} ({}): support {}-{}; anchor order retained",
@@ -114,7 +116,7 @@ pub(super) fn stable_track_order(
             .get(&before)
             .zip(anchor_positions.get(&after))
             .map_or(usize::MAX, |(before, after)| before.abs_diff(*after));
-        if anchor_distance > 1 {
+        if anchor_distance > 1 && !unanimous {
             let message = format!(
                 "stable order retained anchor barrier between tracks {} ({}) and {} ({}): support {}-{}",
                 before,
@@ -323,7 +325,7 @@ fn stable_id_order(
     result
 }
 
-fn alpha_overlap(left: &Observation, right: &Observation) -> bool {
+pub(super) fn alpha_overlap(left: &Observation, right: &Observation) -> bool {
     for index in 0..left.pixels.len() / 4 {
         if left.pixels[index * 4 + 3] == 0 {
             continue;

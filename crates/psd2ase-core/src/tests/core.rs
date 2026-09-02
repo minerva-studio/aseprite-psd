@@ -128,6 +128,185 @@ fn static_frame_has_no_serialization_duration() {
 }
 
 #[test]
+fn top_level_frame_source_keeps_background_shared() {
+    let mut background = layer(
+        1,
+        NormalizedLayerKind::Pixel,
+        Some(true),
+        Vec::new(),
+        vec![state(0, true)],
+    );
+    background.name = "Background".to_string();
+    let mut first = layer(
+        2,
+        NormalizedLayerKind::Pixel,
+        Some(true),
+        Vec::new(),
+        vec![state(0, true)],
+    );
+    first.name = "First".to_string();
+    let mut hidden_child = layer(
+        4,
+        NormalizedLayerKind::Pixel,
+        Some(true),
+        Vec::new(),
+        vec![state(0, true)],
+    );
+    hidden_child.name = "Hidden child".to_string();
+    let mut second = layer(
+        3,
+        NormalizedLayerKind::Group,
+        Some(true),
+        vec![hidden_child],
+        vec![state(0, true)],
+    );
+    second.name = "Second".to_string();
+    let mut document = NormalizedDocument {
+        root_layers: vec![background, first, second],
+        frames: vec![NormalizedFrame {
+            index: 0,
+            source_id: None,
+            duration_ms: None,
+            dispose: None,
+        }],
+        ..Default::default()
+    };
+
+    let warnings = apply_frame_source(&mut document, FrameSource::TopLevel)
+        .expect("top-level frames should be constructed");
+
+    assert_eq!(document.frames.len(), 2);
+    assert_eq!(
+        document.root_layers[0]
+            .frame_states
+            .iter()
+            .map(|state| state.enabled)
+            .collect::<Vec<_>>(),
+        vec![false, false]
+    );
+    assert_eq!(
+        document.root_layers[1]
+            .frame_states
+            .iter()
+            .map(|state| state.enabled)
+            .collect::<Vec<_>>(),
+        vec![true, false]
+    );
+    assert_eq!(
+        document.root_layers[2]
+            .frame_states
+            .iter()
+            .map(|state| state.enabled)
+            .collect::<Vec<_>>(),
+        vec![false, true]
+    );
+    assert_eq!(
+        document.root_layers[2].children[0]
+            .frame_states
+            .iter()
+            .map(|state| state.enabled)
+            .collect::<Vec<_>>(),
+        vec![false, false]
+    );
+    assert!(warnings[0].contains("2 top-level frames"));
+    assert!(warnings[0].contains("Background"));
+}
+
+#[test]
+fn automatic_frame_source_does_not_infer_top_level_animation() {
+    let mut document = NormalizedDocument {
+        root_layers: vec![
+            layer(
+                1,
+                NormalizedLayerKind::Pixel,
+                None,
+                Vec::new(),
+                vec![state(0, true)],
+            ),
+            layer(
+                2,
+                NormalizedLayerKind::Group,
+                None,
+                Vec::new(),
+                vec![state(0, true)],
+            ),
+        ],
+        frames: vec![NormalizedFrame {
+            index: 0,
+            source_id: None,
+            duration_ms: None,
+            dispose: None,
+        }],
+        ..Default::default()
+    };
+
+    apply_frame_source(&mut document, FrameSource::Auto)
+        .expect("auto should preserve static input");
+
+    assert_eq!(document.frames.len(), 1);
+    assert!(
+        document
+            .root_layers
+            .iter()
+            .all(|layer| layer.frame_states[0].enabled)
+    );
+}
+
+#[test]
+fn top_level_frame_source_rejects_photoshop_timeline() {
+    let mut document = NormalizedDocument {
+        animation_resource_ids: vec![4000],
+        ..Default::default()
+    };
+    let error = apply_frame_source(&mut document, FrameSource::TopLevel)
+        .expect_err("timeline input must not be reinterpreted");
+    assert!(error.contains("cannot replace a Photoshop timeline"));
+}
+
+#[test]
+fn photoshop_frame_duration_validation_uses_ten_millisecond_quantization() {
+    assert_eq!(canonical_frame_duration_ms(83), 80);
+    assert_eq!(canonical_frame_duration_ms(65_535), 65_530);
+    assert_eq!(canonical_frame_duration_ms(84), 80);
+    assert_ne!(
+        canonical_frame_duration_ms(83),
+        canonical_frame_duration_ms(90)
+    );
+}
+
+#[test]
+fn roundtrip_preset_falls_back_to_auto_for_unmarked_documents() {
+    let (exact, association) = resolve_roundtrip_association(roundtrip::RoundTripLayout {
+        status: roundtrip::RoundTripStatus {
+            marked: false,
+            valid: true,
+        },
+        version: None,
+        frame_count: None,
+    })
+    .expect("unmarked documents should use automatic association");
+    assert!(!exact);
+    assert!(matches!(association, LayerAssociation::Auto(_)));
+}
+
+#[test]
+fn roundtrip_preset_keeps_invalid_markers_on_recovery_path() {
+    let error = resolve_roundtrip_association(roundtrip::RoundTripLayout {
+        status: roundtrip::RoundTripStatus {
+            marked: true,
+            valid: false,
+        },
+        version: Some(2),
+        frame_count: Some(2),
+    })
+    .expect_err("invalid markers must require recovery");
+    assert!(matches!(
+        error,
+        ConversionError::RoundTripRecoveryRequired(_)
+    ));
+}
+
+#[test]
 fn pixel_data_is_owned_and_keeps_origin() {
     let source = ag_psd::psd::PixelData {
         width: 1,

@@ -204,17 +204,19 @@ function Dialogs.new(process)
     }
   end
 
-  --- Returns the non-interactive defaults used when Aseprite opens a PSD directly.
-  local function default_import_options(roundtrip_marked)
+  --- Returns the defaults used by both native and menu PSD imports.
+  local function default_import_options(preferences)
     return {
       overwrite = true,
-      layer_association = roundtrip_marked and "auto" or "preserve",
+      frame_source = "auto",
+      layer_association = "auto",
+      use_roundtrip_metadata = not preferences or preferences.use_roundtrip_metadata ~= false,
       link_identical_cels = false,
       jitter_mode = "off",
       jitter_kind = "alpha",
       jitter_profile = "conservative",
       preserve_photoshop_metadata = false,
-      association_strategy = "compact",
+      association_strategy = "conservative",
       z_order = "stable",
       stable_order = "consensus",
       uncertain_layers = "group",
@@ -222,9 +224,9 @@ function Dialogs.new(process)
   end
 
   --- Shows the complete PSD import dialog and returns the selected options.
-  local function select_import_options(input_filename, roundtrip_marked)
+  local function select_import_options(input_filename, preferences)
     local dialog = Dialog{ title="Import PSD" }
-    local defaults = default_import_options(roundtrip_marked)
+    local defaults = default_import_options(preferences)
     local jitter_options = {
       jitter_mode = defaults.jitter_mode,
       jitter_kind = defaults.jitter_kind,
@@ -232,13 +234,10 @@ function Dialogs.new(process)
     }
     if not dialog then
       show_error("PSD to Aseprite", "Aseprite does not have an available UI.")
-      return nil
+      return nil, "unavailable"
     end
     if input_filename then
       dialog:label{ id="input_summary", label="PSD", text=app.fs.fileTitle(input_filename) }
-      if roundtrip_marked then
-        dialog:label{ id="roundtrip_summary", text="Round-trip metadata detected; auto association is enabled by default." }
-      end
     else
       dialog:file{
         id="input",
@@ -249,20 +248,28 @@ function Dialogs.new(process)
         filetypes={"psd", "psb"},
       }
     end
+    dialog:combobox{
+      id="frame_source",
+      label="Frame source",
+      option="Automatic",
+      options={"Automatic", "Static document", "Top-level layers as frames"},
+    }
     --- Keeps advanced association controls aligned with the selected mode.
     local function update_option_controls()
       local current = dialog.data
-      local automatic = current.layer_association == "auto"
-      dialog:modify{ id="association_strategy", enabled=automatic }
-      dialog:modify{ id="z_order", enabled=automatic }
-      dialog:modify{ id="stable_order", enabled=automatic }
-      dialog:modify{ id="link_identical_cels", enabled=automatic }
+      local automatic = current.layer_association == "Automatic association"
+      local use_metadata = current.use_roundtrip_metadata == true
+      local advanced = automatic and not use_metadata
+      dialog:modify{ id="association_strategy", enabled=advanced }
+      dialog:modify{ id="z_order", enabled=advanced }
+      dialog:modify{ id="stable_order", enabled=advanced }
+      dialog:modify{ id="link_identical_cels", enabled=advanced }
       if not automatic and current.link_identical_cels then
         dialog:modify{ id="link_identical_cels", selected=false }
       end
       dialog:modify{
         id="uncertain_layers",
-        enabled=automatic and current.association_strategy == "conservative",
+        enabled=advanced and current.association_strategy == "conservative",
       }
       if not automatic and jitter_options.jitter_kind ~= "alpha" then
         jitter_options.jitter_kind = "alpha"
@@ -272,22 +279,23 @@ function Dialogs.new(process)
     dialog:combobox{
       id="layer_association",
       label="Layer association",
-      option=defaults.layer_association,
-      options={"preserve", "auto"},
+      option=defaults.layer_association == "preserve" and "Preserve layers" or "Automatic association",
+      options={"Automatic association", "Preserve layers"},
       onchange=update_option_controls,
-    }
-    dialog:check{
-      id="link_identical_cels",
-      label="Linked cels",
-      text="Link identical cels",
-      selected=defaults.link_identical_cels,
-      enabled=false,
     }
     dialog:check{
       id="preserve_photoshop_metadata",
       label="Photoshop metadata",
-      text="Preserve metadata for PSD round-trip",
+      text="Preserve Photoshop metadata",
       selected=defaults.preserve_photoshop_metadata,
+    }
+    dialog:separator{ text="Layer association" }
+    dialog:check{
+      id="use_roundtrip_metadata",
+      label="Metadata",
+      text="Use metadata",
+      selected=defaults.use_roundtrip_metadata,
+      onclick=update_option_controls,
     }
     dialog:combobox{
       id="association_strategy",
@@ -319,6 +327,13 @@ function Dialogs.new(process)
       enabled=false,
     }
     dialog:newrow()
+    dialog:check{
+      id="link_identical_cels",
+      label="Linked cels",
+      text="Link identical cels",
+      selected=defaults.link_identical_cels,
+      enabled=false,
+    }
     dialog:button{
       id="jitter_settings",
       label="Jitter repair",
@@ -329,7 +344,7 @@ function Dialogs.new(process)
         local committed = select_jitter_options(
           dialog,
           jitter_options,
-          current.layer_association == "auto")
+          current.layer_association == "Automatic association")
         if committed then
           jitter_options = committed
           dialog:modify{ id="jitter_settings", text=jitter_summary(jitter_options) }
@@ -338,19 +353,47 @@ function Dialogs.new(process)
     }
     update_option_controls()
     dialog:newrow()
-    dialog:button{ id="import", text="Import", focus=true }
-    dialog:button{ id="cancel", text="Cancel" }
+    dialog:button{ id="import", text="Import", focus=true, hexpand=false }
+    dialog:button{ id="cancel", text="Cancel", hexpand=false }
     dialog:show()
     local data = dialog.data
     data.input = input_filename or data.input
     if not data.import or not data.input or data.input == "" then
-      return nil
+      return nil, "cancelled"
     end
+    data.layer_association = data.layer_association == "Preserve layers" and "preserve" or "auto"
+    data.frame_source = ({
+      ["Automatic"] = "auto",
+      ["Static document"] = "static",
+      ["Top-level layers as frames"] = "top-level",
+    })[data.frame_source] or "auto"
+    data.use_roundtrip_metadata = data.use_roundtrip_metadata == true
     data.overwrite = true
     data.jitter_mode = jitter_options.jitter_mode
     data.jitter_kind = jitter_options.jitter_kind
     data.jitter_profile = jitter_options.jitter_profile
     return data
+  end
+
+  --- Asks how to recover when converter-owned metadata is damaged.
+  local function select_roundtrip_recovery()
+    local dialog = Dialog{ title="PSD Metadata Recovery" }
+    if not dialog then
+      return nil, "unavailable"
+    end
+    dialog:label{ text="Frame metadata is damaged or inconsistent. Choose an import strategy." }
+    dialog:newrow()
+    dialog:button{ id="automatic", text="Automatic association", focus=true, hexpand=false }
+    dialog:button{ id="preserve", text="Preserve layers", hexpand=false }
+    dialog:button{ id="cancel", text="Cancel", hexpand=false }
+    dialog:show()
+    if dialog.data.automatic then
+      return "auto"
+    end
+    if dialog.data.preserve then
+      return "preserve"
+    end
+    return nil, "cancelled"
   end
 
   --- Shows the export compression choices shared by both export entrypoints.
@@ -366,6 +409,12 @@ function Dialogs.new(process)
       option="ZIP",
       options={"ZIP", "ZIP prediction", "RLE", "Raw"},
     }
+    dialog:check{
+      id="include_empty_layers",
+      label="Empty pixel layers",
+      text="Export empty pixel layers",
+      selected=false,
+    }
     dialog:newrow()
     dialog:button{ id="export", text="Export", focus=true }
     dialog:button{ id="cancel", text="Cancel" }
@@ -380,6 +429,7 @@ function Dialogs.new(process)
         ["RLE"] = "rle",
         ["Raw"] = "raw",
       })[dialog.data.compression] or "zip",
+      include_empty_layers = dialog.data.include_empty_layers == true,
     }
   end
 
@@ -440,31 +490,37 @@ function Dialogs.new(process)
     return dialog.data.input
   end
 
-  --- Shows and persists the PSD round-trip metadata preference for this extension.
+  --- Shows and persists PSD metadata import/export preferences for this extension.
   local function show_roundtrip_settings(plugin)
-    local dialog = Dialog{ title="PSD to Aseprite Settings" }
+    local dialog = Dialog{ title="PSD Metadata Settings" }
     if not dialog then
       show_error("PSD to Aseprite", "Aseprite does not have an available UI.")
       return
     end
+    dialog:separator{ text="Metadata" }
     dialog:check{
       id="embed_roundtrip_metadata",
-      label="PSD round-trip",
-      text="Embed invisible PSD round-trip metadata",
+      text="Write metadata on export",
       selected=plugin.preferences.embed_roundtrip_metadata ~= false,
-    }
-    dialog:label{
-      text="Stores only version, logical layer IDs, and cel relationships; no paths or user data.",
-    }
-    dialog:label{
-      text="Disable this only if you do not want automatic association when reopening exported PSDs.",
+      hexpand=false,
     }
     dialog:newrow()
-    dialog:button{ id="apply", text="Apply", focus=true }
-    dialog:button{ id="cancel", text="Cancel" }
+    dialog:check{
+      id="use_roundtrip_metadata",
+      text="Use metadata on import",
+      selected=plugin.preferences.use_roundtrip_metadata ~= false,
+      hexpand=false,
+    }
+    dialog:newrow()
+    dialog:label{ text="Restores layer/frame relationships." }
+    dialog:label{ text="Stores no paths or personal data." }
+    dialog:newrow()
+    dialog:button{ id="apply", text="Apply", focus=true, hexpand=false }
+    dialog:button{ id="cancel", text="Cancel", hexpand=false }
     dialog:show()
     if dialog.data.apply then
       plugin.preferences.embed_roundtrip_metadata = dialog.data.embed_roundtrip_metadata == true
+      plugin.preferences.use_roundtrip_metadata = dialog.data.use_roundtrip_metadata == true
     end
   end
 
@@ -474,6 +530,8 @@ function Dialogs.new(process)
     select_export_destination = select_export_destination,
     select_import_source = select_import_source,
     select_import_options = select_import_options,
+    select_roundtrip_recovery = select_roundtrip_recovery,
+    default_import_options = default_import_options,
     show_information_loss = show_information_loss,
     show_roundtrip_settings = show_roundtrip_settings,
   }

@@ -18,33 +18,55 @@ that bundles the converter for import and native Save As workflows.
 5. Allow the extension to launch its bundled converter when Aseprite asks for
    external-program permission for the first time.
 
-The imported sprite opens as a modified document that is not associated with
-the temporary conversion file. Press Ctrl+S or use Save As to choose the final
-`.aseprite` path; Aseprite suggests the PSD's directory and base name.
+The explicit Import command opens a modified document that is not associated
+with the temporary conversion file. Native `File > Open` returns a document
+associated with the original PSD. For an explicit import, press Ctrl+S or use
+Save As to choose the final `.aseprite` path; Aseprite suggests the PSD's
+directory and base name.
 
-The extension defaults to `preserve`, which keeps source layers separate. Its
-dialog also exposes the experimental automatic association modes described
-below.
+Both native `File > Open` and the explicit Import command show the same import
+options. Choose `Automatic association` or `Preserve layers`. In Automatic
+association mode, `Use metadata` selects the exact metadata preset; when it is
+off, the dialog exposes the experimental association controls and uses the
+normal heuristics. Legacy v1 and unmarked files use the automatic association
+fallback, while damaged converter metadata opens a recovery choice instead of
+being silently ignored. In particular, an unmarked PSD is intentionally not
+treated as `Preserve layers`: it falls back to the standard Automatic
+association path. Turn off `Use metadata` when you need to tune the association
+strategy for such a file.
 
-PSD files carrying this marker default to `auto` on a later import; ordinary
-PSDs continue to default to `preserve`.
-
-Exports include an invisible, versioned PSD round-trip metadata block by
+Exports include an invisible, versioned PSD metadata block by
 default. It records only the metadata version, logical layer IDs, and
 materialized cel relationships; it does not contain file paths, usernames,
 device information, or usage tracking. Photoshop and other readers may ignore
-this block. Use **File > Export > PSD to Aseprite Settings...** to disable it
-for future exports. The PSD remains readable when disabled, but reopening it
-cannot automatically recognize the converter-owned layer association.
+this block. Use **File > Export > PSD to Aseprite Settings...** to control both
+export embedding and import usage. Disabling import usage keeps Automatic
+association on the heuristic path even when metadata is present. Disabling
+export embedding leaves the PSD readable, but future opens cannot use exact
+converter-owned layer association from that file.
+
+Cancelling the native `File > Open` import dialog reports `PSD opening
+cancelled by user.` so that a cancelled open is never confused with a failed
+or partially initialized document.
 
 To export, choose **File > Save As...** and select `.psd` or `.psb`. The
 extension snapshots isolated original and flattened copies, runs the bundled
 converter, validates the Photoshop document, and only then writes it through
 Aseprite's custom-format save stream. The save options let you choose whether
-the current frame is written as Photoshop's active frame; Ctrl+S reuses the
-selected format and options. Export always records the currently selected frame
+the current frame is written as Photoshop's active frame and whether empty
+pixel layers are included. Ctrl+S reuses the selected format and options.
+Export always records the currently selected frame
 as Photoshop's active frame. Channel compression can be selected as `ZIP`,
-`ZIP prediction`, `RLE`, or `Raw`.
+`ZIP prediction`, `RLE`, or `Raw`. Repeated Ctrl+S on the same sprite and
+destination reuses the last successfully saved compression choice; changing
+the destination or reloading the extension asks again. The explicit Export
+menu command always asks independently.
+
+Aseprite may open and truncate a native custom-format destination before the
+save callback runs. The extension validates the complete PSD before writing,
+but cannot provide transactional rollback for a failed overwrite. Use the
+explicit Export command to write a separate destination when the existing file
+must be preserved.
 
 ## Command line
 
@@ -54,8 +76,11 @@ Build the native CLI with Rust 1.88 or newer:
 cargo build --release --locked -p psd2ase
 ```
 
-The export command accepts `--compression raw|rle|zip|zip-prediction`; omitted
-means the existing ZIP-without-prediction default.
+The export command accepts `--compression raw|rle|zip|zip-prediction` and
+`--empty-layers include|omit`. Compression defaults to the existing
+ZIP-without-prediction mode, while empty layers default to `omit`. `omit`
+removes only pixel layers with no cel in any frame; a layer that is empty in
+some frames still gets a hidden placeholder so frame topology stays aligned.
 
 Build the Windows x64 Aseprite extension in one step (the script builds the
 release converter and embeds it in the package):
@@ -80,6 +105,7 @@ specified:
 psd2ase convert INPUT.psd -o OUTPUT.aseprite
 psd2ase convert INPUT.psd -o OUTPUT.aseprite --overwrite
 psd2ase convert INPUT.psd -o OUTPUT.aseprite --layer-association auto --linked-cels identical
+psd2ase convert INPUT.psd -o OUTPUT.aseprite --layer-association roundtrip
 psd2ase convert INPUT.psd -o OUTPUT.aseprite --layer-association auto --linked-cels identical --jitter-mode repair --jitter-kind all
 ```
 
@@ -91,16 +117,33 @@ preserved unless `--overwrite` is explicit:
 psd2ase export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite
 psd2ase export INPUT.aseprite -o OUTPUT.psb --composite COMPOSITE.aseprite --report REPORT.json --overwrite
 psd2ase export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite --roundtrip-metadata off
+psd2ase export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite --empty-layers omit
 ```
 
 Run `psd2ase --help` for the complete command syntax.
+
+Frame interpretation is explicit for PSDs without a Photoshop timeline:
+
+- `--frame-source auto` is the default. It uses a real Photoshop timeline when
+  present and otherwise keeps the PSD static.
+- `--frame-source static` always imports one static frame.
+- `--frame-source top-level` treats each top-level layer or group as a frame.
+  A top-level layer named `Background` is reported and shared by every frame.
+  This mode is intended for explicitly confirmed layer-per-frame exports such
+  as Procreate Animation Assist PSDs; the Procreate marker alone never enables it.
 
 ## Layer association
 
 - `--layer-association preserve` is the default and preserves source-layer
   identity.
-- `--layer-association auto --association-strategy compact` enables the
-  compact cross-frame logical-layer planner.
+- `--layer-association roundtrip` restores valid v2 frame-group metadata exactly,
+  uses automatic association for legacy v1 markers, preserves unmarked files,
+  and exits with recovery-required status for damaged converter metadata. It
+  intentionally rejects auto-only tuning flags.
+- `--layer-association auto` defaults to the conservative planner, which
+  prioritizes editable logical identities.
+- `--association-strategy compact` explicitly prioritizes the fewest tracks
+  that preserve the rendered result.
 - `--association-strategy conservative` enables multilingual copy-family,
   multi-track, and candidate-folder analysis. Ambiguous identities remain
   separate.

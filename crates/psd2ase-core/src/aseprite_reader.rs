@@ -21,6 +21,53 @@ pub struct AsepriteExportSource {
     pub composites: Vec<Vec<u8>>,
     /// Compatibility losses discovered while reading the source snapshots.
     pub information_loss: InformationLossReport,
+    /// Frame-local layer snapshots used by the frame-first PSD exporter.
+    pub(crate) frame_snapshots: Option<Vec<FrameSnapshot>>,
+}
+
+/// One playback frame with the original Aseprite layer hierarchy materialized.
+#[derive(Debug, Clone)]
+pub(crate) struct FrameSnapshot {
+    /// Top-level layers in Aseprite order.
+    pub(crate) layers: Vec<FrameSnapshotLayer>,
+}
+
+/// One frame-local Aseprite layer and its optional cel pixels.
+#[derive(Debug, Clone)]
+pub(crate) struct FrameSnapshotLayer {
+    /// Stable source layer identity based on the original layer index.
+    pub(crate) source_layer_id: u32,
+    /// User-authored layer name.
+    pub(crate) name: String,
+    /// Original layer kind.
+    pub(crate) kind: NormalizedLayerKind,
+    /// Valid base opacity, when the Aseprite header enables it.
+    pub(crate) opacity: Option<u8>,
+    /// Valid base blend mode, when the layer kind supports it.
+    pub(crate) blend_mode: Option<String>,
+    /// Base layer visibility.
+    pub(crate) visible: bool,
+    /// Frame-local cel data for pixel layers.
+    pub(crate) cel: Option<FrameSnapshotCel>,
+    /// Child layers for groups.
+    pub(crate) children: Vec<FrameSnapshotLayer>,
+}
+
+/// Pixel data and placement for one frame-local cel.
+#[derive(Debug, Clone)]
+pub(crate) struct FrameSnapshotCel {
+    /// Cel width in pixels.
+    pub(crate) width: u32,
+    /// Cel height in pixels.
+    pub(crate) height: u32,
+    /// Cel x origin in document coordinates.
+    pub(crate) x: i32,
+    /// Cel y origin in document coordinates.
+    pub(crate) y: i32,
+    /// Cel opacity byte.
+    pub(crate) opacity: u8,
+    /// Owned RGBA8 pixels.
+    pub(crate) pixels: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +129,14 @@ pub fn read_aseprite_export_with_active_frame(
     } else {
         normalized_document(&file, &sequence, loop_mode, &mut information_loss)?
     };
+    let frame_snapshots = (!has_tilemap)
+        .then(|| {
+            sequence
+                .iter()
+                .map(|source_frame| build_frame_snapshot(&file, *source_frame))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
     if let Some(active_frame_index) = active_frame_index {
         if active_frame_index as usize >= document.frames.len() {
             return Err(ExportError::AsepriteRead(format!(
@@ -95,6 +150,77 @@ pub fn read_aseprite_export_with_active_frame(
         document,
         composites,
         information_loss,
+        frame_snapshots,
+    })
+}
+
+/// Materializes one playback frame without collapsing distinct cel variants.
+fn build_frame_snapshot(
+    file: &AsepriteFile,
+    source_frame: usize,
+) -> Result<FrameSnapshot, ExportError> {
+    let mut layers = Vec::new();
+    for layer_index in 0..file.layers().len() {
+        if file.layers()[layer_index].parent.is_none() {
+            layers.push(build_frame_snapshot_layer(file, layer_index, source_frame)?);
+        }
+    }
+    Ok(FrameSnapshot { layers })
+}
+
+/// Recursively materializes one source layer for a playback frame.
+fn build_frame_snapshot_layer(
+    file: &AsepriteFile,
+    layer_index: usize,
+    source_frame: usize,
+) -> Result<FrameSnapshotLayer, ExportError> {
+    let layer = &file.layers()[layer_index];
+    let (opacity, blend_mode) = layer_properties(file, layer);
+    let (kind, cel) = match layer.kind {
+        LayerKind::Group => (NormalizedLayerKind::Group, None),
+        LayerKind::Normal => {
+            let layer_ref = file.layer_ref(layer_index).ok_or_else(|| {
+                ExportError::AsepriteRead("normal layer has no layer handle".to_string())
+            })?;
+            let cel = cel_sample(file, layer_ref, source_frame)?.map(|sample| FrameSnapshotCel {
+                width: sample.width,
+                height: sample.height,
+                x: sample.x,
+                y: sample.y,
+                opacity: sample.opacity,
+                pixels: sample.pixels,
+            });
+            (NormalizedLayerKind::Pixel, cel)
+        }
+        LayerKind::Tilemap { .. } => {
+            return Err(ExportError::AsepriteRead(
+                "tilemap cannot be materialized as an editable frame snapshot".to_string(),
+            ));
+        }
+        _ => {
+            return Err(ExportError::AsepriteRead(format!(
+                "layer {:?} uses an unsupported kind",
+                layer.name
+            )));
+        }
+    };
+    let mut children = Vec::new();
+    if kind == NormalizedLayerKind::Group {
+        for child_index in 0..file.layers().len() {
+            if file.layers()[child_index].parent == Some(layer_index) {
+                children.push(build_frame_snapshot_layer(file, child_index, source_frame)?);
+            }
+        }
+    }
+    Ok(FrameSnapshotLayer {
+        source_layer_id: (layer_index + 1) as u32,
+        name: layer.name.clone(),
+        kind,
+        opacity,
+        blend_mode,
+        visible: layer.visible,
+        cel,
+        children,
     })
 }
 
@@ -939,6 +1065,20 @@ mod tests {
         assert_eq!(
             rgba_pixels(&file, &pixels),
             vec![10, 20, 30, 0, 40, 50, 60, 200]
+        );
+    }
+
+    #[test]
+    fn default_header_flags_do_not_authorize_group_properties() {
+        let mut file = AsepriteFile::new(1, 1, ColorMode::Rgba);
+        file.add_frame(1);
+        file.add_group("group");
+        file.add_layer("pixel");
+
+        assert_eq!(layer_properties(&file, &file.layers()[0]), (None, None));
+        assert_eq!(
+            layer_properties(&file, &file.layers()[1]),
+            (Some(255), Some("normal".to_string()))
         );
     }
 }

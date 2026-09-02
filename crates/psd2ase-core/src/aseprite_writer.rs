@@ -674,7 +674,9 @@ fn create_planned_tree<'a>(
                 .map(|(layer, location)| layer_options(layer, location, warnings))
                 .transpose()?
                 .unwrap_or_default();
-            options.visible = true;
+            options.visible = source.map_or(true, |layer| {
+                layer.frame_states.iter().any(|state| state.enabled)
+            });
             let group = match parent {
                 Some(parent) => file.add_group_in_with(name, parent, options),
                 None => file.add_group_with(name, options),
