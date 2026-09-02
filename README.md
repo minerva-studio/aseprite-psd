@@ -147,6 +147,15 @@ Frame interpretation is explicit for PSDs without a Photoshop timeline:
 - `--association-strategy conservative` enables multilingual copy-family,
   multi-track, and candidate-folder analysis. Ambiguous identities remain
   separate.
+
+Automatic association does not require perfect layer names. Default Photoshop
+names, lazy naming, and names that drift between frames can still be resolved
+when cross-frame structure, mutual exclusion, pixels, positions, ordering, and
+names provide enough combined evidence. In those cases the solver restores a
+stable `layer × frame` logical track without requiring manual PSD renaming. If
+the evidence is insufficient, it keeps identities separate and reports the
+uncertainty instead of silently merging tracks.
+
 - Stable track order uses cross-frame overlap consensus by default. Use
   `--stable-order anchor` for anchor-frame ordering or `strict` to reject
   unresolved evidence.

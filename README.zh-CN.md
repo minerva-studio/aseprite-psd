@@ -121,6 +121,13 @@ psd2ase export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite --emp
 - `--association-strategy compact` 显式选择在保持渲染结果的前提下尽量减少轨道。
 - `--association-strategy conservative` 启用多语言复制家族、多轨和候选 Folder
   分析；身份不明确的图层仍保持分离。
+
+自动关联不要求图层名称完美。即使使用 Photoshop 默认名称、懒得命名，或同一
+图层在不同帧之间改了名字，只要跨帧结构、互斥关系、像素、位置、顺序和名称
+能够提供足够的综合证据，solver 仍可能恢复正确关系。此时它会直接恢复稳定的
+`layer × frame` 逻辑轨道，不需要用户手动重命名 PSD；证据不足时则保持图层身份
+分离并报告不确定性，不会静默合并。
+
 - 稳定轨道顺序默认使用跨帧重叠共识。使用 `--stable-order anchor` 可改用锚点帧
   顺序，使用 `strict` 可在证据无法确定时拒绝转换。
 - `--z-order auto` 启用实验性的逐 cel Z-Index，并且必须配合自动关联。
