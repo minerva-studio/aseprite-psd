@@ -11,7 +11,7 @@ use ag_psd::descriptor::{
 use ag_psd::psd::{
     AnimationDispose, AnimationFrame, AnimationFrameFlags, AnimationFrameInfo, AnimationInfo,
     Animations, BlendMode, ColorMode, Compression, ImageResources, Layer, LayerAdditionalInfo,
-    PixelData, PointF, Psd, ReadOptions, WriteOptions,
+    PixelData, PointF, Psd, ReadOptions, SectionDividerType, WriteOptions,
 };
 use ag_psd::reader::PsdReader;
 use ag_psd::writer::{
@@ -872,6 +872,7 @@ struct LayerRecord {
     extra_length: usize,
     extra_end: usize,
     layer_id: Option<u32>,
+    section_divider_type: Option<u32>,
 }
 
 /// Locates all encoded layer records and their lyid values without interpreting pixels.
@@ -914,12 +915,13 @@ fn layer_record_layout(bytes: &[u8], psb: bool) -> Result<LayerRecordLayout, Exp
             .checked_add(extra_length)
             .filter(|end| *end <= bytes.len())
             .ok_or_else(|| ExportError::Writer("layer extra data exceeds output".to_string()))?;
-        let layer_id = find_layer_id(&bytes[extra_start..extra_end])?;
+        let (layer_id, section_divider_type) = find_layer_metadata(&bytes[extra_start..extra_end])?;
         records.push(LayerRecord {
             extra_length_offset,
             extra_length,
             extra_end,
             layer_id,
+            section_divider_type,
         });
         channel_lengths_by_record.push(channel_lengths);
         cursor = extra_end;
@@ -946,8 +948,8 @@ fn layer_record_layout(bytes: &[u8], psb: bool) -> Result<LayerRecordLayout, Exp
     })
 }
 
-/// Finds the lyid additional-info value inside one layer's extra-data payload.
-fn find_layer_id(extra: &[u8]) -> Result<Option<u32>, ExportError> {
+/// Finds layer ID and section-divider metadata inside one layer's extra-data payload.
+fn find_layer_metadata(extra: &[u8]) -> Result<(Option<u32>, Option<u32>), ExportError> {
     let mut cursor = 0;
     cursor = skip_local_u32_section(extra, cursor)?;
     cursor = skip_local_u32_section(extra, cursor)?;
@@ -957,6 +959,8 @@ fn find_layer_id(extra: &[u8]) -> Result<Option<u32>, ExportError> {
         as usize;
     cursor += 1 + name_length;
     cursor = (cursor + 3) & !3;
+    let mut layer_id = None;
+    let mut section_divider_type = None;
     while cursor < extra.len() {
         if extra.len() - cursor < 12 {
             return Err(ExportError::Writer(
@@ -982,11 +986,13 @@ fn find_layer_id(extra: &[u8]) -> Result<Option<u32>, ExportError> {
                 ExportError::Writer("layer additional-info exceeds record".to_string())
             })?;
         if key == b"lyid" {
-            return Ok(Some(read_be_u32(extra, cursor)?));
+            layer_id = Some(read_be_u32(extra, cursor)?);
+        } else if key == b"lsct" && length >= 4 {
+            section_divider_type = Some(read_be_u32(extra, cursor)?);
         }
         cursor = (end + 1) & !1;
     }
-    Ok(None)
+    Ok((layer_id, section_divider_type))
 }
 
 /// Validates container version, normalized layer animation, and flattened composite.
@@ -1097,10 +1103,14 @@ fn validate_layer_records(
     let layout = layer_record_layout(bytes, psb)?;
     let expected_ids = collect_layer_ids(&expected.root_layers);
     let mut ids = BTreeSet::new();
-    let mut records_without_id = 0usize;
+    let mut invalid_records_without_id = 0usize;
     for record in layout.records {
         let Some(id) = record.layer_id else {
-            records_without_id += 1;
+            if record.section_divider_type
+                != Some(SectionDividerType::BoundingSectionDivider as u32)
+            {
+                invalid_records_without_id += 1;
+            }
             continue;
         };
         if !ids.insert(id) {
@@ -1109,9 +1119,9 @@ fn validate_layer_records(
             )));
         }
     }
-    if records_without_id > 1 || ids != expected_ids {
+    if invalid_records_without_id > 0 || ids != expected_ids {
         return Err(ExportError::OutputValidation(format!(
-            "encoded layer IDs differ: expected {:?}, got {:?} (records without ID: {records_without_id})",
+            "encoded layer IDs differ: expected {:?}, got {:?} (invalid records without ID: {invalid_records_without_id})",
             expected_ids, ids
         )));
     }
