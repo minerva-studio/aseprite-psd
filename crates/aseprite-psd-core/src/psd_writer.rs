@@ -2150,7 +2150,7 @@ mod tests {
 
     use crate::{
         AutoAssociationOptions, ConvertOptions, JitterKind, JitterMode, JitterOptions,
-        JitterProfile, LayerAssociation,
+        JitterProfile, LayerAssociation, NormalizedBounds,
     };
     use aseprite::{
         AsepriteFile, BlendMode as AseBlendMode, ColorMode as AseColorMode, LayerOptions, Pixels,
@@ -2506,12 +2506,40 @@ mod tests {
             )
             .expect("export selected compression");
             assert_eq!(report.output, mode_output);
+            let mode_bytes = fs::read(&mode_output).expect("read selected compression");
+            let layout = layer_record_layout(&mode_bytes, false).expect("inspect PSD layout");
+            let expected_code = compression.ag_psd() as u16;
+            validate_channel_compression(&layout, expected_code)
+                .expect("selected compression should be used for every non-empty channel");
+
+            let mode_normalized =
+                crate::normalize(&mode_output).expect("normalize selected compression");
+            compare_normalized(&normalized, &mode_normalized)
+                .expect("compression must not change normalized structure or pixels");
+
+            let mode_roundtrip = directory.join(format!("compression-{index}.aseprite"));
+            crate::convert(
+                &mode_output,
+                &mode_roundtrip,
+                &crate::ConvertOptions {
+                    layer_association: crate::LayerAssociation::AutoForRoundTrip,
+                    ..Default::default()
+                },
+            )
+            .expect("selected compression should remain importable");
+            let mode_roundtrip_file = AsepriteFile::from_reader(
+                fs::read(&mode_roundtrip)
+                    .expect("read selected compression roundtrip")
+                    .as_slice(),
+            )
+            .expect("parse selected compression roundtrip");
             assert_eq!(
-                crate::normalize(&mode_output)
-                    .expect("normalize selected compression")
-                    .frames
-                    .len(),
-                3
+                mode_roundtrip_file
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.duration_ms)
+                    .collect::<Vec<_>>(),
+                vec![120, 80, 60]
             );
         }
 
@@ -2570,6 +2598,157 @@ mod tests {
         assert!(matches!(error, ExportError::AsepriteRead(_)));
         assert_eq!(fs::read(&output).expect("read rollback PSD"), original);
         fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    /// Verifies Unicode layer names through Aseprite-to-PSD and PSD-to-Aseprite round trips.
+    #[test]
+    fn unicode_layer_names_survive_psd_roundtrip() {
+        let directory = std::env::temp_dir().join(format!(
+            "aseprite-psd-unicode-layer-names-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).expect("create Unicode fixture directory");
+        let input = directory.join("unicode-source.aseprite");
+        let composite = directory.join("unicode-composite.aseprite");
+        let psd = directory.join("unicode-layer-names.psd");
+        let reimported = directory.join("unicode-reimported.aseprite");
+
+        let layer_specs = [
+            ("中文", [255, 0, 0, 255]),
+            ("é", [0, 255, 0, 255]),
+            ("e\u{301}", [0, 0, 255, 255]),
+            ("", [255, 255, 0, 255]),
+            ("相同", [255, 0, 255, 255]),
+            ("相同", [0, 255, 255, 255]),
+        ];
+        let mut source = AsepriteFile::new(layer_specs.len() as u16, 1, AseColorMode::Rgba);
+        let group = source.add_group("组😀");
+        let frame = source.add_frame(100);
+        let mut composite_pixels = Vec::new();
+        for (x, (name, pixels)) in layer_specs.iter().enumerate() {
+            let layer = source.add_layer_in(name, group);
+            source
+                .set_cel(
+                    layer,
+                    frame,
+                    Pixels::new(pixels.to_vec(), 1, 1, AseColorMode::Rgba)
+                        .expect("Unicode layer pixels"),
+                    x as i16,
+                    0,
+                )
+                .expect("Unicode layer cel");
+            composite_pixels.extend_from_slice(pixels);
+        }
+        write_aseprite(&input, &source);
+
+        let mut flattened = AsepriteFile::new(layer_specs.len() as u16, 1, AseColorMode::Rgba);
+        let flattened_layer = flattened.add_layer("Composite");
+        let flattened_frame = flattened.add_frame(100);
+        flattened
+            .set_cel(
+                flattened_layer,
+                flattened_frame,
+                Pixels::new(
+                    composite_pixels.clone(),
+                    layer_specs.len() as u16,
+                    1,
+                    AseColorMode::Rgba,
+                )
+                .expect("Unicode composite pixels"),
+                0,
+                0,
+            )
+            .expect("Unicode composite cel");
+        write_aseprite(&composite, &flattened);
+
+        export(&input, &composite, &psd, &ExportOptions::default())
+            .expect("export Unicode layer-name PSD");
+        let normalized = crate::normalize(&psd).expect("normalize Unicode layer-name PSD");
+        assert_eq!(normalized.canvas, (layer_specs.len() as u32, 1));
+        assert_eq!(normalized.frames.len(), 1);
+        assert_eq!(normalized.frames[0].duration_ms, Some(100));
+
+        let frame_root = normalized.root_layers.first().expect("frame-group root");
+        assert_eq!(frame_root.name, "Frame 1");
+        assert_eq!(frame_root.children.len(), 1);
+        let normalized_group = &frame_root.children[0];
+        assert_eq!(normalized_group.name, "组😀");
+        assert_eq!(normalized_group.kind, NormalizedLayerKind::Group);
+        assert_eq!(normalized_group.children.len(), layer_specs.len());
+        let expected_names = layer_specs
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            normalized_group
+                .children
+                .iter()
+                .map(|layer| layer.name.as_str())
+                .collect::<Vec<_>>(),
+            expected_names
+        );
+        assert_ne!(
+            normalized_group.children[4].id, normalized_group.children[5].id,
+            "duplicate names must retain distinct layer identities"
+        );
+        for (index, (_, pixels)) in layer_specs.iter().enumerate() {
+            let layer = &normalized_group.children[index];
+            assert_eq!(
+                layer.bounds,
+                NormalizedBounds {
+                    left: index as i32,
+                    top: 0,
+                    right: index as i32 + 1,
+                    bottom: 1,
+                }
+            );
+            assert_eq!(
+                layer.pixels.as_ref().expect("normalized layer pixels").data,
+                pixels.to_vec()
+            );
+        }
+
+        crate::convert(
+            &psd,
+            &reimported,
+            &crate::ConvertOptions {
+                layer_association: crate::LayerAssociation::AutoForRoundTrip,
+                ..Default::default()
+            },
+        )
+        .expect("reimport Unicode layer-name PSD");
+        let reimported_file = AsepriteFile::from_reader(
+            fs::read(&reimported)
+                .expect("read Unicode layer-name reimport")
+                .as_slice(),
+        )
+        .expect("parse Unicode layer-name reimport");
+        assert_eq!(reimported_file.frames().len(), 1);
+        assert_eq!(reimported_file.frames()[0].duration_ms, 100);
+        let reimported_names = reimported_file
+            .layers()
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reimported_names,
+            vec!["组😀", "中文", "é", "e\u{301}", "", "相同", "相同"]
+        );
+        let reimported_group_index = reimported_file
+            .layers()
+            .iter()
+            .position(|layer| layer.name == "组😀")
+            .expect("reimported Unicode group");
+        for layer_index in 1..reimported_file.layers().len() {
+            assert_eq!(
+                reimported_file.layers()[layer_index].parent,
+                Some(reimported_group_index)
+            );
+        }
+        fs::remove_dir_all(directory).expect("remove Unicode fixture directory");
     }
 
     #[test]
