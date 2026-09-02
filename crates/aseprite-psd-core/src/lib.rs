@@ -345,11 +345,20 @@ fn collect_layer_losses(
         .id
         .and_then(|value| u32::try_from(value as u64).ok());
     if layer.additional_info.mask.is_some() || layer.additional_info.real_mask.is_some() {
+        let rasterized = bitmap_user_mask(layer).is_some();
         report.add(
             InformationLossCode::PixelMask,
-            LossDisposition::Dropped,
+            if rasterized {
+                LossDisposition::Rasterized
+            } else {
+                LossDisposition::Dropped
+            },
             location(id),
-            "pixel mask is not represented in the normalized model",
+            if rasterized {
+                "bitmap user mask is rasterized into layer alpha"
+            } else {
+                "pixel or real mask is not represented in the normalized model"
+            },
             true,
             true,
         );
@@ -423,6 +432,43 @@ fn collect_layer_losses(
     }
 }
 
+/// Returns a bitmap user mask that can be safely rasterized into layer alpha.
+fn bitmap_user_mask(layer: &ag_psd::psd::Layer) -> Option<&ag_psd::psd::LayerMaskData> {
+    if layer.children.is_some() || layer.additional_info.real_mask.is_some() {
+        return None;
+    }
+    let mask = layer.additional_info.mask.as_ref()?;
+    if mask.from_vector_data == Some(true)
+        || mask.position_relative_to_layer == Some(true)
+        || mask.user_mask_density.is_some()
+        || mask.user_mask_feather.is_some()
+        || mask.vector_mask_density.is_some()
+        || mask.vector_mask_feather.is_some()
+    {
+        return None;
+    }
+    mask.image_data.as_ref().or(mask.canvas.as_ref())?;
+    Some(mask)
+}
+
+/// Rejects clipping before a conversion can commit an output file.
+fn reject_unsupported_clipping(report: &InformationLossReport) -> Result<(), ConversionError> {
+    let Some(loss) = report
+        .entries
+        .iter()
+        .find(|entry| entry.code == InformationLossCode::Clipping)
+    else {
+        return Ok(());
+    };
+    let location = loss.locations.first();
+    let (path, id) = location
+        .map(|value| (value.path.as_str(), value.layer_id))
+        .unwrap_or(("unknown", None));
+    Err(ConversionError::InputInspection(format!(
+        "clipping is unsupported at layer path {path} (layer id {id:?}); conversion was rejected"
+    )))
+}
+
 /// Collects strict layer IDs and ancestry for the Photoshop metadata scanner.
 fn collect_animation_inputs(
     layer: &ag_psd::psd::Layer,
@@ -474,7 +520,13 @@ fn build_layer(
         None
     } else {
         match layer.image_data.as_ref().or(layer.canvas.as_ref()) {
-            Some(pixel) => Some(copy_rgba8_pixels(pixel, bounds, &path_string)?),
+            Some(pixel) => {
+                let normalized = copy_rgba8_pixels(pixel, bounds, &path_string)?;
+                match bitmap_user_mask(layer) {
+                    Some(mask) => Some(apply_bitmap_user_mask(normalized, mask, &path_string)?),
+                    None => Some(normalized),
+                }
+            }
             None if bounds.right == bounds.left || bounds.bottom == bounds.top => {
                 Some(empty_pixels(bounds, &path_string)?)
             }
@@ -713,6 +765,118 @@ fn copy_rgba8_pixels(
     })
 }
 
+/// Applies one decoded bitmap user mask to a normalized layer's alpha channel.
+fn apply_bitmap_user_mask(
+    mut pixels: NormalizedPixels,
+    mask: &ag_psd::psd::LayerMaskData,
+    path: &str,
+) -> Result<NormalizedPixels, InspectionError> {
+    if mask.disabled == Some(true) {
+        return Ok(pixels);
+    }
+    let mask_pixels = mask
+        .image_data
+        .as_ref()
+        .or(mask.canvas.as_ref())
+        .ok_or_else(|| {
+            InspectionError::Normalization(format!(
+                "bitmap user mask has no decoded pixels at {path}"
+            ))
+        })?;
+    let mask_bounds = NormalizedBounds {
+        left: integral_i32(mask.left, &format!("mask {path} left"))?,
+        top: integral_i32(mask.top, &format!("mask {path} top"))?,
+        right: integral_i32(mask.right, &format!("mask {path} right"))?,
+        bottom: integral_i32(mask.bottom, &format!("mask {path} bottom"))?,
+    };
+    if mask_bounds.right < mask_bounds.left || mask_bounds.bottom < mask_bounds.top {
+        return Err(InspectionError::Normalization(format!(
+            "mask {path} bounds are inverted"
+        )));
+    }
+    let mask_width = u32::try_from(i64::from(mask_bounds.right) - i64::from(mask_bounds.left))
+        .map_err(|_| InspectionError::Normalization(format!("mask {path} width is invalid")))?;
+    let mask_height = u32::try_from(i64::from(mask_bounds.bottom) - i64::from(mask_bounds.top))
+        .map_err(|_| InspectionError::Normalization(format!("mask {path} height is invalid")))?;
+    if (mask_pixels.width, mask_pixels.height) != (mask_width, mask_height) {
+        return Err(InspectionError::Normalization(format!(
+            "mask pixel dimensions mismatch at {path}: expected {mask_width}x{mask_height}, got {}x{}",
+            mask_pixels.width, mask_pixels.height
+        )));
+    }
+    let expected_mask_bytes = usize::try_from(
+        u64::from(mask_width)
+            .checked_mul(u64::from(mask_height))
+            .and_then(|value| value.checked_mul(4))
+            .ok_or_else(|| {
+                InspectionError::Normalization(format!(
+                    "mask dimensions overflow RGBA8 size at {path}"
+                ))
+            })?,
+    )
+    .map_err(|_| {
+        InspectionError::Normalization(format!(
+            "mask dimensions exceed addressable memory at {path}"
+        ))
+    })?;
+    if mask_pixels.data.len() != expected_mask_bytes {
+        return Err(InspectionError::Normalization(format!(
+            "mask pixel buffer length mismatch at {path}: expected {expected_mask_bytes}, got {}",
+            mask_pixels.data.len()
+        )));
+    }
+    let default_color = mask.default_color.unwrap_or(0.0);
+    if !default_color.is_finite() || !(0.0..=255.0).contains(&default_color) {
+        return Err(InspectionError::Normalization(format!(
+            "mask default color is outside 0..=255 at {path}"
+        )));
+    }
+    let default_coverage = default_color.round() as u8;
+    let pixel_width = usize::try_from(pixels.width).map_err(|_| {
+        InspectionError::Normalization(format!("pixel width exceeds addressable memory at {path}"))
+    })?;
+    let mask_width = usize::try_from(mask_width).map_err(|_| {
+        InspectionError::Normalization(format!("mask width exceeds addressable memory at {path}"))
+    })?;
+    for y in 0..pixels.height {
+        let y = usize::try_from(y).map_err(|_| {
+            InspectionError::Normalization(format!(
+                "pixel row exceeds addressable memory at {path}"
+            ))
+        })?;
+        let document_y = i64::from(pixels.top) + i64::try_from(y).unwrap_or(i64::MAX);
+        for x in 0..pixels.width {
+            let x = usize::try_from(x).map_err(|_| {
+                InspectionError::Normalization(format!(
+                    "pixel column exceeds addressable memory at {path}"
+                ))
+            })?;
+            let document_x = i64::from(pixels.left) + i64::try_from(x).unwrap_or(i64::MAX);
+            let mask_x = document_x - i64::from(mask_bounds.left);
+            let mask_y = document_y - i64::from(mask_bounds.top);
+            let coverage = if mask_x >= 0
+                && mask_y >= 0
+                && mask_x < i64::try_from(mask_width).unwrap_or(i64::MAX)
+                && mask_y < i64::from(mask_bounds.bottom) - i64::from(mask_bounds.top)
+            {
+                let mask_y = usize::try_from(mask_y).map_err(|_| {
+                    InspectionError::Normalization(format!("mask row is invalid at {path}"))
+                })?;
+                let mask_x = usize::try_from(mask_x).map_err(|_| {
+                    InspectionError::Normalization(format!("mask column is invalid at {path}"))
+                })?;
+                mask_pixels.data[(mask_y * mask_width + mask_x) * 4]
+            } else {
+                default_coverage
+            };
+            let pixel_index = (y * pixel_width + x) * 4;
+            let alpha = u16::from(pixels.data[pixel_index + 3]);
+            pixels.data[pixel_index + 3] = ((alpha * u16::from(coverage) + 127) / 255) as u8;
+        }
+    }
+    Ok(pixels)
+}
+
 /// Normalizes parser enum debug names to a stable lowercase string.
 fn normalize_enum_name(value: &str) -> String {
     let mut spaced = String::with_capacity(value.len() + 4);
@@ -862,6 +1026,7 @@ pub fn convert(
     };
     let (mut document, mut information_loss) = normalize_bytes(&bytes)
         .map_err(|error| ConversionError::InputInspection(error.to_string()))?;
+    reject_unsupported_clipping(&information_loss)?;
     let frame_source_warnings = apply_frame_source(&mut document, options.frame_source)
         .map_err(ConversionError::InputInspection)?;
     if document.bits_per_channel != Some(8)

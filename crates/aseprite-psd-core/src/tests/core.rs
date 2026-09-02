@@ -1,5 +1,10 @@
 use super::*;
 
+use std::fs;
+use std::io::Cursor;
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 #[test]
 fn missing_layer_ids_use_stable_name_independent_fallbacks() {
     let first = layer_id(None, "0/1").expect("fallback id");
@@ -53,6 +58,262 @@ fn zero_area_layers_without_pixels_remain_empty() {
     let pixels = normalized.pixels.expect("empty pixel buffer");
     assert_eq!((pixels.width, pixels.height), (0, 0));
     assert!(pixels.data.is_empty());
+}
+
+/// Builds a small PSD fixture with a bitmap user mask and known alpha values.
+fn bitmap_mask_fixture(clipping: bool, parameterized: bool) -> ag_psd::psd::Psd {
+    let mut layer = ag_psd::psd::Layer::default();
+    layer.additional_info.name = Some("Masked layer".to_string());
+    layer.additional_info.id = Some(41.0);
+    layer.top = Some(0.0);
+    layer.left = Some(0.0);
+    layer.bottom = Some(1.0);
+    layer.right = Some(2.0);
+    layer.clipping = Some(clipping);
+    layer.image_data = Some(ag_psd::psd::PixelData {
+        width: 2,
+        height: 1,
+        data: vec![10, 20, 30, 200, 40, 50, 60, 100],
+    });
+    layer.additional_info.mask = Some(ag_psd::psd::LayerMaskData {
+        top: Some(0.0),
+        left: Some(0.0),
+        bottom: Some(1.0),
+        right: Some(2.0),
+        default_color: Some(0.0),
+        image_data: Some(ag_psd::psd::PixelData {
+            width: 2,
+            height: 1,
+            data: vec![64, 64, 64, 255, 128, 128, 128, 255],
+        }),
+        user_mask_density: parameterized.then_some(0.5),
+        ..Default::default()
+    });
+    ag_psd::psd::Psd {
+        width: 2.0,
+        height: 1.0,
+        channels: Some(4.0),
+        bits_per_channel: Some(8.0),
+        color_mode: Some(ag_psd::psd::ColorMode::Rgb),
+        children: Some(vec![layer]),
+        ..Default::default()
+    }
+}
+
+/// Writes a PSD fixture through the real ag-psd serializer.
+fn write_psd_fixture(path: &Path, psd: &ag_psd::psd::Psd) {
+    fs::write(path, ag_psd::write_psd(psd, &Default::default())).expect("write PSD fixture");
+}
+
+/// Creates a unique temporary directory for a core conversion fixture.
+fn fixture_directory(prefix: &str) -> std::path::PathBuf {
+    let directory = std::env::temp_dir().join(format!(
+        "{prefix}-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&directory).expect("create fixture directory");
+    directory
+}
+
+#[test]
+fn bitmap_user_mask_rasterizes_alpha_and_reports_editability_loss() {
+    let directory = fixture_directory("aseprite-psd-bitmap-mask");
+    let input = directory.join("masked.psd");
+    write_psd_fixture(&input, &bitmap_mask_fixture(false, false));
+
+    let (normalized, report) = normalize_bytes(&fs::read(&input).expect("read masked PSD"))
+        .expect("normalize bitmap mask fixture");
+    let layer = &normalized.root_layers[0];
+    assert_eq!(layer.name, "Masked layer");
+    assert_eq!(
+        layer.bounds,
+        NormalizedBounds {
+            left: 0,
+            top: 0,
+            right: 2,
+            bottom: 1
+        }
+    );
+    assert_eq!(
+        layer.pixels.as_ref().expect("masked layer pixels").data,
+        vec![10, 20, 30, 50, 40, 50, 60, 50]
+    );
+    let loss = report
+        .entries
+        .iter()
+        .find(|entry| entry.code == InformationLossCode::PixelMask)
+        .expect("bitmap mask loss report");
+    assert_eq!(loss.disposition, LossDisposition::Rasterized);
+    assert_eq!(loss.count, 1);
+    assert_eq!(loss.locations[0].path, "0");
+    assert_eq!(loss.locations[0].layer_id, Some(41));
+    assert!(loss.editability_impact);
+
+    fs::remove_dir_all(directory).expect("remove bitmap mask fixture");
+}
+
+#[test]
+fn bitmap_user_mask_maps_pixels_in_document_coordinates() {
+    let directory = fixture_directory("aseprite-psd-bitmap-mask-offset");
+    let input = directory.join("masked.psd");
+    let mut psd = bitmap_mask_fixture(false, false);
+    let layer = &mut psd.children.as_mut().expect("fixture layer")[0];
+    let mask = layer.additional_info.mask.as_mut().expect("fixture mask");
+    mask.left = Some(1.0);
+    mask.right = Some(2.0);
+    mask.default_color = Some(255.0);
+    mask.image_data = Some(ag_psd::psd::PixelData {
+        width: 1,
+        height: 1,
+        data: vec![64, 64, 64, 255],
+    });
+    write_psd_fixture(&input, &psd);
+
+    let (normalized, _) = normalize_bytes(&fs::read(&input).expect("read offset mask PSD"))
+        .expect("normalize offset bitmap mask fixture");
+    assert_eq!(
+        normalized.root_layers[0]
+            .pixels
+            .as_ref()
+            .expect("offset masked pixels")
+            .data,
+        vec![10, 20, 30, 200, 40, 50, 60, 25]
+    );
+
+    fs::remove_dir_all(directory).expect("remove offset bitmap mask fixture");
+}
+
+#[test]
+fn bitmap_user_mask_survives_convert_as_masked_aseprite_pixels() {
+    let directory = fixture_directory("aseprite-psd-bitmap-mask-convert");
+    let input = directory.join("masked.psd");
+    let output = directory.join("masked.aseprite");
+    write_psd_fixture(&input, &bitmap_mask_fixture(false, false));
+
+    let report = convert(
+        &input,
+        &output,
+        &ConvertOptions {
+            layer_association: LayerAssociation::Preserve,
+            ..Default::default()
+        },
+    )
+    .expect("convert bitmap mask fixture");
+    let loss = report
+        .information_loss
+        .entries
+        .iter()
+        .find(|entry| entry.code == InformationLossCode::PixelMask)
+        .expect("bitmap mask conversion report");
+    assert_eq!(loss.disposition, LossDisposition::Rasterized);
+
+    let bytes = fs::read(&output).expect("read converted Aseprite");
+    let file =
+        aseprite::AsepriteFile::from_reader(Cursor::new(bytes)).expect("parse converted Aseprite");
+    assert_eq!(file.frames().len(), 1);
+    assert_eq!(file.layers().len(), 1);
+    assert_eq!(file.layers()[0].name, "Masked layer");
+    let cel = file
+        .cel(file.layer_ref(0).expect("converted pixel layer"), 0)
+        .expect("converted masked cel");
+    match &cel.kind {
+        aseprite::CelKind::Raw { pixels, x, y }
+        | aseprite::CelKind::Compressed { pixels, x, y, .. } => {
+            assert_eq!((*x, *y), (0, 0));
+            assert_eq!(pixels.data, vec![10, 20, 30, 50, 40, 50, 60, 50]);
+        }
+        kind => panic!("unexpected converted cel kind: {kind:?}"),
+    }
+
+    fs::remove_dir_all(directory).expect("remove bitmap mask conversion fixture");
+}
+
+#[test]
+fn clipping_is_rejected_before_output_commit() {
+    let directory = fixture_directory("aseprite-psd-clipping");
+    let input = directory.join("clipping.psd");
+    let output = directory.join("clipping.aseprite");
+    write_psd_fixture(&input, &bitmap_mask_fixture(true, false));
+
+    let error = convert(
+        &input,
+        &output,
+        &ConvertOptions {
+            overwrite: true,
+            layer_association: LayerAssociation::Preserve,
+            ..Default::default()
+        },
+    )
+    .expect_err("clipping must be rejected");
+    let message = error.to_string();
+    assert!(message.contains("clipping is unsupported at layer path 0"));
+    assert!(message.contains("layer id Some(41)"));
+    assert!(!output.exists(), "rejected clipping must not commit output");
+
+    fs::remove_dir_all(directory).expect("remove clipping fixture");
+}
+
+#[test]
+fn parameterized_bitmap_mask_remains_explicitly_unsupported() {
+    let directory = fixture_directory("aseprite-psd-parameterized-mask");
+    let input = directory.join("parameterized.psd");
+    write_psd_fixture(&input, &bitmap_mask_fixture(false, true));
+
+    let (normalized, report) = normalize_bytes(&fs::read(&input).expect("read parameterized PSD"))
+        .expect("normalize parameterized mask fixture");
+    assert_eq!(
+        normalized.root_layers[0]
+            .pixels
+            .as_ref()
+            .expect("parameterized mask pixels")
+            .data,
+        vec![10, 20, 30, 200, 40, 50, 60, 100]
+    );
+    let loss = report
+        .entries
+        .iter()
+        .find(|entry| entry.code == InformationLossCode::PixelMask)
+        .expect("parameterized mask loss report");
+    assert_eq!(loss.disposition, LossDisposition::Dropped);
+    assert!(loss.detail.contains("not represented"));
+
+    fs::remove_dir_all(directory).expect("remove parameterized mask fixture");
+}
+
+#[test]
+fn vector_derived_mask_remains_explicitly_unsupported() {
+    let directory = fixture_directory("aseprite-psd-vector-mask");
+    let input = directory.join("vector-mask.psd");
+    let mut psd = bitmap_mask_fixture(false, false);
+    psd.children.as_mut().expect("fixture layer")[0]
+        .additional_info
+        .mask
+        .as_mut()
+        .expect("fixture mask")
+        .from_vector_data = Some(true);
+    write_psd_fixture(&input, &psd);
+
+    let (normalized, report) = normalize_bytes(&fs::read(&input).expect("read vector mask PSD"))
+        .expect("normalize vector mask fixture");
+    let loss = report
+        .entries
+        .iter()
+        .find(|entry| entry.code == InformationLossCode::PixelMask)
+        .expect("vector mask loss report");
+    assert_eq!(loss.disposition, LossDisposition::Dropped);
+    assert_eq!(
+        normalized.root_layers[0]
+            .pixels
+            .as_ref()
+            .expect("vector mask pixels")
+            .data,
+        vec![10, 20, 30, 200, 40, 50, 60, 100]
+    );
+
+    fs::remove_dir_all(directory).expect("remove vector mask fixture");
 }
 
 fn state(frame_index: u32, enabled: bool) -> NormalizedLayerFrameState {
