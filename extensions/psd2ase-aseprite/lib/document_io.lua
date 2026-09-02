@@ -15,11 +15,13 @@ function DocumentIO.new(process)
     if raw == "" then
       return
     end
-    local ok, report = pcall(json.decode, raw)
-    if not ok or type(report) ~= "table" then
+    local ok, frame_index = pcall(function()
+      local report = json.decode(raw)
+      return report and report.active_frame_index
+    end)
+    if not ok then
       return
     end
-    local frame_index = report.active_frame_index
     if type(frame_index) ~= "number" or frame_index < 0 or frame_index % 1 ~= 0 then
       return
     end

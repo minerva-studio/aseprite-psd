@@ -299,6 +299,30 @@ fn normalized_document(
     Ok(document_header(file, sequence, roots, loop_mode))
 }
 
+/// Resolves whether an Aseprite layer's base properties are valid for its layer kind.
+fn layer_properties(file: &AsepriteFile, layer: &aseprite::Layer) -> (Option<u8>, Option<String>) {
+    const OPACITY_VALID: u32 = 1;
+    const GROUP_PROPERTIES_VALID: u32 = 2;
+    let flags = file.flags();
+    let background = layer.background;
+    let opacity_valid = !background
+        && match layer.kind {
+            LayerKind::Group => flags & OPACITY_VALID != 0 && flags & GROUP_PROPERTIES_VALID != 0,
+            LayerKind::Normal | LayerKind::Tilemap { .. } => flags & OPACITY_VALID != 0,
+            _ => false,
+        };
+    let blend_valid = !background
+        && match layer.kind {
+            LayerKind::Group => flags & GROUP_PROPERTIES_VALID != 0,
+            LayerKind::Normal | LayerKind::Tilemap { .. } => true,
+            _ => false,
+        };
+    (
+        opacity_valid.then_some(layer.opacity),
+        blend_valid.then(|| blend_mode_name(layer.blend_mode)),
+    )
+}
+
 /// Recursively maps one Aseprite layer into normalized groups and static cel layers.
 fn build_layer(
     file: &AsepriteFile,
@@ -308,7 +332,8 @@ fn build_layer(
     next_id: &mut u32,
 ) -> Result<NormalizedLayer, ExportError> {
     let layer = &file.layers()[layer_index];
-    if !is_known_blend_mode(layer.blend_mode) {
+    let (_, blend_mode) = layer_properties(file, layer);
+    if blend_mode.is_some() && !is_known_blend_mode(layer.blend_mode) {
         report.add(
             InformationLossCode::UnknownBlendMode,
             LossDisposition::Degraded,
@@ -342,6 +367,7 @@ fn build_layer(
                 layer,
                 sequence.len(),
                 children,
+                layer_properties(file, layer),
                 Some(&reference_points),
             ))
         }
@@ -365,6 +391,7 @@ fn build_cel_layers(
     next_id: &mut u32,
 ) -> Result<NormalizedLayer, ExportError> {
     let layer = &file.layers()[layer_index];
+    let (layer_opacity, layer_blend_mode) = layer_properties(file, layer);
     let layer_ref = file
         .layer_ref(layer_index)
         .ok_or_else(|| ExportError::AsepriteRead("normal layer has no layer handle".to_string()))?;
@@ -437,8 +464,8 @@ fn build_cel_layers(
             },
             &vec![None; sequence.len()],
             0,
-            Some(layer.opacity),
-            blend_mode_name(layer.blend_mode),
+            layer_opacity,
+            layer_blend_mode.clone(),
             layer.visible,
             None,
         ));
@@ -450,8 +477,8 @@ fn build_cel_layers(
             &variants[0],
             &occurrences,
             0,
-            Some(layer.opacity),
-            blend_mode_name(layer.blend_mode),
+            layer_opacity,
+            layer_blend_mode.clone(),
             layer.visible,
             Some(&reference_points),
         ));
@@ -466,7 +493,7 @@ fn build_cel_layers(
             &occurrences,
             variant_index,
             Some(255),
-            "normal".to_string(),
+            Some("normal".to_string()),
             true,
             None,
         ));
@@ -476,6 +503,7 @@ fn build_cel_layers(
         layer,
         sequence.len(),
         children,
+        (layer_opacity, layer_blend_mode),
         Some(&reference_points),
     ))
 }
@@ -489,7 +517,7 @@ fn static_cel_layer(
     occurrences: &[Option<(usize, i32, i32, u8)>],
     variant_index: usize,
     layer_opacity: Option<u8>,
-    blend_mode: String,
+    blend_mode: Option<String>,
     visible: bool,
     reference_points: Option<&[Option<AnimationPoint>]>,
 ) -> NormalizedLayer {
@@ -527,7 +555,7 @@ fn static_cel_layer(
             bottom: variant.y + variant.height as i32,
         },
         opacity: layer_opacity.map(|value| f64::from(value) / 255.0),
-        blend_mode: Some(blend_mode),
+        blend_mode,
         hidden: Some(!visible),
         pixels: Some(NormalizedPixels {
             width: variant.width,
@@ -547,8 +575,10 @@ fn group_layer(
     layer: &aseprite::Layer,
     frame_count: usize,
     children: Vec<NormalizedLayer>,
+    properties: (Option<u8>, Option<String>),
     reference_points: Option<&[Option<AnimationPoint>]>,
 ) -> NormalizedLayer {
+    let (opacity, blend_mode) = properties;
     NormalizedLayer {
         id,
         name: layer.name.clone(),
@@ -559,8 +589,8 @@ fn group_layer(
             right: 0,
             bottom: 0,
         },
-        opacity: Some(f64::from(layer.opacity) / 255.0),
-        blend_mode: Some(blend_mode_name(layer.blend_mode)),
+        opacity: opacity.map(|value| f64::from(value) / 255.0),
+        blend_mode,
         hidden: Some(!layer.visible),
         pixels: None,
         children,
@@ -809,7 +839,7 @@ fn composite_document(
             &occurrences,
             index,
             Some(255),
-            "normal".to_string(),
+            Some("normal".to_string()),
             true,
             None,
         ));
@@ -832,7 +862,14 @@ fn composite_document(
     document_header(
         file,
         sequence,
-        vec![group_layer(1, &synthetic, sequence.len(), children, None)],
+        vec![group_layer(
+            1,
+            &synthetic,
+            sequence.len(),
+            children,
+            (Some(255), Some("normal".to_string())),
+            None,
+        )],
         loop_mode,
     )
 }

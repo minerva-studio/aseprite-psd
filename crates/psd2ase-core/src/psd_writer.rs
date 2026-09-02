@@ -1565,8 +1565,8 @@ fn compare_layers(
             || expected.name != actual.name
             || expected.kind != actual.kind
             || expected.bounds != actual.bounds
-            || !same_optional_float(expected.opacity, actual.opacity)
-            || expected.blend_mode != actual.blend_mode
+            || !same_base_opacity(expected.opacity, actual.opacity)
+            || !same_base_blend_mode(expected.blend_mode.as_deref(), actual.blend_mode.as_deref())
             || expected.hidden != actual.hidden
             || expected.pixels != actual.pixels
             || expected.frame_states.len() != actual.frame_states.len()
@@ -1605,6 +1605,16 @@ fn same_optional_float(left: Option<f64>, right: Option<f64>) -> bool {
         (Some(left), Some(right)) => (left - right).abs() < 1e-9,
         _ => false,
     }
+}
+
+/// Compares base layer opacity where PSD serializes an implicit default as 1.0.
+fn same_base_opacity(left: Option<f64>, right: Option<f64>) -> bool {
+    same_optional_float(Some(left.unwrap_or(1.0)), Some(right.unwrap_or(1.0)))
+}
+
+/// Compares base layer blend mode where PSD serializes an implicit default as Normal.
+fn same_base_blend_mode(left: Option<&str>, right: Option<&str>) -> bool {
+    left.unwrap_or("normal") == right.unwrap_or("normal")
 }
 
 /// Compares optional animation points with descriptor-level float tolerance.
