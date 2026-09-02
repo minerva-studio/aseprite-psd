@@ -31,6 +31,63 @@ pwsh -File tools/probe.ps1
 Use a real PSD supplied outside the repository for compatibility testing. Do
 not add customer artwork or private fixtures to Git.
 
+## Packaging and release
+
+The extension packaging scripts build the native release converter by default
+and write packages under `dist/`. On Linux or macOS, use Bash with the platform
+that matches the current machine:
+
+```text
+bash tools/package-aseprite-extension.sh --platform linux-x64
+bash tools/package-aseprite-extension.sh --platform macos-arm64
+bash tools/package-aseprite-extension.sh --platform macos-x64
+```
+
+On Windows, use the native PowerShell entry point:
+
+```powershell
+.\tools\package-aseprite-extension.ps1 -Platform windows-x64
+```
+
+Pass `--binary PATH --no-build`, or `-Binary PATH -NoBuild` in PowerShell, to
+package a converter that was built separately. Linux and macOS require the
+`zip` and `unzip` commands; Windows uses `Compress-Archive`.
+
+The Universal package is a multi-platform extension, not one fat executable.
+Prepare the four native converters with this layout:
+
+```text
+universal-input/windows-x64/aseprite-psd.exe
+universal-input/linux-x64/aseprite-psd
+universal-input/macos-arm64/aseprite-psd
+universal-input/macos-x64/aseprite-psd
+```
+
+Then assemble it on Linux or macOS so Unix executable permissions are
+preserved:
+
+```text
+bash tools/package-aseprite-extension.sh --platform universal \
+  --binary-dir universal-input --no-build
+```
+
+The packaging workflow first builds and verifies the CLI on four native
+runners, creates the four platform-specific extension packages, and then
+assembles `aseprite-psd-universal.aseprite-extension` from those converters.
+A manual `workflow_dispatch` run uploads the five packages as artifacts without
+publishing a release.
+
+Pushing a `v*` tag runs the same pipeline and creates or updates the matching
+GitHub Release. Create and push the tag explicitly:
+
+```text
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+GitHub Actions never creates a tag. Re-running the workflow for an existing tag
+updates the five release assets instead of creating a duplicate release.
+
 ## Test layout
 
 Unit tests are centralized under each crate's `src/tests/` directory and are

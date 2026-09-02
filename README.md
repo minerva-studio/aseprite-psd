@@ -9,7 +9,8 @@ that bundles the converter for import and native Save As workflows.
 ## Quick start: Aseprite extension
 
 1. Open the [latest GitHub Release](https://github.com/minerva-studio/aseprite-psd/releases/latest).
-2. Download the extension for your platform:
+2. Download `aseprite-psd-universal.aseprite-extension` for the simplest
+   installation, or choose a smaller platform-specific package:
    - `aseprite-psd-windows-x64.aseprite-extension` for Windows x64.
    - `aseprite-psd-linux-x64.aseprite-extension` for Linux x64 with glibc.
    - `aseprite-psd-macos-arm64.aseprite-extension` for Apple Silicon macOS.
@@ -19,6 +20,9 @@ that bundles the converter for import and native Save As workflows.
 4. Select **File > Import > Import PSD/PSB...** and choose a Photoshop document.
 5. Allow the extension to launch its bundled converter when Aseprite asks for
    external-program permission for the first time.
+
+The macOS packages are not code-signed or notarized yet, so Gatekeeper may
+restrict them after download.
 
 The explicit Import command opens a modified document that is not associated
 with the temporary conversion file. Native `File > Open` returns a document
@@ -84,44 +88,8 @@ ZIP-without-prediction mode, while empty layers default to `omit`. `omit`
 removes only pixel layers with no cel in any frame; a layer that is empty in
 some frames still gets a hidden placeholder so frame topology stays aligned.
 
-Build an Aseprite extension on Linux or macOS with the Bash script (the script
-builds the release converter and embeds it in the package):
-
-```text
-bash tools/package-aseprite-extension.sh --platform linux-x64
-bash tools/package-aseprite-extension.sh --platform macos-arm64
-bash tools/package-aseprite-extension.sh --platform macos-x64
-```
-
-On Windows, use the native PowerShell script:
-
-```powershell
-.\tools\package-aseprite-extension.ps1 -Platform windows-x64
-```
-
-Packages are written to `dist/aseprite-psd-<platform>.aseprite-extension`.
-Pass `--binary PATH --no-build` (or `-Binary PATH -NoBuild` in PowerShell) when
-packaging a converter built elsewhere. Linux and macOS require the `zip`
-command; Windows uses the built-in `Compress-Archive` command.
-
-The Bash script can also assemble a multi-platform package from four already
-built converters:
-
-```text
-bash tools/package-aseprite-extension.sh --platform universal \
-  --binary-dir universal-input --no-build
-```
-
-This is a multi-platform extension package, not a single fat executable. It
-contains Windows x64, Linux x64, macOS arm64, and macOS x64 converters, so the
-same package can be installed on all four platforms. Assemble it on Linux or
-macOS so Unix executable permissions are preserved.
-
-The GitHub Actions packaging workflow is manual-only (`workflow_dispatch`) and
-produces Windows x64, Linux x64, macOS arm64, macOS x64, and an additional
-universal artifact. The
-macOS packages are not code-signed or notarized yet, so Gatekeeper may restrict
-them after download.
+See [the development workflow](docs/development.md) for testing, extension
+packaging, CI, and release instructions.
 
 Inspect a PSD without writing output:
 
