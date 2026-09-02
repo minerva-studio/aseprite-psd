@@ -6,7 +6,6 @@ import { initializeCanvas, readPsd } from "ag-psd";
 import { createReader } from "ag-psd/dist/psdReader.js";
 import { resourceHandlersMap } from "ag-psd/dist/imageResources.js";
 
-const DEFAULT_INPUT = "path/to/fixture.psd";
 const SCHEMA_VERSION = 4;
 
 /**
@@ -30,7 +29,10 @@ initializeCanvas(() => {
 /** Runs the TypeScript ag-psd oracle and writes a normalized snapshot. */
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  const input = args.input ?? process.env.ASEPRITE_PSD_FIXTURE ?? DEFAULT_INPUT;
+  const input = args.input ?? process.env.ASEPRITE_PSD_FIXTURE;
+  if (!input) {
+    throw new Error("PSD input is required: pass --input or set ASEPRITE_PSD_FIXTURE");
+  }
   const output = args.output ?? "target/probe/oracle-snapshot.json";
   const bytes = await readFile(input);
   const psd = readPsd(bytes, {

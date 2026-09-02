@@ -10,7 +10,6 @@ use aseprite_psd_core::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-const DEFAULT_INPUT: &str = r"path\to\fixture.psd";
 const SCHEMA_VERSION: u32 = 4;
 
 /// Runs the Rust PSD probe and writes its normalized snapshot.
@@ -28,7 +27,9 @@ fn main() -> ExitCode {
 fn run(arguments: Vec<String>) -> Result<(), String> {
     let input = argument_value(&arguments, "--input")
         .or_else(|| env::var_os("ASEPRITE_PSD_FIXTURE").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_INPUT));
+        .ok_or_else(|| {
+            "PSD input is required: pass --input or set ASEPRITE_PSD_FIXTURE".to_owned()
+        })?;
     let output = argument_value(&arguments, "--output")
         .unwrap_or_else(|| PathBuf::from("target/probe/rust-snapshot.json"));
     if !input.is_file() {

@@ -21,15 +21,31 @@ cargo test --workspace --locked
 cargo run -p aseprite-psd -- --version
 cargo run -p aseprite-psd -- --help
 npm --prefix tools/ag-psd-oracle install --ignore-scripts --allow-git=all --cache tools/ag-psd-oracle/.npm-cache
-pwsh -File tools/probe.ps1
-# Run the Aseprite-hosted Lua module smoke check (Windows example)
-& 'aseprite' -b `
+pwsh -File tools/probe.ps1 -InputPath 'path\to\fixture.psd'
+pwsh -File tools/render-aseprite-frames.ps1 \
+  -InputPath target/probe/preserve.aseprite \
+  -OutputDirectory target/probe/preserve-frames -FrameCount 12
+# Compare frame-indexed Aseprite renders; visible/alpha differences fail.
+node tools/compare-aseprite-renders.mjs \
+  --left target/probe/preserve-frames \
+  --right target/probe/auto-frames \
+  --output target/probe/render-diff.json
+# Run the Aseprite-hosted Lua module smoke check (Windows example; Aseprite on PATH)
+$Aseprite = (Get-Command aseprite -ErrorAction Stop).Source
+& $Aseprite -b `
   --script-param extensionRoot=$PWD/extensions/aseprite-psd `
   --script extensions/aseprite-psd/tests/smoke.lua
 ```
 
 Use a real PSD supplied outside the repository for compatibility testing. Do
 not add customer artwork or private fixtures to Git.
+
+Use `-OutputDirectory` when probing multiple fixtures so their snapshots do not
+share files. The render comparator consumes frame-indexed `frame-N.png` files
+from two directories and writes per-frame and aggregate visible, Alpha, and
+transparent-RGB-only differences. Only visible or Alpha differences fail. When
+stable source order emits a documented Z-order diagnostic, repeat the visual
+gate with `--z-order auto`; stable and auto are separate conversion contracts.
 
 ## Packaging and release
 
@@ -99,10 +115,17 @@ production code. The CLI follows the same convention under
 `crates/aseprite-psd-cli/src/tests/`. Crate-level `tests/` directories are reserved
 for future black-box integration tests that exercise only public APIs.
 
-The probe runner reads `path\to\fixture.psd` by default. Set
-`ASEPRITE_PSD_FIXTURE` or pass `-InputPath` to select another local fixture. It
-writes only ignored JSON snapshots under `.probe/`, verifies the source file's
-size and SHA-256 before and after the run, and never creates an Aseprite file.
+The probe runner requires an input path. Set `ASEPRITE_PSD_FIXTURE` or pass
+`-InputPath` to select a local fixture. Use `-OutputDirectory` when probing
+multiple fixtures so their snapshots do not share files. It writes only ignored
+JSON snapshots under `target/probe/`,
+verifies the source file's size and SHA-256 before and after the run, and never
+creates an Aseprite file.
+
+The render comparator consumes frame-indexed `frame-N.png` files from two
+directories. It writes a JSON report with per-frame and aggregate visible,
+Alpha, and transparent-RGB-only differences. Only visible or Alpha differences
+fail the command; transparent RGB differences are retained as diagnostic data.
 
 Stage 3 adds a Photoshop frame-animation gate to the same probe command. The
 Rust scanner reads bounded image-resource and layer additional-info sections
