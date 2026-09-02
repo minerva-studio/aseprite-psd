@@ -22,6 +22,10 @@ cargo run -p psd2ase -- --version
 cargo run -p psd2ase -- --help
 npm --prefix tools/ag-psd-oracle install --ignore-scripts --allow-git=all --cache tools/ag-psd-oracle/.npm-cache
 pwsh -File tools/probe.ps1
+# Run the Aseprite-hosted Lua module smoke check (Windows example)
+& 'aseprite' -b `
+  --script-param extensionRoot=$PWD/extensions/psd2ase-aseprite `
+  --script extensions/psd2ase-aseprite/tests/smoke.lua
 ```
 
 Use a real PSD supplied outside the repository for compatibility testing. Do
@@ -92,6 +96,11 @@ all unsupported mappings are reported as warnings.
   Candidate folders never reuse a source layer ID and are validated against the
   public planned topology before writing.
 - `psd2ase` owns argument parsing, output policy, exit codes, and presentation.
+- The Aseprite adapter keeps `psd2ase.lua` as a registration-only entrypoint.
+  `lib/process.lua` owns the converter process and temporary-file boundary,
+  `lib/dialogs.lua` owns host UI, `lib/document_io.lua` owns Sprite lifecycle,
+  and `lib/workflows.lua` owns import/export orchestration. The adapter does
+  not duplicate PSD parsing or normalized conversion semantics.
 - The parser owns PSD decoding; the writer must not reinterpret PSD descriptors.
 - `NormalizedDocument::find_layer` is the single crate-private source-layer
   traversal used by planning, writing, and read-back validation.

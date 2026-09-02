@@ -69,6 +69,13 @@ source_dir="$repo_root/extensions/psd2ase-aseprite"
 
 [[ -f "$source_dir/package.json" ]] || { echo "error: package.json not found" >&2; exit 66; }
 [[ -f "$source_dir/psd2ase.lua" ]] || { echo "error: psd2ase.lua not found" >&2; exit 66; }
+module_files=(process.lua dialogs.lua document_io.lua workflows.lua)
+for module_file in "${module_files[@]}"; do
+  [[ -f "$source_dir/lib/$module_file" ]] || {
+    echo "error: extension module not found: $source_dir/lib/$module_file" >&2
+    exit 66
+  }
+done
 
 if [[ "$build_binary" -eq 1 ]]; then
   case "$platform" in
@@ -101,8 +108,12 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$staging/bin/$platform"
+mkdir -p "$staging/lib"
 cp -- "$source_dir/package.json" "$staging/package.json"
 cp -- "$source_dir/psd2ase.lua" "$staging/psd2ase.lua"
+for module_file in "${module_files[@]}"; do
+  cp -- "$source_dir/lib/$module_file" "$staging/lib/$module_file"
+done
 cp -- "$binary" "$staging/bin/$platform/$executable_name"
 
 python_command=""
