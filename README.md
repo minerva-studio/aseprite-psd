@@ -12,6 +12,8 @@ that bundles the converter for import and native Save As workflows.
 2. Download the extension for your platform:
    - `aseprite-psd-windows-x64.aseprite-extension` for Windows x64.
    - `aseprite-psd-linux-x64.aseprite-extension` for Linux x64 with glibc.
+   - `aseprite-psd-macos-arm64.aseprite-extension` for Apple Silicon macOS.
+   - `aseprite-psd-macos-x64.aseprite-extension` for Intel macOS.
 3. Open the downloaded package to install it in Aseprite, then restart Aseprite
    if the command is not immediately visible.
 4. Select **File > Import > Import PSD/PSB...** and choose a Photoshop document.
@@ -82,15 +84,44 @@ ZIP-without-prediction mode, while empty layers default to `omit`. `omit`
 removes only pixel layers with no cel in any frame; a layer that is empty in
 some frames still gets a hidden placeholder so frame topology stays aligned.
 
-Build the Windows x64 Aseprite extension in one step (the script builds the
-release converter and embeds it in the package):
+Build an Aseprite extension on Linux or macOS with the Bash script (the script
+builds the release converter and embeds it in the package):
 
 ```text
-bash tools/package-aseprite-extension.sh --platform windows-x64
+bash tools/package-aseprite-extension.sh --platform linux-x64
+bash tools/package-aseprite-extension.sh --platform macos-arm64
+bash tools/package-aseprite-extension.sh --platform macos-x64
 ```
 
-The package is written to `dist/aseprite-psd-windows-x64.aseprite-extension`.
-Pass `--binary PATH --no-build` when packaging a converter built elsewhere.
+On Windows, use the native PowerShell script:
+
+```powershell
+.\tools\package-aseprite-extension.ps1 -Platform windows-x64
+```
+
+Packages are written to `dist/aseprite-psd-<platform>.aseprite-extension`.
+Pass `--binary PATH --no-build` (or `-Binary PATH -NoBuild` in PowerShell) when
+packaging a converter built elsewhere. Linux and macOS require the `zip`
+command; Windows uses the built-in `Compress-Archive` command.
+
+The Bash script can also assemble a multi-platform package from four already
+built converters:
+
+```text
+bash tools/package-aseprite-extension.sh --platform universal \
+  --binary-dir universal-input --no-build
+```
+
+This is a multi-platform extension package, not a single fat executable. It
+contains Windows x64, Linux x64, macOS arm64, and macOS x64 converters, so the
+same package can be installed on all four platforms. Assemble it on Linux or
+macOS so Unix executable permissions are preserved.
+
+The GitHub Actions packaging workflow is manual-only (`workflow_dispatch`) and
+produces Windows x64, Linux x64, macOS arm64, macOS x64, and an additional
+universal artifact. The
+macOS packages are not code-signed or notarized yet, so Gatekeeper may restrict
+them after download.
 
 Inspect a PSD without writing output:
 
@@ -188,7 +219,8 @@ than synthesizing colors. Advanced overrides are available through
   Ubuntu/WSL2 Linux x64 with glibc. PSD/PSB Save As additionally requires the
   custom-format save callback implemented by Aseprite #6008 until that API is
   available in a stable Aseprite release.
-- macOS is not packaged or tested in this release.
+- macOS packages are built by the manual GitHub Actions workflow but have not
+  yet received authentic Aseprite runtime validation.
 - The extension registers PSD/PSB custom-format load and save callbacks. The
   explicit import command remains available for configurable import policies.
 - Conversion preserves the normalized layer tree, RGBA8 cels, Photoshop frame

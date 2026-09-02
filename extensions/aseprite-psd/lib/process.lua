@@ -24,6 +24,12 @@ function Process.new(plugin)
     elseif app.os.linux and app.os.x64 then
       platform_directory = "linux-x64"
       executable = "aseprite-psd"
+    elseif app.os.macos and app.os.arm64 then
+      platform_directory = "macos-arm64"
+      executable = "aseprite-psd"
+    elseif app.os.macos and app.os.x64 then
+      platform_directory = "macos-x64"
+      executable = "aseprite-psd"
     else
       return nil
     end

@@ -3,17 +3,20 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: package-aseprite-extension.sh --platform PLATFORM [--binary PATH] [--output PATH]
+Usage: package-aseprite-extension.sh --platform PLATFORM [--binary PATH | --binary-dir PATH] [--output PATH]
 
-PLATFORM must be linux-x64 or windows-x64.
+PLATFORM must be linux-x64, macos-arm64, macos-x64, windows-x64, or universal.
 
 When --binary is omitted, the script builds the native release converter before
 packaging it. Use --no-build with --binary when the converter was built elsewhere.
+Universal packaging requires --binary-dir containing one binary per platform and
+never builds a converter itself.
 EOF
 }
 
 platform=""
 binary=""
+binary_dir=""
 output=""
 build_binary=1
 
@@ -33,6 +36,12 @@ while (($# > 0)); do
     --no-build)
       build_binary=0
       shift
+      ;;
+    --binary-dir)
+      [[ $# -ge 2 ]] || { usage >&2; exit 64; }
+      binary_dir="$2"
+      build_binary=0
+      shift 2
       ;;
     --output)
       [[ $# -ge 2 ]] || { usage >&2; exit 64; }
@@ -54,11 +63,17 @@ case "$platform" in
   linux-x64)
     executable_name="aseprite-psd"
     ;;
+  macos-arm64|macos-x64)
+    executable_name="aseprite-psd"
+    ;;
   windows-x64)
     executable_name="aseprite-psd.exe"
     ;;
+  universal)
+    executable_name=""
+    ;;
   *)
-    echo "error: --platform must be linux-x64 or windows-x64" >&2
+    echo "error: --platform must be linux-x64, macos-arm64, macos-x64, windows-x64, or universal" >&2
     exit 64
     ;;
 esac
@@ -77,9 +92,26 @@ for module_file in "${module_files[@]}"; do
   }
 done
 
+if [[ "$platform" == "universal" ]]; then
+  [[ -n "$binary_dir" ]] || {
+    echo "error: --binary-dir is required for universal packaging" >&2
+    exit 64
+  }
+  [[ -z "$binary" ]] || {
+    echo "error: --binary and --binary-dir cannot be used together" >&2
+    exit 64
+  }
+elif [[ -n "$binary_dir" ]]; then
+  echo "error: --binary-dir is only valid with --platform universal" >&2
+  exit 64
+fi
+
 if [[ "$build_binary" -eq 1 ]]; then
   case "$platform" in
     linux-x64)
+      binary="$repo_root/target/release/aseprite-psd"
+      ;;
+    macos-arm64|macos-x64)
       binary="$repo_root/target/release/aseprite-psd"
       ;;
     windows-x64)
@@ -90,8 +122,10 @@ if [[ "$build_binary" -eq 1 ]]; then
   (cd "$repo_root" && cargo build --release --locked -p aseprite-psd)
 fi
 
-[[ -n "$binary" ]] || { echo "error: --binary is required when --no-build is used" >&2; exit 64; }
-[[ -f "$binary" ]] || { echo "error: converter binary not found: $binary" >&2; exit 66; }
+if [[ "$platform" != "universal" ]]; then
+  [[ -n "$binary" ]] || { echo "error: --binary is required when --no-build is used" >&2; exit 64; }
+  [[ -f "$binary" ]] || { echo "error: converter binary not found: $binary" >&2; exit 66; }
+fi
 
 if [[ -z "$output" ]]; then
   output="$repo_root/dist/aseprite-psd-$platform.aseprite-extension"
@@ -107,53 +141,75 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$staging/bin/$platform"
+if [[ "$platform" == "universal" ]]; then
+  mkdir -p "$staging/bin"
+else
+  mkdir -p "$staging/bin/$platform"
+fi
 mkdir -p "$staging/lib"
 cp -- "$source_dir/package.json" "$staging/package.json"
 cp -- "$source_dir/aseprite-psd.lua" "$staging/aseprite-psd.lua"
 for module_file in "${module_files[@]}"; do
   cp -- "$source_dir/lib/$module_file" "$staging/lib/$module_file"
 done
-cp -- "$binary" "$staging/bin/$platform/$executable_name"
-
-python_command=""
-for candidate in python3 python; do
-  if command -v "$candidate" >/dev/null 2>&1 \
-    && "$candidate" -c 'import zipfile' >/dev/null 2>&1; then
-    python_command="$candidate"
-    break
-  fi
-done
-
-quote_powershell_literal() {
-  local value="$1"
-  value="${value//\'/\'\'}"
-  printf "'%s'" "$value"
-}
+if [[ "$platform" == "universal" ]]; then
+  universal_platforms=(windows-x64 linux-x64 macos-arm64 macos-x64)
+  for universal_platform in "${universal_platforms[@]}"; do
+    if [[ "$universal_platform" == "windows-x64" ]]; then
+      universal_executable="aseprite-psd.exe"
+    else
+      universal_executable="aseprite-psd"
+    fi
+    universal_binary="$binary_dir/$universal_platform/$universal_executable"
+    [[ -f "$universal_binary" ]] || {
+      echo "error: universal converter binary not found: $universal_binary" >&2
+      exit 66
+    }
+    if [[ "$universal_platform" != "windows-x64" ]]; then
+      chmod +x "$universal_binary"
+    fi
+    mkdir -p "$staging/bin/$universal_platform"
+    cp -- "$universal_binary" "$staging/bin/$universal_platform/$universal_executable"
+  done
+else
+  cp -- "$binary" "$staging/bin/$platform/$executable_name"
+fi
 
 if command -v zip >/dev/null 2>&1; then
   (cd "$staging" && zip -q -r "$output" .)
-elif [[ -n "$python_command" ]]; then
-  "$python_command" - "$staging" "$output" <<'PY'
-import sys
-from pathlib import Path
-from zipfile import ZIP_DEFLATED, ZipFile
-
-staging = Path(sys.argv[1])
-output = Path(sys.argv[2])
-with ZipFile(output, "w", ZIP_DEFLATED) as archive:
-    for path in staging.rglob("*"):
-        if path.is_file():
-            archive.write(path, path.relative_to(staging).as_posix())
-PY
-elif command -v powershell.exe >/dev/null 2>&1 && command -v cygpath >/dev/null 2>&1; then
-  windows_staging="$(cygpath -w "$staging")"
-  windows_output="$(cygpath -w "$output")"
-  powershell_script="\$staging = $(quote_powershell_literal "$windows_staging"); \$output = $(quote_powershell_literal "$windows_output"); Compress-Archive -Path (Join-Path \$staging '*') -DestinationPath \$output -CompressionLevel Optimal -Force"
-  powershell.exe -NoLogo -NoProfile -NonInteractive -Command "$powershell_script"
 else
-  echo "error: install zip, Python 3, or PowerShell to create the extension archive" >&2
+  echo "error: install the zip command to create the extension archive" >&2
   exit 69
+fi
+
+if ! command -v unzip >/dev/null 2>&1; then
+  echo "error: install the unzip command to validate the extension archive" >&2
+  exit 69
+fi
+archive_entries="$(unzip -Z1 "$output")"
+require_entry() {
+  local entry="$1"
+  if ! printf '%s\n' "$archive_entries" | grep -Fqx "$entry"; then
+    echo "error: created archive is missing: $entry" >&2
+    exit 1
+  fi
+}
+require_entry "package.json"
+require_entry "aseprite-psd.lua"
+for module_file in "${module_files[@]}"; do
+  require_entry "lib/$module_file"
+done
+if [[ "$platform" == "universal" ]]; then
+  for universal_platform in "${universal_platforms[@]}"; do
+    if [[ "$universal_platform" == "windows-x64" ]]; then
+      universal_executable="aseprite-psd.exe"
+    else
+      universal_executable="aseprite-psd"
+    fi
+    require_entry "bin/$universal_platform/$universal_executable"
+  done
+else
+  require_entry "bin/$platform/$executable_name"
 fi
 
 echo "created $output"

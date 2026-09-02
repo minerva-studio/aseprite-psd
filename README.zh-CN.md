@@ -12,6 +12,8 @@
 2. 下载对应平台的扩展：
    - Windows x64 使用 `aseprite-psd-windows-x64.aseprite-extension`。
    - 使用 glibc 的 Linux x64 使用 `aseprite-psd-linux-x64.aseprite-extension`。
+   - Apple Silicon macOS 使用 `aseprite-psd-macos-arm64.aseprite-extension`。
+   - Intel macOS 使用 `aseprite-psd-macos-x64.aseprite-extension`。
 3. 打开下载的扩展包并安装到 Aseprite；如果菜单命令没有立即出现，请重启
    Aseprite。
 4. 选择 **File > Import > Import PSD/PSB...**，然后选择 Photoshop 文档。
@@ -63,15 +65,42 @@ cargo build --release --locked -p aseprite-psd
 省略空图层选项时默认不导出空像素图层。`omit` 只移除所有帧都没有 cel 的像素图层，
 部分帧暂时没有 cel 的图层仍保留隐藏占位，以维持帧结构一致。
 
-也可以一条命令构建 Windows x64 Aseprite 扩展；脚本会先构建 release
-converter，再把它嵌入扩展包：
+也可以在 Linux 或 macOS 上使用 Bash 脚本构建 Aseprite 扩展；脚本会先构建
+release converter，再把它嵌入扩展包：
 
 ```text
-bash tools/package-aseprite-extension.sh --platform windows-x64
+bash tools/package-aseprite-extension.sh --platform linux-x64
+bash tools/package-aseprite-extension.sh --platform macos-arm64
+bash tools/package-aseprite-extension.sh --platform macos-x64
 ```
 
-产物写入 `dist/aseprite-psd-windows-x64.aseprite-extension`。如果
-converter 已经在其他位置构建完成，可改用 `--binary PATH --no-build`。
+Windows 可以直接使用 PowerShell 脚本：
+
+```powershell
+.\tools\package-aseprite-extension.ps1 -Platform windows-x64
+```
+
+产物分别写入 `dist/aseprite-psd-<platform>.aseprite-extension`。如果
+converter 已经在其他位置构建完成，可改用 `--binary PATH --no-build`，或在
+PowerShell 中使用 `-Binary PATH -NoBuild`。Linux/macOS 本地需要 `zip` 命令；
+Windows 使用内置的 `Compress-Archive`。
+
+Bash 脚本还可以把四个平台已经编译好的 converter 组装成一个多平台扩展包：
+
+```text
+bash tools/package-aseprite-extension.sh --platform universal \
+  --binary-dir universal-input --no-build
+```
+
+这个 Universal 包不是单个 fat executable，而是同时包含 Windows x64、Linux
+x64、macOS arm64 和 macOS x64 四个 converter 的扩展包，因此同一个包可以安装
+到四种平台。请在 Linux 或 macOS 上组装，以保留 Unix 二进制的可执行权限。
+
+仓库的 GitHub Actions 打包 workflow 只通过手动 `workflow_dispatch` 触发，
+会分别生成 Windows x64、Linux x64、macOS arm64、macOS x64 以及额外的
+Universal artifact。
+macOS 构建产物当前未进行代码签名或 notarization，下载后可能受到 Gatekeeper
+限制。
 
 只检查 PSD，不写输出文件：
 
@@ -155,7 +184,8 @@ cel 复用候选。
 - 导入扩展包已在 Aseprite 1.3.18.3、Windows x64 和使用 glibc 的
   Ubuntu/WSL2 Linux x64 环境验证。在该 API 进入 Aseprite 稳定版前，
   PSD/PSB Save As 还要求 Aseprite #6008 所实现的自定义格式保存回调。
-- 本版本没有打包或测试 macOS。
+- macOS 包由手动 GitHub Actions workflow 构建，但目前还没有完成真实的
+  Aseprite 运行时验证。
 - 扩展会注册 PSD/PSB 自定义格式的加载与保存回调；需要配置导入策略时仍可使用
   明确的导入菜单命令。
 - 转换会保留规范化图层树、RGBA8 cel、Photoshop 帧动画和受支持的图层状态。
