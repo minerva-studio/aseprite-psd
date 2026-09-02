@@ -1,6 +1,6 @@
 //! PSD/PSB writer and read-back validator for normalized Aseprite exports.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 
@@ -983,7 +983,9 @@ struct LayerRecordLayout {
     layer_info_length_offset: usize,
     layer_info_length: usize,
     records: Vec<LayerRecord>,
-    channel_compressions: Vec<(u16, usize)>,
+    channel_payloads: Vec<ChannelPayload>,
+    composite_start: usize,
+    composite_compression: u16,
 }
 
 #[derive(Debug)]
@@ -993,6 +995,14 @@ struct LayerRecord {
     extra_end: usize,
     layer_id: Option<u32>,
     section_divider_type: Option<u32>,
+}
+
+#[derive(Debug)]
+struct ChannelPayload {
+    compression: u16,
+    encoded_length: usize,
+    data_start: usize,
+    expected_decoded_length: Option<usize>,
 }
 
 /// Locates all encoded layer records and their lyid values without interpreting pixels.
@@ -1016,15 +1026,26 @@ fn layer_record_layout(bytes: &[u8], psb: bool) -> Result<LayerRecordLayout, Exp
     let mut records = Vec::with_capacity(count);
     let mut channel_lengths_by_record = Vec::with_capacity(count);
     for _ in 0..count {
+        let top = read_be_i32(bytes, cursor)?;
+        let left = read_be_i32(bytes, cursor + 4)?;
+        let bottom = read_be_i32(bytes, cursor + 8)?;
+        let right = read_be_i32(bytes, cursor + 12)?;
         checked_advance(bytes, &mut cursor, 16)?;
+        let layer_pixels = Some(rectangle_area(top, left, bottom, right)?);
         let channels = read_be_u16(bytes, cursor)? as usize;
         cursor += 2;
         let mut channel_lengths = Vec::with_capacity(channels);
         for _ in 0..channels {
-            checked_advance(bytes, &mut cursor, 2)?;
+            let channel_id = read_be_i16(bytes, cursor)?;
+            cursor += 2;
             let length = read_be_length(bytes, cursor, psb)?;
             cursor += if psb { 8 } else { 4 };
-            channel_lengths.push(length);
+            channel_lengths.push((channel_id, length, layer_pixels));
+        }
+        if bytes.get(cursor..cursor + 4) != Some(b"8BIM") {
+            return Err(ExportError::Writer(
+                "layer record has an invalid blend-mode signature".to_string(),
+            ));
         }
         checked_advance(bytes, &mut cursor, 12)?;
         let extra_length_offset = cursor;
@@ -1035,7 +1056,8 @@ fn layer_record_layout(bytes: &[u8], psb: bool) -> Result<LayerRecordLayout, Exp
             .checked_add(extra_length)
             .filter(|end| *end <= bytes.len())
             .ok_or_else(|| ExportError::Writer("layer extra data exceeds output".to_string()))?;
-        let (layer_id, section_divider_type) = find_layer_metadata(&bytes[extra_start..extra_end])?;
+        let (layer_id, section_divider_type) =
+            find_layer_metadata(&bytes[extra_start..extra_end], psb)?;
         records.push(LayerRecord {
             extra_length_offset,
             extra_length,
@@ -1046,17 +1068,51 @@ fn layer_record_layout(bytes: &[u8], psb: bool) -> Result<LayerRecordLayout, Exp
         channel_lengths_by_record.push(channel_lengths);
         cursor = extra_end;
     }
-    let mut channel_compressions = Vec::new();
+    let layer_info_end = layer_info_length_offset
+        .checked_add(if psb { 8 } else { 4 })
+        .and_then(|start| start.checked_add(layer_info_length))
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| ExportError::Writer("layer info exceeds output".to_string()))?;
+    let mut channel_payloads = Vec::new();
     for channel_lengths in channel_lengths_by_record {
-        for length in channel_lengths {
-            channel_compressions.push((read_be_u16(bytes, cursor)?, length));
+        for (channel_id, length, layer_pixels) in channel_lengths {
+            if length < 2 {
+                return Err(ExportError::Writer(
+                    "layer channel is shorter than its compression field".to_string(),
+                ));
+            }
+            let compression = read_be_u16(bytes, cursor)?;
+            if compression > Compression::ZipWithPrediction as u16 {
+                return Err(ExportError::Writer(format!(
+                    "layer channel uses unknown compression code {compression}"
+                )));
+            }
+            channel_payloads.push(ChannelPayload {
+                compression,
+                encoded_length: length,
+                data_start: cursor + 2,
+                expected_decoded_length: (!matches!(channel_id, -2 | -3))
+                    .then_some(layer_pixels)
+                    .flatten(),
+            });
             cursor = cursor
                 .checked_add(length)
-                .filter(|end| *end <= bytes.len())
+                .filter(|end| *end <= layer_info_end)
                 .ok_or_else(|| {
                     ExportError::Writer("layer channel data exceeds output".to_string())
                 })?;
         }
+    }
+    let composite_start = layer_mask_length_offset
+        .checked_add(if psb { 8 } else { 4 })
+        .and_then(|start| start.checked_add(layer_mask_length))
+        .filter(|start| start.checked_add(2).is_some_and(|end| end <= bytes.len()))
+        .ok_or_else(|| ExportError::Writer("composite image data is truncated".to_string()))?;
+    let composite_compression = read_be_u16(bytes, composite_start)?;
+    if composite_compression > Compression::ZipWithPrediction as u16 {
+        return Err(ExportError::Writer(format!(
+            "composite image uses unknown compression code {composite_compression}"
+        )));
     }
     Ok(LayerRecordLayout {
         layer_mask_length_offset,
@@ -1064,12 +1120,14 @@ fn layer_record_layout(bytes: &[u8], psb: bool) -> Result<LayerRecordLayout, Exp
         layer_info_length_offset,
         layer_info_length,
         records,
-        channel_compressions,
+        channel_payloads,
+        composite_start,
+        composite_compression,
     })
 }
 
 /// Finds layer ID and section-divider metadata inside one layer's extra-data payload.
-fn find_layer_metadata(extra: &[u8]) -> Result<(Option<u32>, Option<u32>), ExportError> {
+fn find_layer_metadata(extra: &[u8], psb: bool) -> Result<(Option<u32>, Option<u32>), ExportError> {
     let mut cursor = 0;
     cursor = skip_local_u32_section(extra, cursor)?;
     cursor = skip_local_u32_section(extra, cursor)?;
@@ -1089,8 +1147,13 @@ fn find_layer_metadata(extra: &[u8]) -> Result<(Option<u32>, Option<u32>), Expor
         }
         let signature = &extra[cursor..cursor + 4];
         let key = &extra[cursor + 4..cursor + 8];
+        if signature != b"8BIM" && signature != b"8B64" {
+            return Err(ExportError::Writer(
+                "layer additional-info signature is invalid".to_string(),
+            ));
+        }
         cursor += 8;
-        let length = if signature == b"8B64" {
+        let length = if psb && additional_info_uses_u64_length(key) {
             let value = read_be_u64(extra, cursor)? as usize;
             cursor += 8;
             value
@@ -1107,15 +1170,59 @@ fn find_layer_metadata(extra: &[u8]) -> Result<(Option<u32>, Option<u32>), Expor
             })?;
         if key == b"lyid" {
             layer_id = Some(read_be_u32(extra, cursor)?);
-        } else if key == b"lsct" && length >= 4 {
-            section_divider_type = Some(read_be_u32(extra, cursor)?);
+        } else if matches!(key, b"lsct" | b"lsdk") && length >= 4 {
+            let divider = read_be_u32(extra, cursor)?;
+            if divider > SectionDividerType::BoundingSectionDivider as u32 {
+                return Err(ExportError::Writer(format!(
+                    "layer section divider uses unknown type {divider}"
+                )));
+            }
+            section_divider_type = Some(divider);
         }
         cursor = (end + 1) & !1;
     }
     Ok((layer_id, section_divider_type))
 }
 
-/// Validates container version, normalized layer animation, and flattened composite.
+/// Returns whether a PSB additional-info key uses an eight-byte length field.
+fn additional_info_uses_u64_length(key: &[u8]) -> bool {
+    matches!(
+        key,
+        b"LMsk"
+            | b"Lr16"
+            | b"Lr32"
+            | b"Layr"
+            | b"Mt16"
+            | b"Mt32"
+            | b"Mtrn"
+            | b"Alph"
+            | b"FMsk"
+            | b"lnk2"
+            | b"FEid"
+            | b"FXid"
+            | b"PxSD"
+    )
+}
+
+/// Calculates a checked PSD rectangle area and rejects inverted coordinates.
+fn rectangle_area(top: i32, left: i32, bottom: i32, right: i32) -> Result<usize, ExportError> {
+    let height = i64::from(bottom) - i64::from(top);
+    let width = i64::from(right) - i64::from(left);
+    if height < 0 || width < 0 {
+        return Err(ExportError::OutputValidation(
+            "layer record has inverted bounds".to_string(),
+        ));
+    }
+    let height = usize::try_from(height)
+        .map_err(|_| ExportError::OutputValidation("layer height exceeds memory".to_string()))?;
+    let width = usize::try_from(width)
+        .map_err(|_| ExportError::OutputValidation("layer width exceeds memory".to_string()))?;
+    width
+        .checked_mul(height)
+        .ok_or_else(|| ExportError::OutputValidation("layer area exceeds memory".to_string()))
+}
+
+/// Validates the container, export contract, normalized semantics, and composite.
 fn validate_output(
     bytes: &[u8],
     expected: &NormalizedDocument,
@@ -1123,12 +1230,7 @@ fn validate_output(
     psb: bool,
     compression: Option<ExportCompression>,
 ) -> Result<(), ExportError> {
-    let version = read_be_u16(bytes, 4)?;
-    if version != if psb { 2 } else { 1 } {
-        return Err(ExportError::OutputValidation(
-            "PSD/PSB container version differs from output extension".to_string(),
-        ));
-    }
+    let layout = validate_container_structure(bytes, psb)?;
     let options = ReadOptions {
         use_image_data: Some(true),
         skip_thumbnail: Some(true),
@@ -1136,6 +1238,68 @@ fn validate_output(
     };
     let parsed = ag_psd::read_psd(bytes, &options)
         .map_err(|error| ExportError::OutputValidation(error.to_string()))?;
+    validate_export_contract(&parsed, &layout, expected, compression)?;
+    validate_export_semantics(bytes, &parsed, expected, composites)?;
+    Ok(())
+}
+
+/// Validates only PSD/PSB container invariants required by the emitted RGB8 subset.
+fn validate_container_structure(bytes: &[u8], psb: bool) -> Result<LayerRecordLayout, ExportError> {
+    let version = read_be_u16(bytes, 4)?;
+    if version != if psb { 2 } else { 1 } {
+        return Err(ExportError::OutputValidation(
+            "PSD/PSB container version differs from output extension".to_string(),
+        ));
+    }
+    if bytes.get(6..12) != Some(&[0; 6]) {
+        return Err(ExportError::OutputValidation(
+            "PSD header reserved bytes are not zero".to_string(),
+        ));
+    }
+    let layout = layer_record_layout(bytes, psb)?;
+    for record in &layout.records {
+        if record
+            .section_divider_type
+            .is_some_and(|divider| divider > SectionDividerType::BoundingSectionDivider as u32)
+        {
+            return Err(ExportError::OutputValidation(
+                "layer record has an unknown section-divider type".to_string(),
+            ));
+        }
+    }
+    for payload in &layout.channel_payloads {
+        if matches!(
+            payload.compression,
+            value if value == Compression::ZipWithoutPrediction as u16
+                || value == Compression::ZipWithPrediction as u16
+        ) {
+            let end = payload
+                .data_start
+                .checked_add(payload.encoded_length - 2)
+                .filter(|end| *end <= bytes.len())
+                .ok_or_else(|| {
+                    ExportError::OutputValidation(
+                        "ZIP layer channel exceeds the output".to_string(),
+                    )
+                })?;
+            validate_zlib_payload(
+                &bytes[payload.data_start..end],
+                payload.expected_decoded_length,
+                "layer channel",
+            )?;
+        }
+    }
+    validate_composite_payload(bytes, psb, &layout)?;
+    Ok(layout)
+}
+
+/// Validates the choices promised by the Aseprite export interface.
+fn validate_export_contract(
+    parsed: &Psd,
+    layout: &LayerRecordLayout,
+    expected: &NormalizedDocument,
+    compression: Option<ExportCompression>,
+) -> Result<(), ExportError> {
     if !matches!(parsed.channels, Some(3.0 | 4.0))
         || parsed.bits_per_channel != Some(8.0)
         || parsed.color_mode != Some(ColorMode::Rgb)
@@ -1151,16 +1315,29 @@ fn validate_output(
             "canvas dimensions differ after ag-psd read-back".to_string(),
         ));
     }
-    validate_layer_records(bytes, expected, psb)?;
     if let Some(compression) = compression {
-        validate_channel_compression(bytes, psb, compression.ag_psd() as u16)?;
+        validate_channel_compression(layout, compression.ag_psd() as u16)?;
     }
+    Ok(())
+}
+
+/// Validates normalized document semantics and the independently supplied composite.
+fn validate_export_semantics(
+    bytes: &[u8],
+    parsed: &Psd,
+    expected: &NormalizedDocument,
+    composites: &[Vec<u8>],
+) -> Result<(), ExportError> {
     let (normalized, _) = crate::normalize_bytes(bytes)
         .map_err(|error| ExportError::OutputValidation(error.to_string()))?;
     compare_normalized(expected, &normalized)?;
-    let actual_composite = parsed.image_data.or(parsed.canvas).ok_or_else(|| {
-        ExportError::OutputValidation("read-back PSD has no composite image".to_string())
-    })?;
+    let actual_composite = parsed
+        .image_data
+        .as_ref()
+        .or(parsed.canvas.as_ref())
+        .ok_or_else(|| {
+            ExportError::OutputValidation("read-back PSD has no composite image".to_string())
+        })?;
     let expected_composite = composites.first().ok_or_else(|| {
         ExportError::OutputValidation("source has no composite frames".to_string())
     })?;
@@ -1194,90 +1371,158 @@ fn validate_output(
 }
 
 /// Verifies that layer and composite channel headers use the requested mode.
-fn validate_channel_compression(bytes: &[u8], psb: bool, expected: u16) -> Result<(), ExportError> {
-    let layout = layer_record_layout(bytes, psb)?;
-    for (compression, length) in layout.channel_compressions {
-        // ag-psd intentionally stores an empty channel as a two-byte raw payload.
-        if compression != expected && !(compression == Compression::RawData as u16 && length == 2) {
-            return Err(ExportError::OutputValidation(format!(
-                "encoded channel compression differs: expected {expected}, got {compression}"
-            )));
-        }
-    }
-    let composite_start =
-        layout.layer_mask_length_offset + if psb { 8 } else { 4 } + layout.layer_mask_length;
-    if read_be_u16(bytes, composite_start)? != expected {
-        return Err(ExportError::OutputValidation(
-            "encoded composite compression differs from requested mode".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-/// Checks that the encoded layer records contain exactly one stable ID per model layer.
-fn validate_layer_records(
-    bytes: &[u8],
-    expected: &NormalizedDocument,
-    psb: bool,
+fn validate_channel_compression(
+    layout: &LayerRecordLayout,
+    expected: u16,
 ) -> Result<(), ExportError> {
-    let layout = layer_record_layout(bytes, psb)?;
-    let expected_ids = collect_layer_ids(&expected.root_layers);
-    let expected_records_without_id = count_group_layers(&expected.root_layers);
-    let mut ids = BTreeSet::new();
-    let mut bounding_dividers_without_id = 0usize;
-    let mut invalid_records_without_id = 0usize;
-    for record in layout.records {
-        let Some(id) = record.layer_id else {
-            if record.section_divider_type
-                == Some(SectionDividerType::BoundingSectionDivider as u32)
-            {
-                bounding_dividers_without_id += 1;
-            } else {
-                invalid_records_without_id += 1;
-            }
-            continue;
-        };
-        if !ids.insert(id) {
+    for payload in &layout.channel_payloads {
+        // ag-psd intentionally stores an empty channel as a two-byte raw payload.
+        if payload.compression != expected
+            && !(payload.compression == Compression::RawData as u16 && payload.encoded_length == 2)
+        {
             return Err(ExportError::OutputValidation(format!(
-                "duplicate Photoshop layer ID in encoded output: {id}"
+                "encoded channel compression differs: expected {expected}, got {}",
+                payload.compression
             )));
         }
     }
-    if invalid_records_without_id > 0
-        || bounding_dividers_without_id != expected_records_without_id
-        || ids != expected_ids
-    {
+    if layout.composite_compression != expected {
         return Err(ExportError::OutputValidation(format!(
-            "encoded layer IDs differ: expected {:?}, got {:?} (bounding dividers without ID: {}, expected {}; invalid records without ID: {})",
-            expected_ids,
-            ids,
-            bounding_dividers_without_id,
-            expected_records_without_id,
-            invalid_records_without_id
+            "encoded composite compression differs: expected {expected}, got {}",
+            layout.composite_compression
         )));
     }
     Ok(())
 }
 
-/// Collects normalized layer IDs recursively, including groups and pixel layers.
-fn collect_layer_ids(layers: &[NormalizedLayer]) -> BTreeSet<u32> {
-    let mut ids = BTreeSet::new();
-    for layer in layers {
-        ids.insert(layer.id);
-        ids.extend(collect_layer_ids(&layer.children));
+/// Validates one complete zlib stream and its optional decoded byte length.
+fn validate_zlib_payload(
+    payload: &[u8],
+    expected_length: Option<usize>,
+    owner: &str,
+) -> Result<(), ExportError> {
+    use flate2::read::ZlibDecoder;
+    use std::io::Read;
+
+    let mut decoder = ZlibDecoder::new(payload);
+    let mut decoded = Vec::new();
+    decoder.read_to_end(&mut decoded).map_err(|error| {
+        ExportError::OutputValidation(format!("{owner} has invalid ZIP data: {error}"))
+    })?;
+    if decoder.total_in() as usize != payload.len() {
+        return Err(ExportError::OutputValidation(format!(
+            "{owner} contains bytes after its ZIP stream"
+        )));
     }
-    ids
+    if let Some(expected) = expected_length
+        && decoded.len() != expected
+    {
+        return Err(ExportError::OutputValidation(format!(
+            "{owner} ZIP output length differs: expected {expected}, got {}",
+            decoded.len()
+        )));
+    }
+    Ok(())
 }
 
-/// Counts PSD section-divider records emitted for normalized group layers.
-fn count_group_layers(layers: &[NormalizedLayer]) -> usize {
-    layers
-        .iter()
-        .map(|layer| {
-            usize::from(layer.kind == NormalizedLayerKind::Group)
-                + count_group_layers(&layer.children)
-        })
-        .sum()
+/// Validates the composite channel payload using its declared compression method.
+fn validate_composite_payload(
+    bytes: &[u8],
+    psb: bool,
+    layout: &LayerRecordLayout,
+) -> Result<(), ExportError> {
+    use flate2::{Decompress, FlushDecompress, Status};
+
+    let channels = read_be_u16(bytes, 12)? as usize;
+    let height = read_be_u32(bytes, 14)? as usize;
+    let width = read_be_u32(bytes, 18)? as usize;
+    let channel_size = width.checked_mul(height).ok_or_else(|| {
+        ExportError::OutputValidation("composite dimensions overflow memory".to_string())
+    })?;
+    let payload_start = layout.composite_start + 2;
+    let payload = &bytes[payload_start..];
+    match layout.composite_compression {
+        value if value == Compression::RawData as u16 => {
+            let expected = channel_size.checked_mul(channels).ok_or_else(|| {
+                ExportError::OutputValidation("composite byte length overflows memory".to_string())
+            })?;
+            if payload.len() != expected {
+                return Err(ExportError::OutputValidation(format!(
+                    "raw composite length differs: expected {expected}, got {}",
+                    payload.len()
+                )));
+            }
+        }
+        value if value == Compression::RleCompressed as u16 => {
+            let count_width = if psb { 4 } else { 2 };
+            let rows = height.checked_mul(channels).ok_or_else(|| {
+                ExportError::OutputValidation("composite RLE row count overflows".to_string())
+            })?;
+            let table_length = rows.checked_mul(count_width).ok_or_else(|| {
+                ExportError::OutputValidation("composite RLE table overflows".to_string())
+            })?;
+            if payload.len() < table_length {
+                return Err(ExportError::OutputValidation(
+                    "composite RLE row table is truncated".to_string(),
+                ));
+            }
+            let mut encoded_length = 0usize;
+            for row in 0..rows {
+                let offset = row * count_width;
+                let length = if psb {
+                    read_be_u32(payload, offset)? as usize
+                } else {
+                    read_be_u16(payload, offset)? as usize
+                };
+                encoded_length = encoded_length.checked_add(length).ok_or_else(|| {
+                    ExportError::OutputValidation("composite RLE payload overflows".to_string())
+                })?;
+            }
+            if table_length + encoded_length != payload.len() {
+                return Err(ExportError::OutputValidation(
+                    "composite RLE row lengths do not cover the payload".to_string(),
+                ));
+            }
+        }
+        value
+            if value == Compression::ZipWithoutPrediction as u16
+                || value == Compression::ZipWithPrediction as u16 =>
+        {
+            let mut cursor = 0usize;
+            for _ in 0..channels {
+                let mut decompressor = Decompress::new(true);
+                let mut decoded = vec![0; channel_size.saturating_add(1)];
+                let status = decompressor
+                    .decompress(&payload[cursor..], &mut decoded, FlushDecompress::Finish)
+                    .map_err(|error| {
+                        ExportError::OutputValidation(format!(
+                            "composite channel has invalid ZIP data: {error}"
+                        ))
+                    })?;
+                if status != Status::StreamEnd || decompressor.total_out() as usize != channel_size
+                {
+                    return Err(ExportError::OutputValidation(
+                        "composite ZIP channel did not decode to the canvas size".to_string(),
+                    ));
+                }
+                cursor = cursor
+                    .checked_add(decompressor.total_in() as usize)
+                    .filter(|cursor| *cursor <= payload.len())
+                    .ok_or_else(|| {
+                        ExportError::OutputValidation(
+                            "composite ZIP channel exceeds the payload".to_string(),
+                        )
+                    })?;
+            }
+            if cursor != payload.len() {
+                return Err(ExportError::OutputValidation(
+                    "composite image contains bytes after its ZIP channels".to_string(),
+                ));
+            }
+        }
+        _ => unreachable!("compression code was checked while parsing the layout"),
+    }
+    Ok(())
 }
 
 /// Compares the enduring normalized contracts written into the PSD.
@@ -1412,6 +1657,11 @@ fn read_be_i16(bytes: &[u8], offset: usize) -> Result<i16, ExportError> {
     Ok(read_be_u16(bytes, offset)? as i16)
 }
 
+/// Reads a big-endian i32 from a checked byte offset.
+fn read_be_i32(bytes: &[u8], offset: usize) -> Result<i32, ExportError> {
+    Ok(read_be_u32(bytes, offset)? as i32)
+}
+
 /// Reads a big-endian u32 from a checked byte offset.
 fn read_be_u32(bytes: &[u8], offset: usize) -> Result<u32, ExportError> {
     let value = bytes
@@ -1483,6 +1733,114 @@ mod tests {
         AsepriteFile, BlendMode as AseBlendMode, ColorMode as AseColorMode, LayerOptions, Pixels,
         Tileset, TilesetData, TilesetFlags,
     };
+
+    /// Builds the mandatory prefix of one layer extra-data payload.
+    fn empty_layer_extra() -> Vec<u8> {
+        vec![0; 12]
+    }
+
+    /// Appends one even-padded additional-info block to layer extra data.
+    fn push_additional_info(extra: &mut Vec<u8>, signature: &[u8; 4], key: &[u8; 4], data: &[u8]) {
+        extra.extend_from_slice(signature);
+        extra.extend_from_slice(key);
+        extra.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        extra.extend_from_slice(data);
+        if !data.len().is_multiple_of(2) {
+            extra.push(0);
+        }
+    }
+
+    /// Collects logical layer IDs for writer-contract assertions.
+    fn collect_normalized_ids(layers: &[NormalizedLayer], ids: &mut Vec<u32>) {
+        for layer in layers {
+            ids.push(layer.id);
+            collect_normalized_ids(&layer.children, ids);
+        }
+    }
+
+    #[test]
+    fn optional_layer_metadata_accepts_legal_absence_and_unknown_blocks() {
+        assert_eq!(
+            find_layer_metadata(&empty_layer_extra(), false).expect("empty layer extra"),
+            (None, None)
+        );
+
+        let mut extra = empty_layer_extra();
+        push_additional_info(&mut extra, b"8BIM", b"zzzz", &[1, 2, 3]);
+        assert_eq!(
+            find_layer_metadata(&extra, false).expect("unknown additional info"),
+            (None, None)
+        );
+
+        let mut psb_extra = empty_layer_extra();
+        psb_extra.extend_from_slice(b"8B64Lr16");
+        psb_extra.extend_from_slice(&0u64.to_be_bytes());
+        assert_eq!(
+            find_layer_metadata(&psb_extra, true).expect("PSB large-length block"),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn section_divider_accepts_every_specified_type_and_optional_tail() {
+        for divider in 0u32..=3 {
+            for length in [4usize, 12, 16] {
+                let mut data = vec![0; length];
+                data[..4].copy_from_slice(&divider.to_be_bytes());
+                if length >= 12 {
+                    data[4..8].copy_from_slice(b"8BIM");
+                    data[8..12].copy_from_slice(b"pass");
+                }
+                let mut extra = empty_layer_extra();
+                push_additional_info(&mut extra, b"8BIM", b"lsct", &data);
+                assert_eq!(
+                    find_layer_metadata(&extra, false).expect("valid section divider"),
+                    (None, Some(divider))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_additional_info_is_rejected_without_requiring_layer_id() {
+        let mut invalid_signature = empty_layer_extra();
+        push_additional_info(&mut invalid_signature, b"NOPE", b"zzzz", &[1]);
+        assert!(find_layer_metadata(&invalid_signature, false).is_err());
+
+        let mut truncated = empty_layer_extra();
+        truncated.extend_from_slice(b"8BIMlyid");
+        truncated.extend_from_slice(&4u32.to_be_bytes());
+        truncated.extend_from_slice(&[0, 1]);
+        assert!(find_layer_metadata(&truncated, false).is_err());
+
+        let mut unknown_divider = empty_layer_extra();
+        push_additional_info(&mut unknown_divider, b"8BIM", b"lsdk", &4u32.to_be_bytes());
+        assert!(find_layer_metadata(&unknown_divider, false).is_err());
+    }
+
+    #[test]
+    fn strict_zip_validation_rejects_raw_deflate_and_corruption() {
+        use flate2::Compression as FlateCompression;
+        use flate2::write::{DeflateEncoder, ZlibEncoder};
+        use std::io::Write;
+
+        let source = [1, 2, 3, 4];
+        let mut zlib = ZlibEncoder::new(Vec::new(), FlateCompression::default());
+        zlib.write_all(&source).expect("zlib write");
+        let encoded = zlib.finish().expect("zlib finish");
+        validate_zlib_payload(&encoded, Some(source.len()), "test channel")
+            .expect("valid zlib payload");
+
+        let mut raw = DeflateEncoder::new(Vec::new(), FlateCompression::default());
+        raw.write_all(&source).expect("deflate write");
+        let raw = raw.finish().expect("deflate finish");
+        assert!(validate_zlib_payload(&raw, Some(source.len()), "test channel").is_err());
+
+        let mut corrupted = encoded;
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0xff;
+        assert!(validate_zlib_payload(&corrupted, Some(source.len()), "test channel").is_err());
+    }
 
     #[test]
     fn exports_animation_and_rejects_unapproved_replacement() {
@@ -1604,6 +1962,22 @@ mod tests {
             }
         );
         let normalized = crate::normalize(&output).expect("normalize written PSD");
+        let layout = layer_record_layout(&bytes, false).expect("inspect writer layer records");
+        assert!(layout.records.iter().any(|record| {
+            record.layer_id.is_none()
+                && record.section_divider_type
+                    == Some(SectionDividerType::BoundingSectionDivider as u32)
+        }));
+        let mut expected_ids = Vec::new();
+        collect_normalized_ids(&normalized.root_layers, &mut expected_ids);
+        expected_ids.sort_unstable();
+        let mut written_ids = layout
+            .records
+            .iter()
+            .filter_map(|record| record.layer_id)
+            .collect::<Vec<_>>();
+        written_ids.sort_unstable();
+        assert_eq!(written_ids, expected_ids);
         assert_eq!(normalized.frames.len(), 3);
         assert_eq!(normalized.frames[0].duration_ms, Some(120));
         assert_eq!(normalized.frames[1].duration_ms, Some(80));

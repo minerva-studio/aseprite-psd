@@ -11,7 +11,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "ag-psd"
 version = "0.2.0"
-source = "git+https://github.com/minerva-studio/ag-psd-rs.git?rev=c250b11#c250b11f6f89ea70e49b223b7734d48924ee46b7"
+source = "git+https://github.com/minerva-studio/ag-psd-rs.git?rev=e1f3db7#e1f3db7f5add9c2ceda2c04113ed9f28168d33c5"
 dependencies = [
  "flate2",
 ]
@@ -152,6 +152,7 @@ version = "0.1.0"
 dependencies = [
  "ag-psd",
  "aseprite-io",
+ "flate2",
  "serde",
  "serde_json",
 ]
