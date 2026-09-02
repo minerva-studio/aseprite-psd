@@ -3,7 +3,7 @@
 [English](README.md)
 
 `aseprite-psd` 用于在 Photoshop PSD/PSB 与 Aseprite 文档之间双向转换。项目同时
-提供原生命令行程序，以及内附 converter、支持导入和原生 Save As 的 Aseprite
+提供原生命令行程序，以及内附 converter、支持导入和导出流程的 Aseprite
 扩展。
 
 ## 快速开始：Aseprite 扩展
@@ -23,15 +23,21 @@
 macOS 构建产物当前未进行代码签名或 notarization，下载后可能受到 Gatekeeper
 限制。
 
-明确的 Import 命令会打开已修改、且未与转换临时文件关联的文档。原生
-`File > Open` 则返回与原始 PSD 关联的文档。对于明确导入的文档，可按 Ctrl+S
-或使用 Save As 选择最终 `.aseprite` 路径；Aseprite 会默认建议 PSD 所在目录和同名文件。
+通过 `File > Open` 和 `File > Save As...` 直接打开、保存 PSD/PSB，预计需要
+Aseprite 1.3.18.4；上游进度见 [Aseprite #6007](https://github.com/aseprite/aseprite/issues/6007)。
+在该版本可用之前，请改用 **File > Import > Import PSD/PSB...** 和
+**File > Export > Export PSD/PSB...**。
 
-原生 `File > Open` 和明确的 Import 命令都会显示同一套导入选项。用户可选择
-`Automatic association` 或 `Preserve layers`。在 Automatic association 下，勾选
-`Use metadata` 会使用精确的 metadata preset；取消后会启用下方 association 调参并使用
-普通启发式路径。旧 v1 标记和无标记文件使用自动关联回退；converter 元数据损坏时会进入
-恢复选择，不会被静默忽略。特别地，没有 metadata 的 PSD 不会被当作
+明确的 Import 命令会打开已修改、且未与转换临时文件关联的文档。原生
+集成可用后，`File > Open` 会返回与原始 PSD 关联的文档。对于明确导入的文档，
+可按 Ctrl+S 或使用 Save As 选择最终 `.aseprite` 路径；Aseprite 会默认建议 PSD
+所在目录和同名文件。
+
+明确的 Import 命令，以及原生集成可用后的 `File > Open`，都会显示同一套导入选项。
+用户可选择 `Automatic association` 或 `Preserve layers`。在 Automatic association 下，
+勾选 `Use metadata` 会使用精确的 metadata preset；取消后会启用下方 association 调参并
+使用普通启发式路径。旧 v1 标记和无标记文件使用自动关联回退；converter 元数据损坏时
+会进入恢复选择，不会被静默忽略。特别地，没有 metadata 的 PSD 不会被当作
 `Preserve layers`，而是有意回退到标准的 Automatic association。需要为这类文件调整
 association strategy 时，请取消 `Use metadata`。
 
@@ -41,12 +47,13 @@ Photoshop 等其他读取器可以忽略这段信息。通过 **File > Export > 
 Settings...** 可以分别控制导出时写入 metadata，以及导入时是否使用 metadata。
 关闭导出标记后 PSD 仍可正常读写，但后续打开无法使用本转换器的精确图层关联。
 
-在原生 `File > Open` 中取消导入对话框会明确报告 `PSD opening cancelled by user.`，
-不会伪装成失败的 Sprite 或半初始化文档。
+原生集成可用后，在 `File > Open` 中取消导入对话框会明确报告
+`PSD opening cancelled by user.`，不会伪装成失败的 Sprite 或半初始化文档。
 
-导出时选择 **File > Save As...**，并指定 `.psd` 或 `.psb`。扩展会分别创建
-隔离的原始副本与扁平副本，调用内附 converter 并验证 Photoshop 文档，最后
-才通过 Aseprite 自定义格式的保存流写入。保存选项可以选择是否把当前帧写成
+当前导出请使用 **File > Export > Export PSD/PSB...**。原生集成可用后，选择
+**File > Save As...** 并指定 `.psd` 或 `.psb` 将成为额外入口。扩展会分别创建
+隔离的原始副本与扁平副本，调用内附 converter 并验证 Photoshop 文档，最后才通过
+Aseprite 自定义格式的保存流写入。保存选项可以选择是否把当前帧写成
 Photoshop 的 active frame（导出始终使用当前帧），以及选择通道压缩（`ZIP`、
 `ZIP prediction`、`RLE` 或 `Raw`）。同一 Sprite 保存到同一路径时，后续 Ctrl+S
 会复用上次成功的压缩和空像素图层选项；路径改变或扩展重载后会再次询问。明确的
@@ -151,8 +158,10 @@ cel 复用候选。
 ## 当前边界
 
 - 导入扩展包已在 Aseprite 1.3.18.3、Windows x64 和使用 glibc 的
-  Ubuntu/WSL2 Linux x64 环境验证。在该 API 进入 Aseprite 稳定版前，
-  PSD/PSB Save As 还要求 Aseprite #6008 所实现的自定义格式保存回调。
+  Ubuntu/WSL2 Linux x64 环境验证。原生 PSD/PSB `File > Open` 和 `File >
+  Save As...` 集成预计将在 Aseprite 1.3.18.4 中提供；进度见
+  [Aseprite #6007](https://github.com/aseprite/aseprite/issues/6007)。更早版本必须使用
+  扩展提供的明确 Import 和 Export 命令。
 - macOS 包由手动 GitHub Actions workflow 构建，但目前还没有完成真实的
   Aseprite 运行时验证。
 - 扩展会注册 PSD/PSB 自定义格式的加载与保存回调；需要配置导入策略时仍可使用

@@ -4,7 +4,7 @@
 
 `aseprite-psd` converts Photoshop PSD/PSB documents to and from Aseprite documents.
 It is available as a native command-line program and as an Aseprite extension
-that bundles the converter for import and native Save As workflows.
+that bundles the converter for import and export workflows.
 
 ## Quick start: Aseprite extension
 
@@ -24,22 +24,27 @@ that bundles the converter for import and native Save As workflows.
 The macOS packages are not code-signed or notarized yet, so Gatekeeper may
 restrict them after download.
 
-The explicit Import command opens a modified document that is not associated
-with the temporary conversion file. Native `File > Open` returns a document
-associated with the original PSD. For an explicit import, press Ctrl+S or use
-Save As to choose the final `.aseprite` path; Aseprite suggests the PSD's
-directory and base name.
+Native PSD/PSB integration through `File > Open` and `File > Save As...` is
+expected to require Aseprite 1.3.18.4; follow [Aseprite #6007](https://github.com/aseprite/aseprite/issues/6007)
+for the upstream status. Until that version is available, use **File > Import >
+Import PSD/PSB...** and **File > Export > Export PSD/PSB...** instead.
 
-Both native `File > Open` and the explicit Import command show the same import
-options. Choose `Automatic association` or `Preserve layers`. In Automatic
-association mode, `Use metadata` selects the exact metadata preset; when it is
-off, the dialog exposes the experimental association controls and uses the
-normal heuristics. Legacy v1 and unmarked files use the automatic association
-fallback, while damaged converter metadata opens a recovery choice instead of
-being silently ignored. In particular, an unmarked PSD is intentionally not
-treated as `Preserve layers`: it falls back to the standard Automatic
-association path. Turn off `Use metadata` when you need to tune the association
-strategy for such a file.
+The explicit Import command opens a modified document that is not associated
+with the temporary conversion file. Once the native integration is available,
+`File > Open` returns a document associated with the original PSD. For an
+explicit import, press Ctrl+S or use Save As to choose the final `.aseprite`
+path; Aseprite suggests the PSD's directory and base name.
+
+The explicit Import command—and native `File > Open` once available—shows the
+same import options. Choose `Automatic association` or `Preserve layers`. In
+Automatic association mode, `Use metadata` selects the exact metadata preset;
+when it is off, the dialog exposes the experimental association controls and
+uses the normal heuristics. Legacy v1 and unmarked files use the automatic
+association fallback, while damaged converter metadata opens a recovery choice
+instead of being silently ignored. In particular, an unmarked PSD is
+intentionally not treated as `Preserve layers`: it falls back to the standard
+Automatic association path. Turn off `Use metadata` when you need to tune the
+association strategy for such a file.
 
 Exports include an invisible, versioned PSD metadata block by
 default. It records only the metadata version, logical layer IDs, and
@@ -51,14 +56,16 @@ association on the heuristic path even when metadata is present. Disabling
 export embedding leaves the PSD readable, but future opens cannot use exact
 converter-owned layer association from that file.
 
-Cancelling the native `File > Open` import dialog reports `PSD opening
-cancelled by user.` so that a cancelled open is never confused with a failed
-or partially initialized document.
+Once native integration is available, cancelling its `File > Open` import
+dialog reports `PSD opening cancelled by user.` so that a cancelled open is
+never confused with a failed or partially initialized document.
 
-To export, choose **File > Save As...** and select `.psd` or `.psb`. The
-extension snapshots isolated original and flattened copies, runs the bundled
-converter, validates the Photoshop document, and only then writes it through
-Aseprite's custom-format save stream. The save options let you choose whether
+To export now, choose **File > Export > Export PSD/PSB...**. Native `File > Save
+As...` with a `.psd` or `.psb` destination becomes an additional entry point
+once the Aseprite integration is available. The extension snapshots isolated
+original and flattened copies, runs the bundled converter, validates the
+Photoshop document, and only then writes it through Aseprite's custom-format
+save stream. The save options let you choose whether
 the current frame is written as Photoshop's active frame and whether empty
 pixel layers are included. Ctrl+S reuses the selected format and options.
 Export always records the currently selected frame
@@ -184,9 +191,10 @@ than synthesizing colors. Advanced overrides are available through
 ## Current boundaries
 
 - Import packages have been validated with Aseprite 1.3.18.3 on Windows x64 and
-  Ubuntu/WSL2 Linux x64 with glibc. PSD/PSB Save As additionally requires the
-  custom-format save callback implemented by Aseprite #6008 until that API is
-  available in a stable Aseprite release.
+  Ubuntu/WSL2 Linux x64 with glibc. Native PSD/PSB `File > Open` and `File >
+  Save As...` integration is expected in Aseprite 1.3.18.4; track
+  [Aseprite #6007](https://github.com/aseprite/aseprite/issues/6007). Earlier
+  versions must use the extension's explicit Import and Export commands.
 - macOS packages are built by the manual GitHub Actions workflow but have not
   yet received authentic Aseprite runtime validation.
 - The extension registers PSD/PSB custom-format load and save callbacks. The
