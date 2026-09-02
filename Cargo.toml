@@ -1,12 +1,12 @@
 [workspace]
 members = [
-    "crates/psd2ase-core",
-    "crates/psd2ase-cli",
-    "tools/rust-psd-probe",
+    "crates/aseprite-psd-core",
+    "crates/aseprite-psd-cli",
+    "tools/rust-aseprite-psd-probe",
 ]
 default-members = [
-    "crates/psd2ase-core",
-    "crates/psd2ase-cli",
+    "crates/aseprite-psd-core",
+    "crates/aseprite-psd-cli",
 ]
 resolver = "2"
 

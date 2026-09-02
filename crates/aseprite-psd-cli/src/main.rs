@@ -2,7 +2,7 @@ use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use psd2ase_core::{
+use aseprite_psd_core::{
     AssociationDecisionStatus, AssociationStrategy, AutoAssociationOptions, ConversionError,
     ConvertOptions, ExportCompression, ExportOptions, FrameSource, JitterKind, JitterMode,
     JitterOptions, JitterProfile, LayerAssociation, LayerZOrderMode, LinkedCelMode,
@@ -10,8 +10,8 @@ use psd2ase_core::{
     write_report_with_active_frame,
 };
 
-const CONVERT_USAGE: &str = "usage: psd2ase convert INPUT [-o OUTPUT] [--report PATH] [--overwrite] [--frame-source auto|static|top-level] [--preserve-photoshop-metadata] [--linked-cels off|identical] [--layer-association preserve|auto|roundtrip] [--association-strategy compact|conservative] [--z-order stable|auto] [--stable-order consensus|anchor|strict] [--uncertain-layers group|flat] [--jitter-mode off|report|assist|repair] [--jitter-kind alpha|color|all] [--jitter-profile conservative|balanced] [--jitter-alpha-threshold N] [--jitter-max-speck-area N] [--jitter-max-changed-ratio N] [--jitter-max-channel-delta N]";
-const EXPORT_USAGE: &str = "usage: psd2ase export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite [--active-frame-index N] [--compression raw|rle|zip|zip-prediction] [--empty-layers include|omit] [--report PATH] [--overwrite] [--roundtrip-metadata on|off]";
+const CONVERT_USAGE: &str = "usage: aseprite-psd convert INPUT [-o OUTPUT] [--report PATH] [--overwrite] [--frame-source auto|static|top-level] [--preserve-photoshop-metadata] [--linked-cels off|identical] [--layer-association preserve|auto|roundtrip] [--association-strategy compact|conservative] [--z-order stable|auto] [--stable-order consensus|anchor|strict] [--uncertain-layers group|flat] [--jitter-mode off|report|assist|repair] [--jitter-kind alpha|color|all] [--jitter-profile conservative|balanced] [--jitter-alpha-threshold N] [--jitter-max-speck-area N] [--jitter-max-changed-ratio N] [--jitter-max-channel-delta N]";
+const EXPORT_USAGE: &str = "usage: aseprite-psd export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite [--active-frame-index N] [--compression raw|rle|zip|zip-prediction] [--empty-layers include|omit] [--report PATH] [--overwrite] [--roundtrip-metadata on|off]";
 
 #[derive(Debug, PartialEq, Eq)]
 struct ConvertCommand {
@@ -58,7 +58,7 @@ fn run(arguments: Vec<String>) -> Result<(), CliError> {
             Ok(())
         }
         Some("--version") | Some("-V") => {
-            println!("psd2ase {VERSION}");
+            println!("aseprite-psd {VERSION}");
             Ok(())
         }
         Some("inspect") => run_inspect(&arguments[1..]),
@@ -839,7 +839,9 @@ fn parse_jitter_usize(
 /// Extracts the single positional path accepted by a phase-one command.
 fn one_path_argument(arguments: &[String], command: &str) -> Result<PathBuf, CliError> {
     if arguments.len() != 1 || arguments[0].starts_with('-') {
-        return Err(CliError::Usage(format!("usage: psd2ase {command} INPUT")));
+        return Err(CliError::Usage(format!(
+            "usage: aseprite-psd {command} INPUT"
+        )));
     }
     Ok(PathBuf::from(&arguments[0]))
 }
@@ -847,8 +849,8 @@ fn one_path_argument(arguments: &[String], command: &str) -> Result<PathBuf, Cli
 /// Prints the supported command-line syntax.
 fn print_help() {
     println!(
-        "psd2ase {VERSION}\n\n\
-         Usage:\n  psd2ase inspect INPUT\n  {CONVERT_USAGE}\n  {EXPORT_USAGE}\n  psd2ase --version"
+        "aseprite-psd {VERSION}\n\n\
+         Usage:\n  aseprite-psd inspect INPUT\n  {CONVERT_USAGE}\n  {EXPORT_USAGE}\n  aseprite-psd --version"
     );
 }
 

@@ -1,20 +1,20 @@
-# psd2ase
+# aseprite-psd
 
 [English](README.md)
 
-`psd2ase` 用于在 Photoshop PSD/PSB 与 Aseprite 文档之间双向转换。项目同时
+`aseprite-psd` 用于在 Photoshop PSD/PSB 与 Aseprite 文档之间双向转换。项目同时
 提供原生命令行程序，以及内附 converter、支持导入和原生 Save As 的 Aseprite
 扩展。
 
 ## 快速开始：Aseprite 扩展
 
-1. 打开 [最新 GitHub Release](https://github.com/minerva-studio/psd-to-ase/releases/latest)。
+1. 打开 [最新 GitHub Release](https://github.com/minerva-studio/aseprite-psd/releases/latest)。
 2. 下载对应平台的扩展：
-   - Windows x64 使用 `psd2ase-aseprite-windows-x64.aseprite-extension`。
-   - 使用 glibc 的 Linux x64 使用 `psd2ase-aseprite-linux-x64.aseprite-extension`。
+   - Windows x64 使用 `aseprite-psd-windows-x64.aseprite-extension`。
+   - 使用 glibc 的 Linux x64 使用 `aseprite-psd-linux-x64.aseprite-extension`。
 3. 打开下载的扩展包并安装到 Aseprite；如果菜单命令没有立即出现，请重启
    Aseprite。
-4. 选择 **File > Import > Import PSD to Aseprite...**，然后选择 PSD。
+4. 选择 **File > Import > Import PSD/PSB...**，然后选择 Photoshop 文档。
 5. 首次使用时，允许 Aseprite 启动扩展内附的外部 converter。
 
 明确的 Import 命令会打开已修改、且未与转换临时文件关联的文档。原生
@@ -31,7 +31,7 @@ association strategy 时，请取消 `Use metadata`。
 
 导出默认会写入不可见、带版本的 PSD metadata。它只记录元数据版本、
 逻辑图层 ID 和物化 cel 关系，不包含文件路径、用户名、设备信息或使用追踪；
-Photoshop 等其他读取器可以忽略这段信息。通过 **File > Export > PSD to Aseprite
+Photoshop 等其他读取器可以忽略这段信息。通过 **File > Export > Aseprite ↔ Photoshop
 Settings...** 可以分别控制导出时写入 metadata，以及导入时是否使用 metadata。
 关闭导出标记后 PSD 仍可正常读写，但后续打开无法使用本转换器的精确图层关联。
 
@@ -55,7 +55,7 @@ Aseprite 可能在调用保存回调前就打开并截断原生目标文件。�
 使用 Rust 1.88 或更高版本构建原生 CLI：
 
 ```text
-cargo build --release --locked -p psd2ase
+cargo build --release --locked -p aseprite-psd
 ```
 
 导出命令支持 `--compression raw|rle|zip|zip-prediction` 和
@@ -70,36 +70,36 @@ converter，再把它嵌入扩展包：
 bash tools/package-aseprite-extension.sh --platform windows-x64
 ```
 
-产物写入 `dist/psd2ase-aseprite-windows-x64.aseprite-extension`。如果
+产物写入 `dist/aseprite-psd-windows-x64.aseprite-extension`。如果
 converter 已经在其他位置构建完成，可改用 `--binary PATH --no-build`。
 
 只检查 PSD，不写输出文件：
 
 ```text
-psd2ase inspect INPUT.psd
+aseprite-psd inspect INPUT.psd
 ```
 
 转换 PSD。除非指定 `--overwrite`，否则不会替换已有输出：
 
 ```text
-psd2ase convert INPUT.psd -o OUTPUT.aseprite
-psd2ase convert INPUT.psd -o OUTPUT.aseprite --overwrite
-psd2ase convert INPUT.psd -o OUTPUT.aseprite --layer-association auto --linked-cels identical
-psd2ase convert INPUT.psd -o OUTPUT.aseprite --layer-association roundtrip
-psd2ase convert INPUT.psd -o OUTPUT.aseprite --layer-association auto --linked-cels identical --jitter-mode repair --jitter-kind all
+aseprite-psd convert INPUT.psd -o OUTPUT.aseprite
+aseprite-psd convert INPUT.psd -o OUTPUT.aseprite --overwrite
+aseprite-psd convert INPUT.psd -o OUTPUT.aseprite --layer-association auto --linked-cels identical
+aseprite-psd convert INPUT.psd -o OUTPUT.aseprite --layer-association roundtrip
+aseprite-psd convert INPUT.psd -o OUTPUT.aseprite --layer-association auto --linked-cels identical --jitter-mode repair --jitter-kind all
 ```
 
 使用由 Aseprite 另行生成的扁平快照导出 Aseprite 文档。输出后缀决定 PSD 或
 PSB；除非明确指定 `--overwrite`，已有输出不会被替换：
 
 ```text
-psd2ase export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite
-psd2ase export INPUT.aseprite -o OUTPUT.psb --composite COMPOSITE.aseprite --report REPORT.json --overwrite
-psd2ase export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite --roundtrip-metadata off
-psd2ase export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite --empty-layers omit
+aseprite-psd export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite
+aseprite-psd export INPUT.aseprite -o OUTPUT.psb --composite COMPOSITE.aseprite --report REPORT.json --overwrite
+aseprite-psd export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite --roundtrip-metadata off
+aseprite-psd export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite --empty-layers omit
 ```
 
-使用 `psd2ase --help` 查看完整命令格式。
+使用 `aseprite-psd --help` 查看完整命令格式。
 
 没有 Photoshop 时间轴时，帧来源必须明确选择：
 
@@ -171,8 +171,8 @@ cel 复用候选。
 ```text
 cargo fmt --all -- --check
 cargo test --workspace --locked
-cargo run -p psd2ase -- --version
-cargo run -p psd2ase -- --help
+cargo run -p aseprite-psd -- --version
+cargo run -p aseprite-psd -- --help
 ```
 
 解析和写入依赖为 Minerva 维护并固定 commit 的 `ag-psd` fork；`aseprite-io`

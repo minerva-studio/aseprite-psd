@@ -1,5 +1,5 @@
 [package]
-name = "psd2ase-rust-probe"
+name = "aseprite-psd-rust-probe"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,7 +7,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-psd2ase-core = { path = "../../crates/psd2ase-core" }
+aseprite-psd-core = { path = "../../crates/aseprite-psd-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

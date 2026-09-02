@@ -18,14 +18,14 @@
 ```text
 cargo fmt --all -- --check
 cargo test --workspace --locked
-cargo run -p psd2ase -- --version
-cargo run -p psd2ase -- --help
+cargo run -p aseprite-psd -- --version
+cargo run -p aseprite-psd -- --help
 npm --prefix tools/ag-psd-oracle install --ignore-scripts --allow-git=all --cache tools/ag-psd-oracle/.npm-cache
 pwsh -File tools/probe.ps1
 # Run the Aseprite-hosted Lua module smoke check (Windows example)
 & 'aseprite' -b `
-  --script-param extensionRoot=$PWD/extensions/psd2ase-aseprite `
-  --script extensions/psd2ase-aseprite/tests/smoke.lua
+  --script-param extensionRoot=$PWD/extensions/aseprite-psd `
+  --script extensions/aseprite-psd/tests/smoke.lua
 ```
 
 Use a real PSD supplied outside the repository for compatibility testing. Do
@@ -39,23 +39,23 @@ split by the production owner (`core`, `layer_names`, `aseprite_writer`,
 their test module with `#[cfg(test)]` and a `#[path = "tests/..."]` attribute;
 the tests therefore retain private access without scattering test bodies beside
 production code. The CLI follows the same convention under
-`crates/psd2ase-cli/src/tests/`. Crate-level `tests/` directories are reserved
+`crates/aseprite-psd-cli/src/tests/`. Crate-level `tests/` directories are reserved
 for future black-box integration tests that exercise only public APIs.
 
 The probe runner reads `path\to\fixture.psd` by default. Set
-`PSD2ASE_FIXTURE` or pass `-InputPath` to select another local fixture. It
+`ASEPRITE_PSD_FIXTURE` or pass `-InputPath` to select another local fixture. It
 writes only ignored JSON snapshots under `.probe/`, verifies the source file's
 size and SHA-256 before and after the run, and never creates an Aseprite file.
 
 Stage 3 adds a Photoshop frame-animation gate to the same probe command. The
 Rust scanner reads bounded image-resource and layer additional-info sections
 (4000/4003, shmd/mlst/mdyn) and converts them into the format-independent
-animation model in psd2ase-core. The TypeScript `ag-psd` master snapshot is
+animation model in aseprite-psd-core. The TypeScript `ag-psd` master snapshot is
 pinned as the development oracle for overlapping parser behaviour; the
 Minerva-maintained Rust `ag-psd` fork remains the product runtime and includes
 documented extensions beyond that oracle.
 
-Stage 4 exposes `psd2ase_core::normalize` as the reader boundary. It owns the
+Stage 4 exposes `aseprite_psd_core::normalize` as the reader boundary. It owns the
 recursive layer tree, validated document bounds, copied RGBA8 pixels, and
 frame-local layer state. A static PSD becomes one normalized frame with no
 duration; a future Aseprite serializer may choose its own 100 ms default at
@@ -72,7 +72,7 @@ all unsupported mappings are reported as warnings.
 
 ## Ownership rules
 
-- `psd2ase-core` owns normalized document semantics, pixel ownership, and
+- `aseprite-psd-core` owns normalized document semantics, pixel ownership, and
   conversion invariants. PSD and Aseprite writers use this model as their only
   conversion boundary.
 - `LayerAssociation` is the conversion-policy source of truth. Preserve mode
@@ -95,8 +95,8 @@ all unsupported mappings are reported as warnings.
 - Layout owns persistent and candidate group identities through `GroupKey`.
   Candidate folders never reuse a source layer ID and are validated against the
   public planned topology before writing.
-- `psd2ase` owns argument parsing, output policy, exit codes, and presentation.
-- The Aseprite adapter keeps `psd2ase.lua` as a registration-only entrypoint.
+- `aseprite-psd` owns argument parsing, output policy, exit codes, and presentation.
+- The Aseprite adapter keeps `aseprite-psd.lua` as a registration-only entrypoint.
   `lib/process.lua` owns the converter process and temporary-file boundary,
   `lib/dialogs.lua` owns host UI, `lib/document_io.lua` owns Sprite lifecycle,
   and `lib/workflows.lua` owns import/export orchestration. The adapter does

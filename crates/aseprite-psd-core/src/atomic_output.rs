@@ -74,7 +74,7 @@ mod tests {
     #[test]
     fn failed_no_overwrite_preserves_existing_output() {
         let directory = std::env::temp_dir().join(format!(
-            "psd2ase-atomic-{}",
+            "aseprite-psd-atomic-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")

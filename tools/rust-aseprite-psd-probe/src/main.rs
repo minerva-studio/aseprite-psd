@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use psd2ase_core::{
+use aseprite_psd_core::{
     AnimationFlags, AnimationPoint, NormalizedDocument, NormalizedLayer, NormalizedLayerFrameState,
     NormalizedLayerKind, NormalizedLoopMode, normalize,
 };
@@ -27,7 +27,7 @@ fn main() -> ExitCode {
 /// Parses probe arguments, reads the PSD, and serializes the snapshot.
 fn run(arguments: Vec<String>) -> Result<(), String> {
     let input = argument_value(&arguments, "--input")
-        .or_else(|| env::var_os("PSD2ASE_FIXTURE").map(PathBuf::from))
+        .or_else(|| env::var_os("ASEPRITE_PSD_FIXTURE").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from(DEFAULT_INPUT));
     let output = argument_value(&arguments, "--output")
         .unwrap_or_else(|| PathBuf::from("target/probe/rust-snapshot.json"));
@@ -143,7 +143,7 @@ fn collect_layer(
 }
 
 /// Converts owned RGBA8 data into dimensions, origin, and a digest.
-fn pixel_snapshot(pixel: &psd2ase_core::NormalizedPixels) -> Result<PixelSnapshot, String> {
+fn pixel_snapshot(pixel: &aseprite_psd_core::NormalizedPixels) -> Result<PixelSnapshot, String> {
     let expected = pixel
         .width
         .checked_mul(pixel.height)

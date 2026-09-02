@@ -1,7 +1,7 @@
 {
-  "name": "psd2ase-aseprite",
-  "displayName": "PSD to Aseprite",
-  "description": "Import and export Photoshop PSD/PSB documents through the psd2ase converter.",
+  "name": "aseprite-psd",
+  "displayName": "Aseprite ↔ Photoshop",
+  "description": "Import and export Photoshop PSD/PSB documents through the aseprite-psd converter.",
   "version": "0.2.0",
   "author": {
     "name": "Minerva Studio"
@@ -14,7 +14,7 @@
   "contributes": {
     "scripts": [
       {
-        "path": "./psd2ase.lua"
+        "path": "./aseprite-psd.lua"
       }
     ]
   }

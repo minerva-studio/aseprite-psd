@@ -375,7 +375,7 @@ fn export_requires_composite_and_preserves_all_paths() {
 #[test]
 fn export_command_writes_psd_and_psb_reports_for_unicode_paths() {
     let directory = std::env::temp_dir().join(format!(
-        "psd2ase-cli-export-{}-导出",
+        "aseprite-psd-cli-export-{}-导出",
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -439,7 +439,7 @@ fn export_command_writes_psd_and_psb_reports_for_unicode_paths() {
 #[test]
 fn export_report_failure_keeps_verified_output() {
     let directory = std::env::temp_dir().join(format!(
-        "psd2ase-cli-report-failure-{}",
+        "aseprite-psd-cli-report-failure-{}",
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")

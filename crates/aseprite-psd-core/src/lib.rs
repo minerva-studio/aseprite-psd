@@ -1,4 +1,4 @@
-//! Format-independent conversion boundaries for PSD to Aseprite.
+//! Format-independent conversion boundaries for Aseprite and Photoshop documents.
 //!
 //! The current implementation exposes a normalized reader and an experimental
 //! Aseprite writer. Coordinate mapping remains provisional until visual review

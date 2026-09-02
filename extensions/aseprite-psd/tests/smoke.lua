@@ -8,7 +8,7 @@ local function load_module(filename)
   return assert(chunk())
 end
 
-local entry_chunk = assert(loadfile(app.fs.joinPath(root, "psd2ase.lua")))
+local entry_chunk = assert(loadfile(app.fs.joinPath(root, "aseprite-psd.lua")))
 entry_chunk()
 assert(type(init) == "function", "entry script must define init")
 
@@ -132,7 +132,7 @@ assert(export_text:find("--roundtrip-metadata\0off", 1, true))
 assert(export_text:find("--empty-layers\0omit", 1, true))
 
 local default_export_arguments = process.build_export_arguments(
-  "psd2ase.exe",
+  "aseprite-psd.exe",
   "source.aseprite",
   "composite.aseprite",
   "output.psd",
@@ -162,4 +162,4 @@ end)
 assert(not success, "workflow failure must propagate")
 assert(not app.fs.isFile(failed_path), "failed workflow must clean temporary files")
 
-print("psd2ase Lua module smoke test passed")
+print("aseprite-psd Lua module smoke test passed")

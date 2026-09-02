@@ -233,7 +233,7 @@ function Dialogs.new(process)
       jitter_profile = defaults.jitter_profile,
     }
     if not dialog then
-      show_error("PSD to Aseprite", "Aseprite does not have an available UI.")
+      show_error("Aseprite ↔ Photoshop", "Aseprite does not have an available UI.")
       return nil, "unavailable"
     end
     if input_filename then
@@ -470,7 +470,7 @@ function Dialogs.new(process)
   local function select_import_source()
     local dialog = Dialog{ title="Import PSD" }
     if not dialog then
-      show_error("PSD to Aseprite", "Aseprite does not have an available UI.")
+      show_error("Aseprite ↔ Photoshop", "Aseprite does not have an available UI.")
       return nil
     end
     dialog:file{
@@ -494,7 +494,7 @@ function Dialogs.new(process)
   local function show_roundtrip_settings(plugin)
     local dialog = Dialog{ title="PSD Metadata Settings" }
     if not dialog then
-      show_error("PSD to Aseprite", "Aseprite does not have an available UI.")
+      show_error("Aseprite ↔ Photoshop", "Aseprite does not have an available UI.")
       return
     end
     dialog:separator{ text="Metadata" }

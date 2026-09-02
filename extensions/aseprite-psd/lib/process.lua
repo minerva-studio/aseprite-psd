@@ -20,10 +20,10 @@ function Process.new(plugin)
     local executable
     if app.os.windows and app.os.x64 then
       platform_directory = "windows-x64"
-      executable = "psd2ase.exe"
+      executable = "aseprite-psd.exe"
     elseif app.os.linux and app.os.x64 then
       platform_directory = "linux-x64"
-      executable = "psd2ase"
+      executable = "aseprite-psd"
     else
       return nil
     end
@@ -98,13 +98,13 @@ function Process.new(plugin)
     state.temporary_sequence = state.temporary_sequence + 1
     local candidate = app.fs.joinPath(
       app.fs.tempPath,
-      string.format("psd2ase-%d-%d.%s", os.time(), state.temporary_sequence, extension)
+      string.format("aseprite-psd-%d-%d.%s", os.time(), state.temporary_sequence, extension)
     )
     while app.fs.isFile(candidate) do
       state.temporary_sequence = state.temporary_sequence + 1
       candidate = app.fs.joinPath(
         app.fs.tempPath,
-        string.format("psd2ase-%d-%d.%s", os.time(), state.temporary_sequence, extension)
+        string.format("aseprite-psd-%d-%d.%s", os.time(), state.temporary_sequence, extension)
       )
     end
     return candidate
@@ -258,7 +258,7 @@ function Process.new(plugin)
   --- Runs one converter command, captures diagnostics, and optionally checks its output.
   local function run_process(binary, arguments, output, operation)
     if not app.fs.isFile(binary) then
-      error("Bundled psd2ase executable was not found: " .. tostring(binary))
+      error("Bundled aseprite-psd executable was not found: " .. tostring(binary))
     end
     local log_filename = temporary_path("log")
     local command = build_command(arguments, log_filename)
@@ -268,7 +268,7 @@ function Process.new(plugin)
     local diagnostics = read_file(log_filename)
     if not launch_ok then
       remove_file(log_filename)
-      error("Could not launch psd2ase: " .. tostring(result))
+      error("Could not launch aseprite-psd: " .. tostring(result))
     end
     if not command_succeeded(result, reason, code) then
       local detail = diagnostics
@@ -281,7 +281,7 @@ function Process.new(plugin)
       end
       remove_file(log_filename)
       error(string.format(
-        "psd2ase %s failed (%s).\n\n%s",
+        "aseprite-psd %s failed (%s).\n\n%s",
         operation or "command",
         format_exit_status(result, reason, code),
         detail
@@ -289,7 +289,7 @@ function Process.new(plugin)
     end
     if output and not app.fs.isFile(output) then
       remove_file(log_filename)
-      error("psd2ase reported success but did not create: " .. output)
+      error("aseprite-psd reported success but did not create: " .. output)
     end
     remove_file(log_filename)
     return diagnostics

@@ -1,15 +1,15 @@
-local COMMAND_ID = "Psd2aseImport"
+local COMMAND_ID = "AsepritePsdImport"
 
 --- Loads one extension module relative to the installed extension directory.
 local function load_module(plugin, filename)
   local path = app.fs.joinPath(plugin.path, "lib", filename)
   local chunk, load_error = loadfile(path)
   if not chunk then
-    error("Could not load psd2ase module " .. path .. ": " .. tostring(load_error))
+    error("Could not load aseprite-psd module " .. path .. ": " .. tostring(load_error))
   end
   local ok, module = pcall(chunk)
   if not ok then
-    error("Could not initialize psd2ase module " .. path .. ": " .. tostring(module))
+    error("Could not initialize aseprite-psd module " .. path .. ": " .. tostring(module))
   end
   return module
 end
@@ -35,18 +35,18 @@ function init(plugin)
 
   plugin:newCommand{
     id=COMMAND_ID,
-    title="Import PSD to Aseprite...",
+    title="Import PSD/PSB...",
     group="file_import",
     onclick=function()
       if not process.binary then
-        dialogs.show_error("PSD to Aseprite", "This extension has no binary for the current platform.")
+        dialogs.show_error("Aseprite ↔ Photoshop", "This extension has no binary for the current platform.")
         return
       end
       workflows.import_from_menu(plugin)
     end,
   }
   plugin:newCommand{
-    id="Psd2aseExport",
+    id="AsepritePsdExport",
     title="Export PSD/PSB...",
     group="file_export",
     onclick=function()
@@ -54,8 +54,8 @@ function init(plugin)
     end,
   }
   plugin:newCommand{
-    id="Psd2aseSettings",
-    title="PSD to Aseprite Settings...",
+    id="AsepritePsdSettings",
+    title="Aseprite ↔ Photoshop Settings...",
     group="file_export",
     onclick=function()
       dialogs.show_roundtrip_settings(plugin)
@@ -83,6 +83,6 @@ function init(plugin)
     end,
   }
   if not process.binary or not app.fs.isFile(process.binary) then
-    print("psd2ase: no supported bundled executable was found")
+    print("aseprite-psd: no supported bundled executable was found")
   end
 end

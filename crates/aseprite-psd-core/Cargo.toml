@@ -1,17 +1,16 @@
 [package]
-name = "psd2ase"
+name = "aseprite-psd-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-psd2ase-core = { path = "../psd2ase-core" }
+ag-psd.workspace = true
+aseprite-io.workspace = true
+flate2 = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-[dev-dependencies]
-aseprite-io = { workspace = true }
 
 [lints]
 workspace = true

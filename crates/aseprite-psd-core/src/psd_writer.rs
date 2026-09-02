@@ -2260,7 +2260,7 @@ mod tests {
     #[test]
     fn exports_animation_and_rejects_unapproved_replacement() {
         let directory = std::env::temp_dir().join(format!(
-            "psd2ase-export-{}",
+            "aseprite-psd-export-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
@@ -2624,7 +2624,7 @@ mod tests {
     #[test]
     fn generated_jitter_fixture_reports_and_repairs_known_pixels() {
         let directory = std::env::temp_dir().join(format!(
-            "psd2ase-jitter-fixture-{}",
+            "aseprite-psd-jitter-fixture-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
@@ -2746,7 +2746,7 @@ mod tests {
         assert_eq!(jitter.color_candidates, 2);
         assert_eq!(jitter.color_repairs, 2);
 
-        let keep = std::env::var_os("PSD2ASE_KEEP_JITTER_FIXTURE").is_some();
+        let keep = std::env::var_os("ASEPRITE_PSD_KEEP_JITTER_FIXTURE").is_some();
         if keep {
             let kept = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
             fs::create_dir_all(&kept).expect("create kept fixture directory");
@@ -2762,7 +2762,7 @@ mod tests {
     #[test]
     fn tilemap_export_uses_the_trusted_flattened_snapshot_and_reports_rasterization() {
         let directory = std::env::temp_dir().join(format!(
-            "psd2ase-tilemap-export-{}",
+            "aseprite-psd-tilemap-export-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")

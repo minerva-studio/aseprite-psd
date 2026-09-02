@@ -1,5 +1,5 @@
 param(
-    [string] $InputPath = $env:PSD2ASE_FIXTURE
+    [string] $InputPath = $env:ASEPRITE_PSD_FIXTURE
 )
 
 $ErrorActionPreference = 'Stop'

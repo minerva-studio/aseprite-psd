@@ -4,7 +4,7 @@ use aseprite::{PropertiesMap, PropertyValue, UserData};
 
 use crate::{AnimationPoint, NormalizedLayer, photoshop_metadata};
 
-pub(crate) const REFERENCE_POINTS_PROPERTY: &str = "psd2ase_reference_points";
+pub(crate) const REFERENCE_POINTS_PROPERTY: &str = "aseprite_psd_reference_points";
 
 /// Builds layer user data containing the meaningful Photoshop reference points.
 pub(crate) fn reference_point_user_data(

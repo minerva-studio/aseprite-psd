@@ -26,6 +26,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "aseprite-psd"
+version = "0.1.0"
+dependencies = [
+ "aseprite-io",
+ "aseprite-psd-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "aseprite-psd-core"
+version = "0.1.0"
+dependencies = [
+ "ag-psd",
+ "aseprite-io",
+ "flate2",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "aseprite-psd-rust-probe"
+version = "0.1.0"
+dependencies = [
+ "aseprite-psd-core",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -134,37 +165,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "psd2ase"
-version = "0.1.0"
-dependencies = [
- "aseprite-io",
- "psd2ase-core",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "psd2ase-core"
-version = "0.1.0"
-dependencies = [
- "ag-psd",
- "aseprite-io",
- "flate2",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "psd2ase-rust-probe"
-version = "0.1.0"
-dependencies = [
- "psd2ase-core",
- "serde",
- "serde_json",
- "sha2",
 ]
 
 [[package]]

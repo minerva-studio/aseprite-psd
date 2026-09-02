@@ -30,7 +30,7 @@ initializeCanvas(() => {
 /** Runs the TypeScript ag-psd oracle and writes a normalized snapshot. */
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  const input = args.input ?? process.env.PSD2ASE_FIXTURE ?? DEFAULT_INPUT;
+  const input = args.input ?? process.env.ASEPRITE_PSD_FIXTURE ?? DEFAULT_INPUT;
   const output = args.output ?? "target/probe/oracle-snapshot.json";
   const bytes = await readFile(input);
   const psd = readPsd(bytes, {

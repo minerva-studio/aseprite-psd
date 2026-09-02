@@ -52,10 +52,10 @@ done
 
 case "$platform" in
   linux-x64)
-    executable_name="psd2ase"
+    executable_name="aseprite-psd"
     ;;
   windows-x64)
-    executable_name="psd2ase.exe"
+    executable_name="aseprite-psd.exe"
     ;;
   *)
     echo "error: --platform must be linux-x64 or windows-x64" >&2
@@ -65,10 +65,10 @@ esac
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/.." && pwd)"
-source_dir="$repo_root/extensions/psd2ase-aseprite"
+source_dir="$repo_root/extensions/aseprite-psd"
 
 [[ -f "$source_dir/package.json" ]] || { echo "error: package.json not found" >&2; exit 66; }
-[[ -f "$source_dir/psd2ase.lua" ]] || { echo "error: psd2ase.lua not found" >&2; exit 66; }
+[[ -f "$source_dir/aseprite-psd.lua" ]] || { echo "error: aseprite-psd.lua not found" >&2; exit 66; }
 module_files=(process.lua dialogs.lua document_io.lua workflows.lua)
 for module_file in "${module_files[@]}"; do
   [[ -f "$source_dir/lib/$module_file" ]] || {
@@ -80,28 +80,28 @@ done
 if [[ "$build_binary" -eq 1 ]]; then
   case "$platform" in
     linux-x64)
-      binary="$repo_root/target/release/psd2ase"
+      binary="$repo_root/target/release/aseprite-psd"
       ;;
     windows-x64)
-      binary="$repo_root/target/release/psd2ase.exe"
+      binary="$repo_root/target/release/aseprite-psd.exe"
       ;;
   esac
   echo "building release converter: $binary"
-  (cd "$repo_root" && cargo build --release --locked -p psd2ase)
+  (cd "$repo_root" && cargo build --release --locked -p aseprite-psd)
 fi
 
 [[ -n "$binary" ]] || { echo "error: --binary is required when --no-build is used" >&2; exit 64; }
 [[ -f "$binary" ]] || { echo "error: converter binary not found: $binary" >&2; exit 66; }
 
 if [[ -z "$output" ]]; then
-  output="$repo_root/dist/psd2ase-aseprite-$platform.aseprite-extension"
+  output="$repo_root/dist/aseprite-psd-$platform.aseprite-extension"
 fi
 output_dir="$(dirname -- "$output")"
 mkdir -p "$output_dir"
 output_dir="$(cd -- "$output_dir" && pwd)"
 output="$output_dir/$(basename -- "$output")"
 
-staging="$(mktemp -d "${TMPDIR:-/tmp}/psd2ase-aseprite.XXXXXX")"
+staging="$(mktemp -d "${TMPDIR:-/tmp}/aseprite-psd.XXXXXX")"
 cleanup() {
   rm -rf -- "$staging"
 }
@@ -110,7 +110,7 @@ trap cleanup EXIT
 mkdir -p "$staging/bin/$platform"
 mkdir -p "$staging/lib"
 cp -- "$source_dir/package.json" "$staging/package.json"
-cp -- "$source_dir/psd2ase.lua" "$staging/psd2ase.lua"
+cp -- "$source_dir/aseprite-psd.lua" "$staging/aseprite-psd.lua"
 for module_file in "${module_files[@]}"; do
   cp -- "$source_dir/lib/$module_file" "$staging/lib/$module_file"
 done
