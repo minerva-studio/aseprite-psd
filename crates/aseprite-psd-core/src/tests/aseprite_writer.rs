@@ -1,6 +1,7 @@
 use super::*;
 use crate::{
     AnimationPoint, JitterPlan, NormalizedBounds, NormalizedFrame, NormalizedLayerFrameState,
+    NormalizedSlice, NormalizedSliceKey,
 };
 
 fn pixel_document(width: u32, height: u32, left: i32, top: i32) -> NormalizedDocument {
@@ -61,6 +62,65 @@ fn encodes_static_frame_with_serialization_default() {
         }
         _ => panic!("expected compressed pixel cel"),
     }
+}
+
+#[test]
+fn writes_slice_order_names_bounds_keys_and_degraded_metadata_warning() {
+    let mut document = pixel_document(8, 8, 0, 0);
+    document.slices = vec![
+        NormalizedSlice {
+            name: "区域😀".to_string(),
+            source_id: 7,
+            keys: vec![NormalizedSliceKey {
+                frame: 0,
+                x: -3,
+                y: 4,
+                width: 9,
+                height: 0,
+                pivot: None,
+            }],
+            unrepresentable_fields: vec!["url".to_string(), "group".to_string()],
+        },
+        NormalizedSlice {
+            name: String::new(),
+            source_id: 8,
+            keys: vec![NormalizedSliceKey {
+                frame: 0,
+                x: 2,
+                y: -5,
+                width: 3,
+                height: 6,
+                pivot: Some((1, 2)),
+            }],
+            unrepresentable_fields: Vec::new(),
+        },
+    ];
+
+    let encoded = encode(&document).expect("slice document should encode");
+    let file = AsepriteFile::from_reader(&encoded.bytes[..]).expect("valid Aseprite bytes");
+    assert_eq!(file.slices().len(), 2);
+    assert_eq!(file.slices()[0].name, "区域😀");
+    assert_eq!(
+        (file.slices()[0].keys[0].x, file.slices()[0].keys[0].y),
+        (-3, 4)
+    );
+    assert_eq!(
+        (
+            file.slices()[0].keys[0].width,
+            file.slices()[0].keys[0].height
+        ),
+        (9, 0)
+    );
+    assert_eq!(file.slices()[1].name, "");
+    assert_eq!(file.slices()[1].keys[0].frame, 0);
+    assert_eq!(file.slices()[1].keys[0].pivot, Some((1, 2)));
+    let warning = encoded
+        .warning_details
+        .iter()
+        .find(|warning| warning.code == InformationLossCode::Slices)
+        .expect("Photoshop-only slice metadata warning");
+    assert_eq!(warning.disposition, LossDisposition::Degraded);
+    assert!(warning.message.contains("url, group"));
 }
 
 #[test]

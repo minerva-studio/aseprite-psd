@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use aseprite::{
     AsepriteFile, BlendMode, CelOptions, ColorMode, GroupRef, LayerOptions, LayerRef,
-    LinkedCelOptions, LoopDirection, Pixels,
+    LinkedCelOptions, LoopDirection, Pixels, Slice, SliceKey,
 };
 
 use crate::aseprite_metadata::reference_point_user_data;
@@ -181,7 +181,62 @@ fn initialize_file(
         )
         .map_err(|error| WriterError::Aseprite(error.to_string()))?;
     }
+    add_slices(&mut file, document, &mut warnings)?;
     Ok((file, warnings))
+}
+
+/// Adds normalized slices without manufacturing keys or Photoshop-only equivalents.
+fn add_slices(
+    file: &mut AsepriteFile,
+    document: &NormalizedDocument,
+    warnings: &mut WarningCollector,
+) -> Result<(), WriterError> {
+    for slice in &document.slices {
+        let mut keys = Vec::with_capacity(slice.keys.len());
+        for key in &slice.keys {
+            if key.frame as usize >= document.frames.len() {
+                return Err(WriterError::InvalidFrameIndex {
+                    expected: document.frames.len().saturating_sub(1),
+                    actual: key.frame,
+                });
+            }
+            keys.push(SliceKey {
+                frame: key.frame,
+                x: key.x,
+                y: key.y,
+                width: key.width,
+                height: key.height,
+                nine_patch: None,
+                pivot: key.pivot,
+            });
+        }
+        file.add_slice(Slice {
+            name: slice.name.clone(),
+            has_nine_patch: false,
+            has_pivot: keys.iter().any(|key| key.pivot.is_some()),
+            keys,
+            user_data: None,
+        });
+        if !slice.unrepresentable_fields.is_empty() {
+            warnings.push(
+                InformationLossCode::Slices,
+                LossDisposition::Degraded,
+                InformationLocation {
+                    layer_id: None,
+                    path: format!("slice:{}", slice.source_id),
+                    frame_index: None,
+                },
+                format!(
+                    "slice {} preserved bounds and name but not Photoshop fields: {}",
+                    slice.source_id,
+                    slice.unrepresentable_fields.join(", ")
+                ),
+                false,
+                true,
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Encodes one normalized document as an RGBA Aseprite file.

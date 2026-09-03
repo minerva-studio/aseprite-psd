@@ -46,6 +46,7 @@ pub use logical_layers::{
 pub use model::{
     DocumentInspection, NormalizedBounds, NormalizedDocument, NormalizedFrame, NormalizedLayer,
     NormalizedLayerFrameState, NormalizedLayerKind, NormalizedLoopMode, NormalizedPixels,
+    NormalizedSlice, NormalizedSliceKey,
 };
 pub use photoshop_animation::{
     AnimationFlags, AnimationLayerInput, AnimationParseError, AnimationPoint, LayerAnimationState,
@@ -156,6 +157,7 @@ pub fn normalize(input: &Path) -> Result<NormalizedDocument, InspectionError> {
 fn normalize_bytes(
     bytes: &[u8],
 ) -> Result<(NormalizedDocument, InformationLossReport), InspectionError> {
+    validate_slice_resources(bytes)?;
     let options = ag_psd::psd::ReadOptions {
         use_image_data: Some(true),
         skip_thumbnail: Some(true),
@@ -179,6 +181,7 @@ fn normalize_bytes(
         .map(|value| integral_u32(value, "document bit depth"))
         .transpose()?;
     let root_layers = psd.children.as_deref().unwrap_or_default();
+    let slices = normalize_slices(psd.image_resources.as_ref())?;
 
     let mut animation_inputs = Vec::new();
     let mut seen_ids = HashSet::new();
@@ -264,9 +267,92 @@ fn normalize_bytes(
             active_frame_index,
             animation_resource_ids: resource_ids,
             animation_frame_flags: frame_flags,
+            slices,
         },
         information_loss,
     ))
+}
+
+/// Strictly validates resource 1050 because the general parser tolerates malformed resources.
+fn validate_slice_resources(bytes: &[u8]) -> Result<(), InspectionError> {
+    fn u32_at(bytes: &[u8], offset: usize, field: &str) -> Result<u32, InspectionError> {
+        let value = bytes
+            .get(offset..offset + 4)
+            .ok_or_else(|| InspectionError::PsdRead(format!("truncated {field}")))?;
+        Ok(u32::from_be_bytes(
+            value.try_into().expect("four-byte slice"),
+        ))
+    }
+
+    if bytes.get(0..4) != Some(b"8BPS") {
+        return Ok(());
+    }
+    let color_len = u32_at(bytes, 26, "color-mode section length")? as usize;
+    let resources_len_offset = 30usize.checked_add(color_len).ok_or_else(|| {
+        InspectionError::PsdRead("color-mode section offset overflow".to_string())
+    })?;
+    let resources_len = u32_at(bytes, resources_len_offset, "image-resources length")? as usize;
+    let mut offset = resources_len_offset + 4;
+    let end = offset.checked_add(resources_len).ok_or_else(|| {
+        InspectionError::PsdRead("image-resources section offset overflow".to_string())
+    })?;
+    if end > bytes.len() {
+        return Err(InspectionError::PsdRead(
+            "truncated image-resources section".to_string(),
+        ));
+    }
+    while offset < end {
+        let signature = bytes.get(offset..offset + 4).ok_or_else(|| {
+            InspectionError::PsdRead("truncated image-resource signature".to_string())
+        })?;
+        if !matches!(signature, b"8BIM" | b"MeSa" | b"AgHg" | b"PHUT" | b"DCSR") {
+            return Err(InspectionError::PsdRead(format!(
+                "invalid image-resource signature at byte {offset}"
+            )));
+        }
+        let id_bytes = bytes
+            .get(offset + 4..offset + 6)
+            .ok_or_else(|| InspectionError::PsdRead("truncated image-resource ID".to_string()))?;
+        let id = u16::from_be_bytes(id_bytes.try_into().expect("two-byte slice"));
+        offset += 6;
+        let name_len = usize::from(*bytes.get(offset).ok_or_else(|| {
+            InspectionError::PsdRead("truncated image-resource name".to_string())
+        })?);
+        let name_bytes = 1usize.checked_add(name_len).ok_or_else(|| {
+            InspectionError::PsdRead("image-resource name length overflow".to_string())
+        })?;
+        offset = offset.checked_add((name_bytes + 1) & !1).ok_or_else(|| {
+            InspectionError::PsdRead("image-resource offset overflow".to_string())
+        })?;
+        let payload_len = u32_at(bytes, offset, "image-resource payload length")? as usize;
+        offset += 4;
+        let payload_end = offset.checked_add(payload_len).ok_or_else(|| {
+            InspectionError::PsdRead("image-resource payload offset overflow".to_string())
+        })?;
+        let payload = bytes
+            .get(offset..payload_end)
+            .ok_or_else(|| InspectionError::PsdRead(format!("truncated image resource {id}")))?;
+        if id == 1050 {
+            let mut reader = ag_psd::reader::PsdReader::new(payload, None, None);
+            let mut resources = ag_psd::psd::ImageResources::default();
+            ag_psd::image_resources::read_image_resource(
+                id,
+                &mut reader,
+                &mut resources,
+                payload.len(),
+            )
+            .map_err(|error| {
+                InspectionError::PsdRead(format!("invalid slices resource: {error}"))
+            })?;
+        }
+        offset = payload_end + (payload_len & 1);
+    }
+    if offset != end {
+        return Err(InspectionError::PsdRead(
+            "image-resource padding exceeds its section".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Records source features that the normalized model intentionally drops.
@@ -288,24 +374,6 @@ fn collect_source_losses(psd: &ag_psd::psd::Psd, report: &mut InformationLossRep
         }
     }
     if let Some(resources) = &psd.image_resources {
-        if resources
-            .slices
-            .as_ref()
-            .is_some_and(|value| !value.is_empty())
-        {
-            report.add(
-                InformationLossCode::Slices,
-                LossDisposition::Dropped,
-                InformationLocation {
-                    layer_id: None,
-                    path: "image_resources".to_string(),
-                    frame_index: None,
-                },
-                "slices are not represented in the normalized model",
-                false,
-                true,
-            );
-        }
         if resources.layer_comps.is_some() {
             report.add(
                 InformationLossCode::LayerComps,
@@ -326,6 +394,115 @@ fn collect_source_losses(psd: &ag_psd::psd::Psd, report: &mut InformationLossRep
             collect_layer_losses(layer, &[index.to_string()], report);
         }
     }
+}
+
+/// Validates PSD slice resources and converts each static rectangle to one frame-zero key.
+fn normalize_slices(
+    resources: Option<&ag_psd::psd::ImageResources>,
+) -> Result<Vec<NormalizedSlice>, InspectionError> {
+    let mut normalized = Vec::new();
+    for (group_index, group) in resources
+        .and_then(|resources| resources.slices.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+    {
+        validate_slice_bounds(group.bounds, &format!("slice group {group_index} bounds"))?;
+        for (slice_index, slice) in group.slices.iter().enumerate() {
+            let field = format!("slice group {group_index} item {slice_index}");
+            let source_id = integral_u32(slice.id, &format!("{field} source ID"))?;
+            let (x, y, width, height) = validate_slice_bounds(slice.bounds, &field)?;
+            normalized.push(NormalizedSlice {
+                name: slice.name.clone().unwrap_or_default(),
+                source_id,
+                keys: vec![NormalizedSliceKey {
+                    frame: 0,
+                    x,
+                    y,
+                    width,
+                    height,
+                    pivot: None,
+                }],
+                unrepresentable_fields: slice_unrepresentable_fields(group, slice),
+            });
+        }
+    }
+    Ok(normalized)
+}
+
+/// Validates an integral LTRB rectangle and returns an Aseprite-compatible XYWH rectangle.
+fn validate_slice_bounds(
+    bounds: ag_psd::psd::LtrbBounds,
+    field: &str,
+) -> Result<(i32, i32, u32, u32), InspectionError> {
+    let left = integral_i32(Some(bounds.left), &format!("{field} left"))?;
+    let top = integral_i32(Some(bounds.top), &format!("{field} top"))?;
+    let right = integral_i32(Some(bounds.right), &format!("{field} right"))?;
+    let bottom = integral_i32(Some(bounds.bottom), &format!("{field} bottom"))?;
+    let width = right.checked_sub(left).ok_or_else(|| {
+        InspectionError::Normalization(format!("{field} width overflows the supported range"))
+    })?;
+    let height = bottom.checked_sub(top).ok_or_else(|| {
+        InspectionError::Normalization(format!("{field} height overflows the supported range"))
+    })?;
+    if width < 0 || height < 0 {
+        return Err(InspectionError::Normalization(format!(
+            "{field} has reversed bounds ({left}, {top}, {right}, {bottom})"
+        )));
+    }
+    Ok((left, top, width as u32, height as u32))
+}
+
+/// Lists authored Photoshop slice fields that have no honest Aseprite equivalent.
+fn slice_unrepresentable_fields(
+    group: &ag_psd::psd::SliceGroup,
+    slice: &ag_psd::psd::Slice,
+) -> Vec<String> {
+    let mut fields = vec!["group".to_string()];
+    if slice.origin.is_some() {
+        fields.push("origin".to_string());
+    }
+    if slice.associated_layer_id != 0.0 {
+        fields.push("associated_layer_id".to_string());
+    }
+    for (name, present) in [
+        ("url", !slice.url.is_empty()),
+        ("target", !slice.target.is_empty()),
+        ("message", !slice.message.is_empty()),
+        ("alt_text", !slice.alt_tag.is_empty()),
+        (
+            "cell_text",
+            slice.cell_text_is_html || !slice.cell_text.is_empty(),
+        ),
+        (
+            "background",
+            !matches!(
+                slice.background_color_type,
+                None | Some(ag_psd::psd::SliceBackgroundColorType::None)
+            ) || slice.background_color.r != 0.0
+                || slice.background_color.g != 0.0
+                || slice.background_color.b != 0.0
+                || slice.background_color.a != 0.0,
+        ),
+        (
+            "outsets",
+            [
+                slice.top_outset,
+                slice.left_outset,
+                slice.bottom_outset,
+                slice.right_outset,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|value| value != 0.0),
+        ),
+        ("group_name", !group.group_name.is_empty()),
+    ] {
+        if present {
+            fields.push(name.to_string());
+        }
+    }
+    fields
 }
 
 /// Recursively records layer-level features outside the normalized contract.
@@ -1224,7 +1401,43 @@ fn read_and_validate_output_header(
             )));
         }
     }
+    validate_output_slices(&file, document)?;
     Ok(file)
+}
+
+/// Validates slice order, names, keys, bounds, and pivots after Aseprite reread.
+fn validate_output_slices(
+    file: &aseprite::AsepriteFile,
+    document: &NormalizedDocument,
+) -> Result<(), ConversionError> {
+    if file.slices().len() != document.slices.len() {
+        return Err(ConversionError::OutputValidation(format!(
+            "slice count differs: expected {}, got {}",
+            document.slices.len(),
+            file.slices().len()
+        )));
+    }
+    for (index, (actual, expected)) in file.slices().iter().zip(&document.slices).enumerate() {
+        if actual.name != expected.name || actual.keys.len() != expected.keys.len() {
+            return Err(ConversionError::OutputValidation(format!(
+                "slice {index} name or key count differs"
+            )));
+        }
+        for (key_index, (actual, expected)) in actual.keys.iter().zip(&expected.keys).enumerate() {
+            if actual.frame != expected.frame
+                || actual.x != expected.x
+                || actual.y != expected.y
+                || actual.width != expected.width
+                || actual.height != expected.height
+                || actual.pivot != expected.pivot
+            {
+                return Err(ConversionError::OutputValidation(format!(
+                    "slice {index} key {key_index} differs"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Returns the ten-millisecond duration quantum used by Photoshop animation data.

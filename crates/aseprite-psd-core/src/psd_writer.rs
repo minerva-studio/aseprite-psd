@@ -3061,6 +3061,7 @@ mod tests {
             active_frame_index: None,
             animation_resource_ids: vec![4000],
             animation_frame_flags: None,
+            slices: Vec::new(),
         };
         let mut report = InformationLossReport::default();
         let psd = build_psd(&document, &[vec![255, 0, 0, 255]], &mut report)

@@ -906,6 +906,7 @@ fn document_header(
             unify_layer_style: false,
             unify_layer_visibility: false,
         }),
+        slices: Vec::new(),
     }
 }
 

@@ -38,6 +38,38 @@ pub struct NormalizedDocument {
     pub animation_resource_ids: Vec<u16>,
     /// Optional source animation flags.
     pub animation_frame_flags: Option<crate::AnimationFlags>,
+    /// Photoshop slices in source group and slice order.
+    pub slices: Vec<NormalizedSlice>,
+}
+
+/// A named PSD slice and the source fields that Aseprite cannot represent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedSlice {
+    /// User-authored slice name; an empty name is preserved.
+    pub name: String,
+    /// Stable Photoshop slice identifier.
+    pub source_id: u32,
+    /// Slice keys in authored order.
+    pub keys: Vec<NormalizedSliceKey>,
+    /// Photoshop-only source fields that require a degraded compatibility report.
+    pub unrepresentable_fields: Vec<String>,
+}
+
+/// A normalized slice rectangle and optional pivot at one playback frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NormalizedSliceKey {
+    /// Zero-based playback frame index.
+    pub frame: u32,
+    /// Left coordinate in document space.
+    pub x: i32,
+    /// Top coordinate in document space.
+    pub y: i32,
+    /// Non-negative rectangle width.
+    pub width: u32,
+    /// Non-negative rectangle height.
+    pub height: u32,
+    /// Optional pivot relative to the slice origin.
+    pub pivot: Option<(i32, i32)>,
 }
 
 impl NormalizedDocument {
