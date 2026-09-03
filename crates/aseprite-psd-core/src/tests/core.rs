@@ -105,6 +105,86 @@ fn write_psd_fixture(path: &Path, psd: &ag_psd::psd::Psd) {
     fs::write(path, ag_psd::write_psd(psd, &Default::default())).expect("write PSD fixture");
 }
 
+/// Builds a minimal PSD directly from the PSD specification's binary sections.
+///
+/// This deliberately does not use `ag-psd` to write the fixture. It contains a
+/// two-pixel RGBA layer, a raw `-2` user-mask channel, a layer ID block, and an
+/// optional clipping flag so parser and conversion tests have an independent
+/// PSD input source.
+fn psd_spec_mask_fixture(clipping: bool) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"8BPS");
+    bytes.extend_from_slice(&1u16.to_be_bytes());
+    bytes.extend_from_slice(&[0; 6]);
+    bytes.extend_from_slice(&4u16.to_be_bytes());
+    bytes.extend_from_slice(&1u32.to_be_bytes());
+    bytes.extend_from_slice(&2u32.to_be_bytes());
+    bytes.extend_from_slice(&8u16.to_be_bytes());
+    bytes.extend_from_slice(&3u16.to_be_bytes());
+
+    // Color mode data and image resources are empty in this valid RGB8 PSD.
+    bytes.extend_from_slice(&0u32.to_be_bytes());
+    bytes.extend_from_slice(&0u32.to_be_bytes());
+
+    let mut layer_info = Vec::new();
+    layer_info.extend_from_slice(&1i16.to_be_bytes());
+    layer_info.extend_from_slice(&0i32.to_be_bytes());
+    layer_info.extend_from_slice(&0i32.to_be_bytes());
+    layer_info.extend_from_slice(&1i32.to_be_bytes());
+    layer_info.extend_from_slice(&2i32.to_be_bytes());
+    layer_info.extend_from_slice(&5u16.to_be_bytes());
+    for id in [0i16, 1, 2, -1, -2] {
+        layer_info.extend_from_slice(&id.to_be_bytes());
+        layer_info.extend_from_slice(&4u32.to_be_bytes());
+    }
+    layer_info.extend_from_slice(b"8BIMnorm");
+    layer_info.push(255);
+    layer_info.push(u8::from(clipping));
+    layer_info.push(0x08);
+    layer_info.push(0);
+
+    let mut extra = Vec::new();
+    let mut mask_data = Vec::new();
+    for value in [0i32, 0, 1, 2] {
+        mask_data.extend_from_slice(&value.to_be_bytes());
+    }
+    mask_data.push(0);
+    mask_data.push(0);
+    mask_data.extend_from_slice(&[0, 0]);
+    extra.extend_from_slice(&(mask_data.len() as u32).to_be_bytes());
+    extra.extend_from_slice(&mask_data);
+    extra.extend_from_slice(&8u32.to_be_bytes());
+    extra.extend_from_slice(&[0; 8]);
+
+    let name = b"PSD spec mask";
+    extra.push(name.len() as u8);
+    extra.extend_from_slice(name);
+    extra.extend_from_slice(&[0, 0]);
+    extra.extend_from_slice(b"8BIMlyid");
+    extra.extend_from_slice(&4u32.to_be_bytes());
+    extra.extend_from_slice(&41u32.to_be_bytes());
+
+    layer_info.extend_from_slice(&(extra.len() as u32).to_be_bytes());
+    layer_info.extend_from_slice(&extra);
+    for channel in [[10u8, 40], [20, 50], [30, 60], [200, 100], [64, 128]] {
+        layer_info.extend_from_slice(&0u16.to_be_bytes());
+        layer_info.extend_from_slice(&channel);
+    }
+
+    let mut layer_and_mask = Vec::new();
+    layer_and_mask.extend_from_slice(&(layer_info.len() as u32).to_be_bytes());
+    layer_and_mask.extend_from_slice(&layer_info);
+    layer_and_mask.extend_from_slice(&0u32.to_be_bytes());
+    bytes.extend_from_slice(&(layer_and_mask.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(&layer_and_mask);
+
+    bytes.extend_from_slice(&0u16.to_be_bytes());
+    for channel in [[10u8, 40], [20, 50], [30, 60], [50, 50]] {
+        bytes.extend_from_slice(&channel);
+    }
+    bytes
+}
+
 /// Creates a unique temporary directory for a core conversion fixture.
 fn fixture_directory(prefix: &str) -> std::path::PathBuf {
     let directory = std::env::temp_dir().join(format!(
@@ -156,6 +236,29 @@ fn bitmap_user_mask_rasterizes_alpha_and_reports_editability_loss() {
 }
 
 #[test]
+fn bitmap_user_mask_accepts_hand_built_psd_spec_fixture() {
+    let (normalized, report) = normalize_bytes(&psd_spec_mask_fixture(false))
+        .expect("normalize hand-built PSD specification fixture");
+    let layer = &normalized.root_layers[0];
+    assert_eq!(layer.name, "PSD spec mask");
+    assert_eq!(layer.id, 41);
+    // The TS ag-psd oracle exposes source layer pixels; normalization applies
+    // the PSD user mask to alpha as the destination contract requires.
+    assert_eq!(
+        layer.pixels.as_ref().expect("spec fixture pixels").data,
+        vec![10, 20, 30, 50, 40, 50, 60, 50]
+    );
+    let loss = report
+        .entries
+        .iter()
+        .find(|entry| entry.code == InformationLossCode::PixelMask)
+        .expect("spec fixture mask loss report");
+    assert_eq!(loss.disposition, LossDisposition::Rasterized);
+    assert_eq!(loss.locations[0].path, "0");
+    assert_eq!(loss.locations[0].layer_id, Some(41));
+}
+
+#[test]
 fn bitmap_user_mask_maps_pixels_in_document_coordinates() {
     let directory = fixture_directory("aseprite-psd-bitmap-mask-offset");
     let input = directory.join("masked.psd");
@@ -191,7 +294,7 @@ fn bitmap_user_mask_survives_convert_as_masked_aseprite_pixels() {
     let directory = fixture_directory("aseprite-psd-bitmap-mask-convert");
     let input = directory.join("masked.psd");
     let output = directory.join("masked.aseprite");
-    write_psd_fixture(&input, &bitmap_mask_fixture(false, false));
+    fs::write(&input, psd_spec_mask_fixture(false)).expect("write PSD specification fixture");
 
     let report = convert(
         &input,
@@ -215,7 +318,7 @@ fn bitmap_user_mask_survives_convert_as_masked_aseprite_pixels() {
         aseprite::AsepriteFile::from_reader(Cursor::new(bytes)).expect("parse converted Aseprite");
     assert_eq!(file.frames().len(), 1);
     assert_eq!(file.layers().len(), 1);
-    assert_eq!(file.layers()[0].name, "Masked layer");
+    assert_eq!(file.layers()[0].name, "PSD spec mask");
     let cel = file
         .cel(file.layer_ref(0).expect("converted pixel layer"), 0)
         .expect("converted masked cel");
@@ -236,7 +339,7 @@ fn clipping_is_rejected_before_output_commit() {
     let directory = fixture_directory("aseprite-psd-clipping");
     let input = directory.join("clipping.psd");
     let output = directory.join("clipping.aseprite");
-    write_psd_fixture(&input, &bitmap_mask_fixture(true, false));
+    fs::write(&input, psd_spec_mask_fixture(true)).expect("write PSD specification fixture");
 
     let error = convert(
         &input,
