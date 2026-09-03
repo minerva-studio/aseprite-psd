@@ -108,7 +108,8 @@ diagnostics but are outside the Photoshop compatibility target. `omit`
 removes only pixel layers with no cel in any frame; a layer that is empty in
 some frames still gets a hidden placeholder so frame topology stays aligned.
 
-See [the development workflow](docs/development.md) for testing, extension
+See the [changelog](CHANGELOG.md) for release notes and
+[the development workflow](docs/development.md) for testing, extension
 packaging, CI, and release instructions.
 
 Inspect a PSD without writing output:

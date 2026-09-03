@@ -91,7 +91,8 @@ ZIP 模式仍可用于诊断，但不属于 Photoshop 兼容目标。省略空�
 空像素图层。`omit` 只移除所有帧都没有 cel 的像素图层，
 部分帧暂时没有 cel 的图层仍保留隐藏占位，以维持帧结构一致。
 
-测试、扩展打包、CI 和发布说明见[开发工作流](docs/development.md)。
+版本更新记录见 [Changelog](CHANGELOG.md)；测试、扩展打包、CI 和发布说明见
+[开发工作流](docs/development.md)。
 
 只检查 PSD，不写输出文件：
 
