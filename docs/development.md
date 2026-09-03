@@ -108,8 +108,8 @@ Pushing a `v*` tag runs the same pipeline and creates or updates the matching
 GitHub Release. Create and push the tag explicitly:
 
 ```text
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
 GitHub Actions never creates a tag. Re-running the workflow for an existing tag

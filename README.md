@@ -6,6 +6,22 @@
 It is available as a native command-line program and as an Aseprite extension
 that bundles the converter for import and export workflows.
 
+## Why aseprite-psd?
+
+| Feature | [Tin-01](https://github.com/Tin-01/aseprite-psd-scripts) | [Resprite](https://resprite.fengeon.com/docs/files/psd) | aseprite-psd |
+| --- | --- | --- | --- |
+| How it runs | Aseprite Lua scripts | Built into Resprite | Aseprite extension + standalone CLI |
+| Input formats | RGB/RGBA 8-bpc PackBits PSD subset | Layered PSD | PSD, PSB, Raw/RLE/ZIP |
+| Photoshop Frame Animation | Single-frame import path | Not described in the documentation | Reconstructed as Aseprite frames |
+| Automatic layer association | No | Not described in the documentation | Logical tracks, candidate folders, and diagnostics |
+| Linked cels | No | Not described in the documentation | Identical pixels can be restored as linked cels |
+| 16/32 bits per channel | Not supported | Not described in the documentation | Imported with an explicit downgrade to RGBA8 |
+| PSD slices | No | Not described in the documentation | Preserves names, order, bounds, and static keys |
+| Information-loss reporting | Debug log | Not described in the documentation | Versioned structured report |
+| Output validation | Not described in the documentation | Not described in the documentation | Aseprite reread and structural validation |
+
+We also look forward to [native PSD support in Aseprite](https://github.com/aseprite/aseprite/issues/114).
+
 ## Quick start: Aseprite extension
 
 1. Open the [latest GitHub Release](https://github.com/minerva-studio/aseprite-psd/releases/latest).
@@ -25,9 +41,9 @@ The macOS packages are not code-signed or notarized yet, so Gatekeeper may
 restrict them after download.
 
 Native PSD/PSB integration through `File > Open` and `File > Save As...` is
-expected to require Aseprite 1.3.18.4; follow [Aseprite #6007](https://github.com/aseprite/aseprite/issues/6007)
-for the upstream status. Until that version is available, use **File > Import >
-Import PSD/PSB...** and **File > Export > Export PSD/PSB...** instead.
+expected to require Aseprite 1.3.18.4. Until that version is available, use
+**File > Import > Import PSD/PSB...** and **File > Export > Export PSD/PSB...**
+instead.
 
 The explicit Import command opens a modified document that is not associated
 with the temporary conversion file. Once the native integration is available,
@@ -192,9 +208,8 @@ than synthesizing colors. Advanced overrides are available through
 
 - Import packages have been validated with Aseprite 1.3.18.3 on Windows x64 and
   Ubuntu/WSL2 Linux x64 with glibc. Native PSD/PSB `File > Open` and `File >
-  Save As...` integration is expected in Aseprite 1.3.18.4; track
-  [Aseprite #6007](https://github.com/aseprite/aseprite/issues/6007). Earlier
-  versions must use the extension's explicit Import and Export commands.
+  Save As...` integration is expected in Aseprite 1.3.18.4. Earlier versions
+  must use the extension's explicit Import and Export commands.
 - macOS packages are built by the manual GitHub Actions workflow but have not
   yet received authentic Aseprite runtime validation.
 - The extension registers PSD/PSB custom-format load and save callbacks. The
@@ -211,10 +226,10 @@ than synthesizing colors. Advanced overrides are available through
   and layer-association fields are recorded as `Slices/Degraded` information
   loss. Resource 1050 versions 6/7/8 have specification-driven tests; authentic
   Photoshop samples for versions 7/8 remain unverified.
-- PSB version 2 input is supported for ordinary-size documents. The pinned
-  `psd-tools` `slices.psb` fixture has passed Rust and TypeScript probe
-  comparison plus conversion/read-back checks. Very large dimensions and
-  Photoshop features outside the normalized model remain unverified.
+- PSB input is supported. The pinned `psd-tools` `slices.psb` fixture has passed
+  Rust and TypeScript probe comparison plus conversion/read-back checks. Very
+  large canvases remain limited by the dimensions Aseprite can represent, and
+  performance near Photoshop's maximum dimensions has not been validated.
 - Export preserves supported groups, static layer properties, frame duration,
   cel visibility/position/opacity, identical cel reuse, and deterministic tag
   playback. Tilemaps use the independently flattened composite snapshot and

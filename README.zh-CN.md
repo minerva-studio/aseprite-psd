@@ -6,6 +6,22 @@
 提供原生命令行程序，以及内附 converter、支持导入和导出流程的 Aseprite
 扩展。
 
+## 为什么使用 aseprite-psd？
+
+| 功能 | [Tin-01](https://github.com/Tin-01/aseprite-psd-scripts) | [Resprite](https://resprite.fengeon.com/zh/docs/files/psd) | aseprite-psd |
+| --- | --- | --- | --- |
+| 使用方式 | Aseprite Lua 脚本 | Resprite 内置功能 | Aseprite 扩展 + 独立 CLI |
+| 输入格式 | RGB/RGBA 8-bpc、PackBits PSD 子集 | 分层 PSD | PSD、PSB、Raw/RLE/ZIP |
+| Photoshop Frame Animation | 单帧导入路径 | 文档未说明 | 重建为 Aseprite 帧 |
+| 自动图层关联 | 无 | 文档未说明 | logical tracks、候选 Folder 和诊断 |
+| Linked cels | 无 | 文档未说明 | 相同像素可恢复为 linked cels |
+| 16/32 bits-per-channel | 不支持 | 文档未说明 | 导入并明确降级为 RGBA8 |
+| PSD slices | 无 | 文档未说明 | 保留名称、顺序、bounds 和静态 key |
+| 信息损失报告 | debug log | 文档未说明 | 带版本的结构化报告 |
+| 输出验证 | 文档未说明 | 文档未说明 | Aseprite reread 与结构验证 |
+
+也期待 [Aseprite 原生 PSD 支持](https://github.com/aseprite/aseprite/issues/114)早日完成。
+
 ## 快速开始：Aseprite 扩展
 
 1. 打开 [最新 GitHub Release](https://github.com/minerva-studio/aseprite-psd/releases/latest)。
@@ -24,9 +40,8 @@ macOS 构建产物当前未进行代码签名或 notarization，下载后可能�
 限制。
 
 通过 `File > Open` 和 `File > Save As...` 直接打开、保存 PSD/PSB，预计需要
-Aseprite 1.3.18.4；上游进度见 [Aseprite #6007](https://github.com/aseprite/aseprite/issues/6007)。
-在该版本可用之前，请改用 **File > Import > Import PSD/PSB...** 和
-**File > Export > Export PSD/PSB...**。
+Aseprite 1.3.18.4。在该版本可用之前，请改用 **File > Import > Import PSD/PSB...**
+和 **File > Export > Export PSD/PSB...**。
 
 明确的 Import 命令会打开已修改、且未与转换临时文件关联的文档。原生
 集成可用后，`File > Open` 会返回与原始 PSD 关联的文档。对于明确导入的文档，
@@ -159,9 +174,8 @@ cel 复用候选。
 
 - 导入扩展包已在 Aseprite 1.3.18.3、Windows x64 和使用 glibc 的
   Ubuntu/WSL2 Linux x64 环境验证。原生 PSD/PSB `File > Open` 和 `File >
-  Save As...` 集成预计将在 Aseprite 1.3.18.4 中提供；进度见
-  [Aseprite #6007](https://github.com/aseprite/aseprite/issues/6007)。更早版本必须使用
-  扩展提供的明确 Import 和 Export 命令。
+  Save As...` 集成预计将在 Aseprite 1.3.18.4 中提供。更早版本必须使用扩展提供的
+  明确 Import 和 Export 命令。
 - macOS 包由手动 GitHub Actions workflow 构建，但目前还没有完成真实的
   Aseprite 运行时验证。
 - 扩展会注册 PSD/PSB 自定义格式的加载与保存回调；需要配置导入策略时仍可使用
@@ -175,9 +189,9 @@ cel 复用候选。
   group、URL、target、message、alt text、background、outsets 和图层关联会明确记入
   `Slices/Degraded` 信息损失报告。resource 1050 的 version 6/7/8 已有规范驱动测试，
   但 version 7/8 仍缺少真实 Photoshop 样本验证。
-- 已支持普通尺寸的 PSB version 2 输入。固定的 `psd-tools` `slices.psb` fixture 已通过
-  Rust/TypeScript probe 对比及转换回读验证；超大尺寸和规范化模型之外的 Photoshop
-  特性仍未验证。
+- 支持 PSB 输入。固定的 `psd-tools` `slices.psb` fixture 已通过 Rust/TypeScript
+  probe 对比及转换回读验证；超大画布仍受 Aseprite 可表达尺寸限制，接近 Photoshop
+  上限的文件性能尚未验证。
 - 导出会保留受支持的组、静态图层属性、帧时长、cel 可见性/位置/透明度、相同
   cel 复用，以及确定性的 tag 播放序列。Tilemap 使用独立扁平快照并报告为
   rasterized；无法继续编辑的 tag 名称/边界、slice、颜色配置和逐 cel Z-Index
