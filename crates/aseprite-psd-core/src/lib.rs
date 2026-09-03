@@ -860,12 +860,14 @@ fn integral_u32(value: f64, field: &str) -> Result<u32, InspectionError> {
     }
 }
 
-/// Rejects source depths that cannot be represented faithfully by normalization.
+/// Accepts the source depths that the PSD reader can normalize to RGBA8.
 fn validate_normalization_bit_depth(bits_per_channel: Option<f64>) -> Result<(), InspectionError> {
-    if bits_per_channel == Some(32.0) {
-        return Err(InspectionError::Normalization(
-            "32-bit PSD input is not supported for conversion".to_string(),
-        ));
+    if let Some(bits) = bits_per_channel {
+        if !bits.is_finite() || !matches!(bits, 1.0 | 8.0 | 16.0 | 32.0) {
+            return Err(InspectionError::Normalization(format!(
+                "unsupported PSD bits per channel: {bits}"
+            )));
+        }
     }
     Ok(())
 }

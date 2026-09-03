@@ -15,14 +15,8 @@ fn missing_layer_ids_use_stable_name_independent_fallbacks() {
 }
 
 #[test]
-fn thirty_two_bit_documents_are_rejected_before_normalization() {
-    let error = validate_normalization_bit_depth(Some(32.0))
-        .expect_err("32-bit input must remain outside the normalized contract");
-    assert!(
-        error
-            .to_string()
-            .contains("32-bit PSD input is not supported")
-    );
+fn sixteen_and_thirty_two_bit_documents_are_accepted_by_normalization() {
+    assert!(validate_normalization_bit_depth(Some(32.0)).is_ok());
     assert!(validate_normalization_bit_depth(Some(8.0)).is_ok());
     assert!(validate_normalization_bit_depth(Some(16.0)).is_ok());
 }
@@ -327,6 +321,23 @@ fn psb_spec_slices_fixture(version: u32, malformed_layer_section: bool) -> Vec<u
 
 /// Builds a one-pixel PSD with an explicit color mode, depth, and channel count.
 fn psd_color_fixture(color_mode: u16, bits_per_channel: u16, channels: u16) -> Vec<u8> {
+    let bytes_per_sample = usize::from(bits_per_channel.div_ceil(8));
+    let sample_count = usize::from(channels) * bytes_per_sample;
+    psd_color_fixture_with_data(
+        color_mode,
+        bits_per_channel,
+        channels,
+        &vec![0; sample_count],
+    )
+}
+
+/// Builds a one-pixel PSD with caller-provided big-endian channel samples.
+fn psd_color_fixture_with_data(
+    color_mode: u16,
+    bits_per_channel: u16,
+    channels: u16,
+    samples: &[u8],
+) -> Vec<u8> {
     let source = psd_spec_slices_fixture(6, false);
     let resources_len = u32::from_be_bytes(source[30..34].try_into().expect("resource length"));
     let resources_end = 34 + resources_len as usize;
@@ -338,6 +349,7 @@ fn psd_color_fixture(color_mode: u16, bits_per_channel: u16, channels: u16) -> V
     };
     let bytes_per_sample = usize::from(bits_per_channel.div_ceil(8));
     let sample_count = usize::from(channels) * bytes_per_sample;
+    assert_eq!(samples.len(), sample_count, "sample payload length");
 
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"8BPS");
@@ -361,7 +373,7 @@ fn psd_color_fixture(color_mode: u16, bits_per_channel: u16, channels: u16) -> V
         bytes.extend_from_slice(&[0, 0]);
     } else {
         bytes.extend_from_slice(&0u16.to_be_bytes());
-        bytes.extend(std::iter::repeat_n(0u8, sample_count));
+        bytes.extend_from_slice(samples);
     }
     bytes
 }
@@ -639,7 +651,20 @@ fn converts_16_bit_input_with_explicit_rgba8_degradation() {
     let directory = fixture_directory("aseprite-psd-16-bit");
     let input = directory.join("input.psd");
     let output = directory.join("output.aseprite");
-    fs::write(&input, psd_color_fixture(3, 16, 3)).expect("write 16-bit fixture");
+    let fixture = psd_color_fixture_with_data(3, 16, 3, &[0x12, 0x34, 0x80, 0x00, 0xff, 0x00]);
+    let parsed = ag_psd::read_psd(
+        &fixture,
+        &ag_psd::psd::ReadOptions {
+            use_image_data: Some(true),
+            ..Default::default()
+        },
+    )
+    .expect("read 16-bit composite");
+    assert_eq!(
+        parsed.image_data.expect("16-bit composite pixels").data,
+        vec![0x12, 0x80, 0xff, 0xff]
+    );
+    fs::write(&input, fixture).expect("write 16-bit fixture");
     let report = convert(&input, &output, &ConvertOptions::default())
         .expect("16-bit input should normalize to RGBA8");
     let loss = report
@@ -678,20 +703,59 @@ fn converts_grayscale_and_indexed_input_with_color_loss_report() {
 }
 
 #[test]
-fn rejects_32_bit_input_before_output_commit() {
+fn converts_32_bit_float_input_with_explicit_rgba8_degradation() {
     let directory = fixture_directory("aseprite-psd-32-bit");
     let input = directory.join("input.psd");
     let output = directory.join("output.aseprite");
-    fs::write(&input, psd_color_fixture(3, 32, 3)).expect("write 32-bit fixture");
-    let error = convert(&input, &output, &ConvertOptions::default())
-        .expect_err("32-bit input must remain unsupported");
-    assert!(
-        error
-            .to_string()
-            .contains("32-bit PSD input is not supported")
+    let mut fixture = Vec::new();
+    for value in [1.0f32, 0.5, 0.0] {
+        fixture.extend_from_slice(&value.to_be_bytes());
+    }
+    let fixture = psd_color_fixture_with_data(3, 32, 3, &fixture);
+    let parsed = ag_psd::read_psd(
+        &fixture,
+        &ag_psd::psd::ReadOptions {
+            use_image_data: Some(true),
+            ..Default::default()
+        },
+    )
+    .expect("read 32-bit composite");
+    assert_eq!(
+        parsed.image_data.expect("32-bit composite pixels").data,
+        vec![255, 128, 0, 255]
     );
-    assert!(!output.exists());
+    fs::write(&input, fixture).expect("write 32-bit fixture");
+    let report = convert(&input, &output, &ConvertOptions::default())
+        .expect("32-bit input should normalize to RGBA8");
+    let loss = report
+        .information_loss
+        .entries
+        .iter()
+        .find(|entry| entry.code == InformationLossCode::UnsupportedColor)
+        .expect("32-bit degradation report");
+    assert_eq!(loss.disposition, LossDisposition::Degraded);
+    assert!(loss.detail.contains("normalized to RGBA8"));
+    let output_file = aseprite::AsepriteFile::from_reader(Cursor::new(
+        fs::read(&output).expect("read 32-bit conversion output"),
+    ))
+    .expect("parse 32-bit conversion output");
+    assert_eq!(output_file.color_mode(), aseprite::ColorMode::Rgba);
     fs::remove_dir_all(directory).expect("remove 32-bit fixture");
+}
+
+#[test]
+fn malformed_32_bit_input_does_not_create_output() {
+    let directory = fixture_directory("aseprite-psd-32-bit-malformed");
+    let input = directory.join("input.psd");
+    let output = directory.join("output.aseprite");
+    let mut fixture = psd_color_fixture(3, 32, 3);
+    fixture.truncate(fixture.len().saturating_sub(14));
+    fs::write(&input, fixture).expect("write malformed 32-bit fixture");
+    let error = convert(&input, &output, &ConvertOptions::default())
+        .expect_err("malformed 32-bit input must fail conversion");
+    assert!(error.to_string().contains("could not parse PSD"));
+    assert!(!output.exists());
+    fs::remove_dir_all(directory).expect("remove malformed 32-bit fixture");
 }
 
 #[test]

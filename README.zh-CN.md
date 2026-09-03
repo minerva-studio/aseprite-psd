@@ -168,6 +168,9 @@ cel 复用候选。
   明确的导入菜单命令。
 - 转换会保留规范化图层树、RGBA8 cel、Photoshop 帧动画和受支持的图层状态。
   逻辑图层关联及部分坐标映射仍属实验功能，重要输出应在 Aseprite 中人工检查。
+- PSD 的 16/32 bits-per-channel 输入可导入，但会由解析库降级为 Aseprite 的 RGBA8；
+  该降级会进入 `UnsupportedColor/Degraded` 信息损失报告。32-bit 在此处指每通道位深，
+  不同于 Aseprite RGBA 的 32 bits-per-pixel。
 - PSD 导入会保留 slice 的名称、顺序、bounds 和静态 frame 0 key；Photoshop 专属的
   group、URL、target、message、alt text、background、outsets 和图层关联会明确记入
   `Slices/Degraded` 信息损失报告。resource 1050 的 version 6/7/8 已有规范驱动测试，

@@ -203,6 +203,9 @@ than synthesizing colors. Advanced overrides are available through
   animation, and supported layer state. Logical-layer association and some
   coordinate mappings remain experimental, so important output should be
   reviewed in Aseprite.
+- PSD 16/32-bits-per-channel input can be imported, but the parser down-converts
+  it to Aseprite RGBA8 and records `UnsupportedColor/Degraded` information loss.
+  This PSD channel depth is distinct from Aseprite RGBA's 32 bits-per-pixel.
 - PSD import preserves slice names, order, bounds, and static frame-0 keys.
   Photoshop-only group, URL, target, message, alt text, background, outsets,
   and layer-association fields are recorded as `Slices/Degraded` information
