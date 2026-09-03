@@ -189,7 +189,6 @@ function Process.new(plugin)
     composite,
     report,
     active_frame_index,
-    compression,
     embed_roundtrip_metadata,
     include_empty_layers)
     local arguments = {
@@ -206,10 +205,6 @@ function Process.new(plugin)
     if active_frame_index ~= nil then
       table.insert(arguments, "--active-frame-index")
       table.insert(arguments, active_frame_index)
-    end
-    if compression ~= nil then
-      table.insert(arguments, "--compression")
-      table.insert(arguments, compression)
     end
     if not embed_roundtrip_metadata then
       table.insert(arguments, "--roundtrip-metadata")
@@ -322,7 +317,6 @@ function Process.new(plugin)
     composite,
     report,
     active_frame_index,
-    compression,
     embed_roundtrip_metadata,
     include_empty_layers)
     if not app.fs.isFile(input) or not app.fs.isFile(composite) then
@@ -337,7 +331,6 @@ function Process.new(plugin)
         composite,
         report,
         active_frame_index,
-        compression,
         embed_roundtrip_metadata,
         include_empty_layers),
       output,

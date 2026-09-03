@@ -78,7 +78,6 @@ function Workflows.new(process, dialogs, documents)
         composite_filename,
         report_filename,
         active_frame_index,
-        export_options.compression,
         plugin.preferences.embed_roundtrip_metadata ~= false,
         export_options.include_empty_layers == true)
       local bytes = process.read_file(output_filename)
@@ -154,7 +153,6 @@ function Workflows.new(process, dialogs, documents)
     local export_options
     if session and session.filename == ev.filename then
       export_options = {
-        compression = session.compression,
         include_empty_layers = session.include_empty_layers,
       }
     else
@@ -170,7 +168,6 @@ function Workflows.new(process, dialogs, documents)
       dialogs.show_information_loss(report, "export")
       state.export_sessions[ev.sprite] = {
         filename = ev.filename,
-        compression = export_options.compression,
         include_empty_layers = export_options.include_empty_layers == true,
       }
     end)

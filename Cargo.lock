@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "aseprite-psd"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aseprite-io",
  "aseprite-psd-core",
@@ -37,7 +37,7 @@ dependencies = [
 
 [[package]]
 name = "aseprite-psd-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "ag-psd",
  "aseprite-io",
@@ -48,7 +48,7 @@ dependencies = [
 
 [[package]]
 name = "aseprite-psd-rust-probe"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aseprite-psd-core",
  "serde",

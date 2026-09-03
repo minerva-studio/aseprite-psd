@@ -36,7 +36,7 @@ pub struct ExportOptions {
     pub overwrite: bool,
     /// Current Aseprite frame to write as Photoshop's zero-based active frame.
     pub active_frame_index: Option<u32>,
-    /// Channel compression policy; `None` preserves the existing ZIP default.
+    /// Channel compression policy; `None` uses Photoshop-compatible RLE.
     pub compression: Option<ExportCompression>,
     /// Embed private metadata that allows this converter to recover cel relationships.
     pub embed_roundtrip_metadata: bool,
@@ -51,15 +51,15 @@ pub enum ExportCompression {
     Raw,
     /// Pack channel rows with PackBits RLE.
     Rle,
-    /// ZIP-compress channel bytes without prediction.
+    /// ZIP-compress channel bytes without prediction for diagnostics only.
     Zip,
-    /// ZIP-compress channel bytes after horizontal prediction.
+    /// ZIP-compress channel bytes after horizontal prediction for diagnostics only.
     ZipPrediction,
 }
 
 impl Default for ExportCompression {
     fn default() -> Self {
-        Self::Zip
+        Self::Rle
     }
 }
 
@@ -185,11 +185,11 @@ pub fn export(
             false,
         )
     };
+    let compression = options.compression.unwrap_or_default();
     let write_options = WriteOptions {
         no_background: Some(true),
         psb: Some(psb),
-        compress: (options.compression.is_none()).then_some(true),
-        compression: options.compression.map(ExportCompression::ag_psd),
+        compression: Some(compression.ag_psd()),
         trim_image_data: Some(false),
         ..Default::default()
     };
@@ -206,7 +206,7 @@ pub fn export(
         &source.document,
         &source.composites,
         psb,
-        options.compression,
+        Some(compression),
         frame_first,
     )?;
     commit_bytes(output, &encoded, options.overwrite).map_err(ExportError::OutputIo)?;
@@ -2356,6 +2356,9 @@ mod tests {
         export(&input, &composite, &output, &ExportOptions::default()).expect("export PSD");
         let bytes = fs::read(&output).expect("read PSD");
         assert_eq!(&bytes[..6], b"8BPS\0\x01");
+        let default_layout = layer_record_layout(&bytes, false).expect("inspect default PSD");
+        validate_channel_compression(&default_layout, ExportCompression::Rle.ag_psd() as u16)
+            .expect("default export should use RLE");
         assert_eq!(
             crate::roundtrip::inspect(&bytes).expect("inspect round-trip metadata"),
             crate::roundtrip::RoundTripStatus {
@@ -3095,6 +3098,7 @@ mod tests {
             assert_eq!(ExportCompression::parse(mode.as_str()), Some(mode));
         }
         assert_eq!(ExportCompression::parse("unsupported"), None);
+        assert_eq!(ExportCompression::default(), ExportCompression::Rle);
     }
 
     /// Writes one test Aseprite file through its authentic serializer.

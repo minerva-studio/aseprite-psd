@@ -283,6 +283,7 @@ fn color_repair_requires_automatic_association() {
 
 #[test]
 fn export_requires_composite_and_preserves_all_paths() {
+    assert!(EXPORT_USAGE.contains("ZIP modes are diagnostic only"));
     let command = export_arguments(&arguments(&[
         "source.aseprite",
         "-o",

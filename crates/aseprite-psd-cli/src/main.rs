@@ -11,7 +11,7 @@ use aseprite_psd_core::{
 };
 
 const CONVERT_USAGE: &str = "usage: aseprite-psd convert INPUT [-o OUTPUT] [--report PATH] [--overwrite] [--frame-source auto|static|top-level] [--preserve-photoshop-metadata] [--linked-cels off|identical] [--layer-association preserve|auto|roundtrip] [--association-strategy compact|conservative] [--z-order stable|auto] [--stable-order consensus|anchor|strict] [--uncertain-layers group|flat] [--jitter-mode off|report|assist|repair] [--jitter-kind alpha|color|all] [--jitter-profile conservative|balanced] [--jitter-alpha-threshold N] [--jitter-max-speck-area N] [--jitter-max-changed-ratio N] [--jitter-max-channel-delta N]";
-const EXPORT_USAGE: &str = "usage: aseprite-psd export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite [--active-frame-index N] [--compression raw|rle|zip|zip-prediction] [--empty-layers include|omit] [--report PATH] [--overwrite] [--roundtrip-metadata on|off]";
+const EXPORT_USAGE: &str = "usage: aseprite-psd export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite [--active-frame-index N] [--compression raw|rle|zip|zip-prediction] [--empty-layers include|omit] [--report PATH] [--overwrite] [--roundtrip-metadata on|off]; default compression is RLE; ZIP modes are diagnostic only and are not Photoshop-compatible";
 
 #[derive(Debug, PartialEq, Eq)]
 struct ConvertCommand {
@@ -71,6 +71,7 @@ fn run(arguments: Vec<String>) -> Result<(), CliError> {
 /// Executes the independently validated Aseprite-to-PSD/PSB export command.
 fn run_export(arguments: &[String]) -> Result<(), CliError> {
     let command = export_arguments(arguments)?;
+    warn_for_photoshop_incompatible_compression(command.compression);
     let report = export(
         &command.input,
         &command.composite,
@@ -110,6 +111,18 @@ fn run_export(arguments: &[String]) -> Result<(), CliError> {
         );
     }
     Ok(())
+}
+
+/// Warns when a diagnostic compression mode is outside the Photoshop target contract.
+fn warn_for_photoshop_incompatible_compression(compression: Option<ExportCompression>) {
+    if matches!(
+        compression,
+        Some(ExportCompression::Zip | ExportCompression::ZipPrediction)
+    ) {
+        eprintln!(
+            "warning: ZIP PSD compression is retained for diagnostics only; it is not supported by the Photoshop compatibility target and may still open in tolerant readers such as GIMP"
+        );
+    }
 }
 
 /// Executes the metadata-only inspection command.

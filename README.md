@@ -81,15 +81,11 @@ As...` with a `.psd` or `.psb` destination becomes an additional entry point
 once the Aseprite integration is available. The extension snapshots isolated
 original and flattened copies, runs the bundled converter, validates the
 Photoshop document, and only then writes it through Aseprite's custom-format
-save stream. The save options let you choose whether
-the current frame is written as Photoshop's active frame and whether empty
-pixel layers are included. Ctrl+S reuses the selected format and options.
-Export always records the currently selected frame
-as Photoshop's active frame. Channel compression can be selected as `ZIP`,
-`ZIP prediction`, `RLE`, or `Raw`. Repeated Ctrl+S on the same sprite and
-destination reuses the last successfully saved compression choice; changing
-the destination or reloading the extension asks again. The explicit Export
-menu command always asks independently.
+save stream. The save options let you choose whether empty pixel layers are
+included, and Ctrl+S reuses the selected format and option. Extension exports
+use Photoshop-compatible RLE channel compression automatically. Exporting an
+Aseprite timeline as a Photoshop timeline is not supported in 0.3.1; the
+supported export contract is a static layered PSD/PSB document.
 
 Aseprite may open and truncate a native custom-format destination before the
 save callback runs. The extension validates the complete PSD before writing,
@@ -106,8 +102,9 @@ cargo build --release --locked -p aseprite-psd
 ```
 
 The export command accepts `--compression raw|rle|zip|zip-prediction` and
-`--empty-layers include|omit`. Compression defaults to the existing
-ZIP-without-prediction mode, while empty layers default to `omit`. `omit`
+`--empty-layers include|omit`. Compression defaults to Photoshop-compatible
+RLE, while empty layers default to `omit`. ZIP modes remain available for
+diagnostics but are outside the Photoshop compatibility target. `omit`
 removes only pixel layers with no cel in any frame; a layer that is empty in
 some frames still gets a hidden placeholder so frame topology stays aligned.
 
@@ -230,9 +227,9 @@ than synthesizing colors. Advanced overrides are available through
   Rust and TypeScript probe comparison plus conversion/read-back checks. Very
   large canvases remain limited by the dimensions Aseprite can represent, and
   performance near Photoshop's maximum dimensions has not been validated.
-- Export preserves supported groups, static layer properties, frame duration,
-  cel visibility/position/opacity, identical cel reuse, and deterministic tag
-  playback. Tilemaps use the independently flattened composite snapshot and
+- Export preserves supported groups and static layer properties. Exporting an
+  Aseprite timeline as a Photoshop timeline is not supported in 0.3.1.
+  Tilemaps use the independently flattened composite snapshot and
   are reported as rasterized; tag names/boundaries, slices, color profiles,
   and per-cel Z-Index are reported when they cannot remain editable.
 - Small, deterministic PSD/PSB fixtures used by automated tests live under

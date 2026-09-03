@@ -122,12 +122,11 @@ local export_arguments = process.build_export_arguments(
   "composite.aseprite",
   "report.json",
   3,
-  "zip-prediction",
   false,
   false)
 local export_text = table.concat(export_arguments, "\0")
 assert(export_text:find("--active-frame-index\0" .. "3", 1, true))
-assert(export_text:find("--compression\0zip-prediction", 1, true))
+assert(not export_text:find("--compression", 1, true))
 assert(export_text:find("--roundtrip-metadata\0off", 1, true))
 assert(export_text:find("--empty-layers\0omit", 1, true))
 
@@ -138,8 +137,8 @@ local default_export_arguments = process.build_export_arguments(
   "output.psd",
   nil,
   nil,
-  nil,
-  true)
+  true,
+  false)
 local default_export_text = table.concat(default_export_arguments, "\0")
 assert(default_export_text:find("--empty-layers\0omit", 1, true))
 

@@ -396,19 +396,13 @@ function Dialogs.new(process)
     return nil, "cancelled"
   end
 
-  --- Shows the export compression choices shared by both export entrypoints.
+  --- Shows the export options shared by both export entrypoints; PSD output uses RLE automatically.
   local function select_export_options()
     local dialog = Dialog{ title="Export PSD/PSB Options" }
     if not dialog then
       show_error("PSD export failed", "Aseprite does not have an available UI.")
       return nil
     end
-    dialog:combobox{
-      id="compression",
-      label="Compression",
-      option="ZIP",
-      options={"ZIP", "ZIP prediction", "RLE", "Raw"},
-    }
     dialog:check{
       id="include_empty_layers",
       label="Empty pixel layers",
@@ -423,12 +417,6 @@ function Dialogs.new(process)
       return nil
     end
     return {
-      compression = ({
-        ["ZIP"] = "zip",
-        ["ZIP prediction"] = "zip-prediction",
-        ["RLE"] = "rle",
-        ["Raw"] = "raw",
-      })[dialog.data.compression] or "zip",
       include_empty_layers = dialog.data.include_empty_layers == true,
     }
   end

@@ -68,11 +68,10 @@ Settings...** 可以分别控制导出时写入 metadata，以及导入时是否
 当前导出请使用 **File > Export > Export PSD/PSB...**。原生集成可用后，选择
 **File > Save As...** 并指定 `.psd` 或 `.psb` 将成为额外入口。扩展会分别创建
 隔离的原始副本与扁平副本，调用内附 converter 并验证 Photoshop 文档，最后才通过
-Aseprite 自定义格式的保存流写入。保存选项可以选择是否把当前帧写成
-Photoshop 的 active frame（导出始终使用当前帧），以及选择通道压缩（`ZIP`、
-`ZIP prediction`、`RLE` 或 `Raw`）。同一 Sprite 保存到同一路径时，后续 Ctrl+S
-会复用上次成功的压缩和空像素图层选项；路径改变或扩展重载后会再次询问。明确的
-Export 菜单命令始终独立询问。
+Aseprite 自定义格式的保存流写入。保存选项可以选择是否包含空像素图层，后续
+Ctrl+S 会复用已选格式和该选项。扩展导出会自动使用 Photoshop 兼容的 RLE 通道
+压缩。0.3.1 暂不支持把 Aseprite 时间线导出为 Photoshop 时间线；受支持的导出
+契约是静态分层 PSD/PSB 文档。
 
 Aseprite 可能在调用保存回调前就打开并截断原生目标文件。扩展会在写入前完整
 验证 PSD，但无法为失败覆盖提供事务式回滚；需要保留旧文件时，请使用 Export 菜单
@@ -87,8 +86,9 @@ cargo build --release --locked -p aseprite-psd
 ```
 
 导出命令支持 `--compression raw|rle|zip|zip-prediction` 和
-`--empty-layers include|omit`；省略压缩时保持现有的 ZIP（无 prediction）默认行为，
-省略空图层选项时默认不导出空像素图层。`omit` 只移除所有帧都没有 cel 的像素图层，
+`--empty-layers include|omit`；省略压缩时默认使用 Photoshop 兼容的 RLE。
+ZIP 模式仍可用于诊断，但不属于 Photoshop 兼容目标。省略空图层选项时默认不导出
+空像素图层。`omit` 只移除所有帧都没有 cel 的像素图层，
 部分帧暂时没有 cel 的图层仍保留隐藏占位，以维持帧结构一致。
 
 测试、扩展打包、CI 和发布说明见[开发工作流](docs/development.md)。
@@ -192,8 +192,8 @@ cel 复用候选。
 - 支持 PSB 输入。固定的 `psd-tools` `slices.psb` fixture 已通过 Rust/TypeScript
   probe 对比及转换回读验证；超大画布仍受 Aseprite 可表达尺寸限制，接近 Photoshop
   上限的文件性能尚未验证。
-- 导出会保留受支持的组、静态图层属性、帧时长、cel 可见性/位置/透明度、相同
-  cel 复用，以及确定性的 tag 播放序列。Tilemap 使用独立扁平快照并报告为
+- 导出会保留受支持的组和静态图层属性。0.3.1 暂不支持把 Aseprite 时间线导出为
+  Photoshop 时间线。Tilemap 使用独立扁平快照并报告为
   rasterized；无法继续编辑的 tag 名称/边界、slice、颜色配置和逐 cel Z-Index
   会进入信息损失报告。
 - 仓库仅提交小型、固定且来源有记录的 PSD/PSB 测试素材；客户 artwork 和大型/私有
