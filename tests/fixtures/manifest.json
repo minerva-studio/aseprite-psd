@@ -15,6 +15,13 @@
       "id": "psd/high-resolution",
       "input": "psd/high-resolution/input.psd",
       "expected_output": "psd/high-resolution/expected.aseprite"
+    },
+    {
+      "id": "psb/psd-tools-slices",
+      "input": "psb/psd-tools-slices/input.psb",
+      "expected_output": "psb/psd-tools-slices/expected.aseprite",
+      "source": "psd-tools@6fb7bd5215069ed63cbe009e921c3f33aa97a3ec",
+      "sha256": "BDAC1216EDAC692B5941CD28D60A6DED9CA7B23B32E903AF47066C3F9DCE958F"
     }
   ]
 }

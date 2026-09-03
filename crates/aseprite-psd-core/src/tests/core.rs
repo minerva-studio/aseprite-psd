@@ -647,6 +647,179 @@ fn malformed_psb_layer_section_does_not_create_output() {
 }
 
 #[test]
+fn upstream_psb_slices_fixture_normalizes_and_converts() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/psb/psd-tools-slices/input.psb");
+    let bytes = fs::read(&input).expect("read upstream PSB");
+    assert_eq!(&bytes[0..4], b"8BPS");
+    assert_eq!(u16::from_be_bytes([bytes[4], bytes[5]]), 2);
+    let color_len = u32::from_be_bytes(bytes[26..30].try_into().expect("color length")) as usize;
+    let resources_len_offset = 30 + color_len;
+    let resources_len = u32::from_be_bytes(
+        bytes[resources_len_offset..resources_len_offset + 4]
+            .try_into()
+            .expect("resource length"),
+    ) as usize;
+    let layer_len_offset = resources_len_offset + 4 + resources_len;
+    assert!(layer_len_offset + 8 <= bytes.len());
+    let layer_len = u64::from_be_bytes(
+        bytes[layer_len_offset..layer_len_offset + 8]
+            .try_into()
+            .expect("PSB layer length"),
+    );
+    assert_eq!(layer_len, 40);
+
+    let (document, _report) = normalize_bytes(&bytes).expect("normalize upstream PSB fixture");
+    assert_eq!(document.canvas, (240, 180));
+    assert_eq!(document.frames.len(), 1);
+    assert_eq!(document.frames[0].index, 0);
+    assert!(document.root_layers.is_empty());
+    assert_eq!(document.slices.len(), 10);
+    assert_eq!(
+        document
+            .slices
+            .iter()
+            .map(|slice| slice.name.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "slices_06",
+            "Slice 1",
+            "slices_04",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            ""
+        ]
+    );
+    assert_eq!(
+        document.slices[0].keys[0],
+        NormalizedSliceKey {
+            frame: 0,
+            x: 133,
+            y: 70,
+            width: 68,
+            height: 68,
+            pivot: None,
+        }
+    );
+    assert_eq!(
+        document.slices[9].keys[0],
+        NormalizedSliceKey {
+            frame: 0,
+            x: 0,
+            y: 0,
+            width: 240,
+            height: 180,
+            pivot: None,
+        }
+    );
+    let directory = fixture_directory("aseprite-psd-real-psb");
+    let output = directory.join("output.aseprite");
+    fs::copy(&input, directory.join("input.psb")).expect("stage upstream PSB");
+    let conversion = convert(
+        &directory.join("input.psb"),
+        &output,
+        &ConvertOptions::default(),
+    )
+    .expect("convert upstream PSB fixture");
+    assert!(output.exists());
+    assert!(
+        conversion
+            .information_loss
+            .entries
+            .iter()
+            .any(|entry| entry.code == InformationLossCode::Slices)
+    );
+    let output_file = aseprite::AsepriteFile::from_reader(Cursor::new(
+        fs::read(&output).expect("read converted upstream PSB"),
+    ))
+    .expect("parse converted upstream PSB");
+    assert_eq!(output_file.slices().len(), document.slices.len());
+    assert_eq!(
+        output_file
+            .slices()
+            .iter()
+            .map(|slice| slice.name.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "slices_06",
+            "Slice 1",
+            "slices_04",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            ""
+        ]
+    );
+    assert_eq!(output_file.slices()[0].keys[0].frame, 0);
+    assert_eq!(
+        (
+            output_file.slices()[0].keys[0].x,
+            output_file.slices()[0].keys[0].y,
+            output_file.slices()[0].keys[0].width,
+            output_file.slices()[0].keys[0].height,
+        ),
+        (133, 70, 68, 68)
+    );
+    fs::remove_dir_all(directory).expect("remove real PSB fixture");
+}
+
+#[test]
+fn malformed_upstream_psb_variants_fail_without_output() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/psb/psd-tools-slices/input.psb");
+    let original = fs::read(&input).expect("read upstream PSB");
+    let color_len = u32::from_be_bytes(original[26..30].try_into().expect("color length")) as usize;
+    let resources_len_offset = 30 + color_len;
+    let resources_len = u32::from_be_bytes(
+        original[resources_len_offset..resources_len_offset + 4]
+            .try_into()
+            .expect("resource length"),
+    ) as usize;
+    let layer_len_offset = resources_len_offset + 4 + resources_len;
+    let layer_len = u64::from_be_bytes(
+        original[layer_len_offset..layer_len_offset + 8]
+            .try_into()
+            .expect("PSB layer length"),
+    );
+
+    let mut variants = Vec::new();
+    let layer_end = layer_len_offset
+        .checked_add(8)
+        .and_then(|offset| offset.checked_add(usize::try_from(layer_len).expect("layer size")))
+        .expect("layer section end");
+    variants.push(("truncated", original[..layer_end - 1].to_vec()));
+    let mut invalid_version = original.clone();
+    invalid_version[4..6].copy_from_slice(&3u16.to_be_bytes());
+    variants.push(("invalid version", invalid_version));
+    let mut oversized_layer = original.clone();
+    oversized_layer[layer_len_offset..layer_len_offset + 8]
+        .copy_from_slice(&u64::MAX.to_be_bytes());
+    variants.push(("oversized layer section", oversized_layer));
+
+    for (name, bytes) in variants {
+        let directory = fixture_directory(&format!("aseprite-psd-psb-{name}"));
+        let staged_input = directory.join("input.psb");
+        let output = directory.join("output.aseprite");
+        fs::write(&staged_input, bytes).expect("write malformed PSB variant");
+        let error = convert(&staged_input, &output, &ConvertOptions::default())
+            .expect_err("malformed PSB must fail conversion");
+        assert!(
+            error.to_string().contains("could not parse PSD"),
+            "unexpected {name} error: {error}"
+        );
+        assert!(!output.exists(), "malformed {name} created output");
+        fs::remove_dir_all(directory).expect("remove malformed PSB fixture");
+    }
+}
+
+#[test]
 fn converts_16_bit_input_with_explicit_rgba8_degradation() {
     let directory = fixture_directory("aseprite-psd-16-bit");
     let input = directory.join("input.psd");

@@ -175,11 +175,15 @@ cel 复用候选。
   group、URL、target、message、alt text、background、outsets 和图层关联会明确记入
   `Slices/Degraded` 信息损失报告。resource 1050 的 version 6/7/8 已有规范驱动测试，
   但 version 7/8 仍缺少真实 Photoshop 样本验证。
+- 已支持普通尺寸的 PSB version 2 输入。固定的 `psd-tools` `slices.psb` fixture 已通过
+  Rust/TypeScript probe 对比及转换回读验证；超大尺寸和规范化模型之外的 Photoshop
+  特性仍未验证。
 - 导出会保留受支持的组、静态图层属性、帧时长、cel 可见性/位置/透明度、相同
   cel 复用，以及确定性的 tag 播放序列。Tilemap 使用独立扁平快照并报告为
   rasterized；无法继续编辑的 tag 名称/边界、slice、颜色配置和逐 cel Z-Index
   会进入信息损失报告。
-- 仓库有意不提交 PSD 或 PSB 测试素材。
+- 仓库仅提交小型、固定且来源有记录的 PSD/PSB 测试素材；客户 artwork 和大型/私有
+  文档仍不会提交。
 
 ## 开发
 

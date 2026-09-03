@@ -211,13 +211,17 @@ than synthesizing colors. Advanced overrides are available through
   and layer-association fields are recorded as `Slices/Degraded` information
   loss. Resource 1050 versions 6/7/8 have specification-driven tests; authentic
   Photoshop samples for versions 7/8 remain unverified.
+- PSB version 2 input is supported for ordinary-size documents. The pinned
+  `psd-tools` `slices.psb` fixture has passed Rust and TypeScript probe
+  comparison plus conversion/read-back checks. Very large dimensions and
+  Photoshop features outside the normalized model remain unverified.
 - Export preserves supported groups, static layer properties, frame duration,
   cel visibility/position/opacity, identical cel reuse, and deterministic tag
   playback. Tilemaps use the independently flattened composite snapshot and
   are reported as rasterized; tag names/boundaries, slices, color profiles,
   and per-cel Z-Index are reported when they cannot remain editable.
-- Small, deterministic PSD fixtures used by automated tests live under
-  `tests/fixtures/`; customer artwork and large/private PSD or PSB files are
+- Small, deterministic PSD/PSB fixtures used by automated tests live under
+  `tests/fixtures/`; customer artwork and large/private documents are
   intentionally kept out of the repository.
 
 ## Development

@@ -10,6 +10,7 @@
 !/tests/fixtures/
 !/tests/fixtures/**/*.psd
 !/tests/fixtures/**/*.aseprite
+!/tests/fixtures/**/*.psb
 /.cargo/
 /.probe/
 tools/ag-psd-oracle/node_modules/
