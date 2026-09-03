@@ -43,7 +43,7 @@ association strategy 时，请取消 `Use metadata`。
 
 导出默认会写入不可见、带版本的 PSD metadata。它只记录元数据版本、
 逻辑图层 ID 和物化 cel 关系，不包含文件路径、用户名、设备信息或使用追踪；
-Photoshop 等其他读取器可以忽略这段信息。通过 **File > Export > Aseprite ↔ Photoshop
+Photoshop 等其他读取器可以忽略这段信息。通过 **File > Export > PSD/PSB Support
 Settings...** 可以分别控制导出时写入 metadata，以及导入时是否使用 metadata。
 关闭导出标记后 PSD 仍可正常读写，但后续打开无法使用本转换器的精确图层关联。
 

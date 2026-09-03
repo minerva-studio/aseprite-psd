@@ -447,6 +447,30 @@ pub(crate) fn build_layer_write_plan_with_context(
 
     let observation_count = frames.iter().map(Vec::len).sum();
     if observation_count == 0 {
+        if document.root_layers.is_empty() {
+            return Ok(LayerWritePlan {
+                root_nodes: Vec::new(),
+                tracks: Vec::new(),
+                report: AssociationReport {
+                    observation_count: 0,
+                    track_count: 0,
+                    omitted_source_layer_ids: Vec::new(),
+                    z_order_mode,
+                    stable_order_mode,
+                    uncertain_layer_mode,
+                    strategy,
+                    name_catalog_version: COPY_SUFFIX_CATALOG_VERSION,
+                    z_order_diagnostics: Vec::new(),
+                    stable_order_diagnostics: Vec::new(),
+                    candidate_groups: Vec::new(),
+                    decisions: Vec::new(),
+                    warnings: vec![
+                        "automatic layer association found no source layers; emitted an empty layer plan"
+                            .to_string(),
+                    ],
+                },
+            });
+        }
         return Err(
             "automatic layer association found no effective visible pixel layers".to_string(),
         );

@@ -39,7 +39,7 @@ function init(plugin)
     group="file_import",
     onclick=function()
       if not process.binary then
-        dialogs.show_error("Aseprite ↔ Photoshop", "This extension has no binary for the current platform.")
+        dialogs.show_error("PSD/PSB Support", "This extension has no binary for the current platform.")
         return
       end
       workflows.import_from_menu(plugin)
@@ -55,7 +55,7 @@ function init(plugin)
   }
   plugin:newCommand{
     id="AsepritePsdSettings",
-    title="Aseprite ↔ Photoshop Settings...",
+    title="PSD/PSB Support Settings...",
     group="file_export",
     onclick=function()
       dialogs.show_roundtrip_settings(plugin)

@@ -767,6 +767,27 @@ fn upstream_psb_slices_fixture_normalizes_and_converts() {
         ),
         (133, 70, 68, 68)
     );
+
+    let auto_output = directory.join("auto-output.aseprite");
+    let auto_conversion = convert(
+        &directory.join("input.psb"),
+        &auto_output,
+        &ConvertOptions {
+            layer_association: LayerAssociation::Auto(AutoAssociationOptions::default()),
+            ..ConvertOptions::default()
+        },
+    )
+    .expect("automatic association should allow slice-only PSB");
+    assert!(auto_output.exists());
+    let association = auto_conversion
+        .association
+        .expect("automatic association report");
+    assert_eq!(association.observation_count, 0);
+    assert_eq!(association.track_count, 0);
+    assert!(association.warnings.iter().any(|warning| {
+        warning.contains("no source layers") && warning.contains("empty layer plan")
+    }));
+
     fs::remove_dir_all(directory).expect("remove real PSB fixture");
 }
 

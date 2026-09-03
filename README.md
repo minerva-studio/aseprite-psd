@@ -50,7 +50,7 @@ Exports include an invisible, versioned PSD metadata block by
 default. It records only the metadata version, logical layer IDs, and
 materialized cel relationships; it does not contain file paths, usernames,
 device information, or usage tracking. Photoshop and other readers may ignore
-this block. Use **File > Export > Aseprite ↔ Photoshop Settings...** to control both
+this block. Use **File > Export > PSD/PSB Support Settings...** to control both
 export embedding and import usage. Disabling import usage keeps Automatic
 association on the heuristic path even when metadata is present. Disabling
 export embedding leaves the PSD readable, but future opens cannot use exact

@@ -35,6 +35,19 @@ fn default_plan_uses_conservative_strategy() {
 }
 
 #[test]
+fn automatic_association_allows_documents_without_source_layers() {
+    let plan = build_layer_write_plan(&document(Vec::new()))
+        .expect("automatic association should allow slice-only documents");
+    assert!(plan.root_nodes.is_empty());
+    assert!(plan.tracks.is_empty());
+    assert_eq!(plan.report.observation_count, 0);
+    assert_eq!(plan.report.track_count, 0);
+    assert!(plan.report.warnings.iter().any(|warning| {
+        warning.contains("no source layers") && warning.contains("empty layer plan")
+    }));
+}
+
+#[test]
 fn metadata_preservation_isolates_only_layers_with_reference_points() {
     let mut referenced = pixel(1, "role", 0, [1, 2, 3, 255]);
     referenced.frame_states[0].reference_point = Some(crate::AnimationPoint { x: 8.0, y: 8.0 });

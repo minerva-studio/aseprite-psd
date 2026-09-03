@@ -1,6 +1,6 @@
 {
   "name": "aseprite-psd",
-  "displayName": "Aseprite ↔ Photoshop",
+  "displayName": "PSD/PSB Support",
   "description": "Import and export Photoshop PSD/PSB documents through the aseprite-psd converter.",
   "version": "0.2.0",
   "author": {
