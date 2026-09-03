@@ -168,6 +168,10 @@ cel 复用候选。
   明确的导入菜单命令。
 - 转换会保留规范化图层树、RGBA8 cel、Photoshop 帧动画和受支持的图层状态。
   逻辑图层关联及部分坐标映射仍属实验功能，重要输出应在 Aseprite 中人工检查。
+- PSD 导入会保留 slice 的名称、顺序、bounds 和静态 frame 0 key；Photoshop 专属的
+  group、URL、target、message、alt text、background、outsets 和图层关联会明确记入
+  `Slices/Degraded` 信息损失报告。resource 1050 的 version 6/7/8 已有规范驱动测试，
+  但 version 7/8 仍缺少真实 Photoshop 样本验证。
 - 导出会保留受支持的组、静态图层属性、帧时长、cel 可见性/位置/透明度、相同
   cel 复用，以及确定性的 tag 播放序列。Tilemap 使用独立扁平快照并报告为
   rasterized；无法继续编辑的 tag 名称/边界、slice、颜色配置和逐 cel Z-Index

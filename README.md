@@ -203,6 +203,11 @@ than synthesizing colors. Advanced overrides are available through
   animation, and supported layer state. Logical-layer association and some
   coordinate mappings remain experimental, so important output should be
   reviewed in Aseprite.
+- PSD import preserves slice names, order, bounds, and static frame-0 keys.
+  Photoshop-only group, URL, target, message, alt text, background, outsets,
+  and layer-association fields are recorded as `Slices/Degraded` information
+  loss. Resource 1050 versions 6/7/8 have specification-driven tests; authentic
+  Photoshop samples for versions 7/8 remain unverified.
 - Export preserves supported groups, static layer properties, frame duration,
   cel visibility/position/opacity, identical cel reuse, and deterministic tag
   playback. Tilemaps use the independently flattened composite snapshot and
