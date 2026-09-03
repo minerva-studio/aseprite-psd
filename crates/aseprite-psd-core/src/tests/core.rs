@@ -297,6 +297,75 @@ fn psd_spec_slices_fixture(version: u32, truncate: bool) -> Vec<u8> {
     bytes
 }
 
+/// Builds a minimal PSB v2 carrying the same hand-authored slices resource.
+fn psb_spec_slices_fixture(version: u32, malformed_layer_section: bool) -> Vec<u8> {
+    let psd = psd_spec_slices_fixture(version, false);
+    let resources_len = u32::from_be_bytes(psd[30..34].try_into().expect("resource length"));
+    let resources_end = 34 + resources_len as usize;
+    let resources = &psd[34..resources_end];
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"8BPS");
+    bytes.extend_from_slice(&2u16.to_be_bytes());
+    bytes.extend_from_slice(&[0; 6]);
+    bytes.extend_from_slice(&3u16.to_be_bytes());
+    bytes.extend_from_slice(&1u32.to_be_bytes());
+    bytes.extend_from_slice(&1u32.to_be_bytes());
+    bytes.extend_from_slice(&8u16.to_be_bytes());
+    bytes.extend_from_slice(&3u16.to_be_bytes());
+    bytes.extend_from_slice(&0u32.to_be_bytes());
+    bytes.extend_from_slice(&(resources.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(resources);
+    bytes.extend_from_slice(&if malformed_layer_section { 1u64 } else { 0u64 }.to_be_bytes());
+    if malformed_layer_section {
+        bytes.push(0);
+    }
+    bytes.extend_from_slice(&0u16.to_be_bytes());
+    bytes.extend_from_slice(&[0, 0, 0]);
+    bytes
+}
+
+/// Builds a one-pixel PSD with an explicit color mode, depth, and channel count.
+fn psd_color_fixture(color_mode: u16, bits_per_channel: u16, channels: u16) -> Vec<u8> {
+    let source = psd_spec_slices_fixture(6, false);
+    let resources_len = u32::from_be_bytes(source[30..34].try_into().expect("resource length"));
+    let resources_end = 34 + resources_len as usize;
+    let resources = &source[34..resources_end];
+    let color_data = if color_mode == 2 {
+        (0..768).map(|value| value as u8).collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let bytes_per_sample = usize::from(bits_per_channel.div_ceil(8));
+    let sample_count = usize::from(channels) * bytes_per_sample;
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"8BPS");
+    bytes.extend_from_slice(&1u16.to_be_bytes());
+    bytes.extend_from_slice(&[0; 6]);
+    bytes.extend_from_slice(&channels.to_be_bytes());
+    bytes.extend_from_slice(&1u32.to_be_bytes());
+    bytes.extend_from_slice(&1u32.to_be_bytes());
+    bytes.extend_from_slice(&bits_per_channel.to_be_bytes());
+    bytes.extend_from_slice(&color_mode.to_be_bytes());
+    bytes.extend_from_slice(&(color_data.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(&color_data);
+    bytes.extend_from_slice(&(resources.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(resources);
+    bytes.extend_from_slice(&0u32.to_be_bytes());
+    if color_mode == 2 {
+        // ag-psd follows the upstream reader and accepts indexed composite data
+        // only through PackBits/RLE, not the raw indexed path.
+        bytes.extend_from_slice(&1u16.to_be_bytes());
+        bytes.extend_from_slice(&2u16.to_be_bytes());
+        bytes.extend_from_slice(&[0, 0]);
+    } else {
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend(std::iter::repeat_n(0u8, sample_count));
+    }
+    bytes
+}
+
 /// Encodes the ASCII-or-class-ID form used by PSD descriptors.
 fn push_descriptor_ascii_or_class_id(bytes: &mut Vec<u8>, value: &str) {
     if value.len() == 4 && value.is_ascii() {
@@ -532,6 +601,97 @@ fn normalizes_hand_built_descriptor_slices_versions_7_and_8() {
                 .contains(&"outsets".to_string())
         );
     }
+}
+
+#[test]
+fn normalizes_psb_v2_descriptor_slices_and_preserves_container_shape() {
+    for version in [7u32, 8u32] {
+        let (document, report) = normalize_bytes(&psb_spec_slices_fixture(version, false))
+            .unwrap_or_else(|error| panic!("normalize PSB version-{version} fixture: {error}"));
+        assert!(report.is_empty());
+        assert_eq!(document.canvas, (1, 1));
+        assert_eq!(document.frames.len(), 1);
+        assert!(document.root_layers.is_empty());
+        assert_eq!(document.slices.len(), 2);
+        assert_eq!(document.slices[0].name, "区域😀");
+        assert_eq!(document.slices[1].name, "");
+        assert_eq!(document.slices[0].keys[0].frame, 0);
+        assert_eq!(document.slices[0].keys[0].x, -3);
+        assert_eq!(document.slices[0].keys[0].width, 9);
+    }
+}
+
+#[test]
+fn malformed_psb_layer_section_does_not_create_output() {
+    let directory = fixture_directory("aseprite-psd-psb-malformed");
+    let input = directory.join("malformed.psb");
+    let output = directory.join("malformed.aseprite");
+    fs::write(&input, psb_spec_slices_fixture(8, true)).expect("write malformed PSB fixture");
+    let error = convert(&input, &output, &ConvertOptions::default())
+        .expect_err("malformed PSB layer section must fail conversion");
+    assert!(error.to_string().contains("could not parse PSD"));
+    assert!(!output.exists());
+    fs::remove_dir_all(directory).expect("remove malformed PSB fixture");
+}
+
+#[test]
+fn converts_16_bit_input_with_explicit_rgba8_degradation() {
+    let directory = fixture_directory("aseprite-psd-16-bit");
+    let input = directory.join("input.psd");
+    let output = directory.join("output.aseprite");
+    fs::write(&input, psd_color_fixture(3, 16, 3)).expect("write 16-bit fixture");
+    let report = convert(&input, &output, &ConvertOptions::default())
+        .expect("16-bit input should normalize to RGBA8");
+    let loss = report
+        .information_loss
+        .entries
+        .iter()
+        .find(|entry| entry.code == InformationLossCode::UnsupportedColor)
+        .expect("16-bit degradation report");
+    assert_eq!(loss.disposition, LossDisposition::Degraded);
+    assert!(loss.detail.contains("normalized to RGBA8"));
+    assert!(output.exists());
+    fs::remove_dir_all(directory).expect("remove 16-bit fixture");
+}
+
+#[test]
+fn converts_grayscale_and_indexed_input_with_color_loss_report() {
+    for (color_mode, channels) in [(1u16, 1u16), (2u16, 1u16), (1u16, 2u16)] {
+        let directory = fixture_directory("aseprite-psd-color-mode");
+        let input = directory.join("input.psd");
+        let output = directory.join("output.aseprite");
+        fs::write(&input, psd_color_fixture(color_mode, 8, channels))
+            .expect("write color-mode fixture");
+        let report = convert(&input, &output, &ConvertOptions::default())
+            .expect("non-RGB input should normalize to RGBA8");
+        let loss = report
+            .information_loss
+            .entries
+            .iter()
+            .find(|entry| entry.code == InformationLossCode::UnsupportedColor)
+            .expect("color-mode degradation report");
+        assert_eq!(loss.disposition, LossDisposition::Degraded);
+        assert!(loss.detail.contains("normalized to RGBA8"));
+        assert!(output.exists());
+        fs::remove_dir_all(directory).expect("remove color-mode fixture");
+    }
+}
+
+#[test]
+fn rejects_32_bit_input_before_output_commit() {
+    let directory = fixture_directory("aseprite-psd-32-bit");
+    let input = directory.join("input.psd");
+    let output = directory.join("output.aseprite");
+    fs::write(&input, psd_color_fixture(3, 32, 3)).expect("write 32-bit fixture");
+    let error = convert(&input, &output, &ConvertOptions::default())
+        .expect_err("32-bit input must remain unsupported");
+    assert!(
+        error
+            .to_string()
+            .contains("32-bit PSD input is not supported")
+    );
+    assert!(!output.exists());
+    fs::remove_dir_all(directory).expect("remove 32-bit fixture");
 }
 
 #[test]
