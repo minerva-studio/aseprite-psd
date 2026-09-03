@@ -208,7 +208,9 @@ than synthesizing colors. Advanced overrides are available through
   playback. Tilemaps use the independently flattened composite snapshot and
   are reported as rasterized; tag names/boundaries, slices, color profiles,
   and per-cel Z-Index are reported when they cannot remain editable.
-- PSD and PSB fixtures are intentionally not committed to this repository.
+- Small, deterministic PSD fixtures used by automated tests live under
+  `tests/fixtures/`; customer artwork and large/private PSD or PSB files are
+  intentionally kept out of the repository.
 
 ## Development
 

@@ -46,7 +46,10 @@ $Aseprite = (Get-Command aseprite -ErrorAction Stop).Source
 ```
 
 Use a real PSD supplied outside the repository for compatibility testing. Do
-not add customer artwork or private fixtures to Git.
+Small deterministic fixtures used by automated tests belong under
+`tests/fixtures/`. Do not add customer artwork or private fixtures to Git;
+keep generated probes and manual review material under the ignored `.probe/`,
+`target/`, or `dist/` directories.
 
 Use `-OutputDirectory` when probing multiple fixtures so their snapshots do not
 share files. The render comparator consumes frame-indexed `frame-N.png` files
