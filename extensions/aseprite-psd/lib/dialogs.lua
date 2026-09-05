@@ -452,8 +452,13 @@ function Dialogs.new(process)
         "Merge identical content (experimental)",
       },
     }
-    dialog:label{ id="content_reuse_help", text="Linked reuses linked cels only when their displayed state matches." }
-    dialog:label{ id="content_reuse_warning", text="Aggressive merging means edits to shared content affect multiple frames." }
+    dialog:label{ id="content_reuse_help", text="Linked reuses linked cels only when their" }
+    dialog:newrow()
+    dialog:label{ text="displayed state matches." }
+    dialog:newrow()
+    dialog:label{ id="content_reuse_warning", text="Aggressive merging means edits to shared" }
+    dialog:newrow()
+    dialog:label{ text="content affect multiple frames." }
     dialog:newrow()
     dialog:button{ id="export", text="Export", focus=true }
     dialog:button{ id="cancel", text="Cancel" }
