@@ -131,7 +131,7 @@ Exports include an invisible, versioned PSD metadata block by default. It record
 
 Once native integration is available, cancelling its `File > Open` import dialog reports `PSD opening cancelled by user.` so that a cancelled open is never confused with a failed or partially initialized document.
 
-To export now, choose **File > Export > Export PSD/PSB...**. Native `File > Save As...` with a `.psd` or `.psb` destination becomes an additional entry point once the Aseprite integration is available. The extension snapshots isolated original and flattened copies, runs the bundled converter, validates the Photoshop document, and only then writes it through Aseprite's custom-format save stream. The save options let you choose whether empty pixel layers are included, and Ctrl+S reuses the selected format and option. Extension exports use Photoshop-compatible RLE channel compression automatically. Exporting an Aseprite timeline as a Photoshop timeline is not supported in 0.3.1; the supported export contract is a static layered PSD/PSB document.
+To export now, choose **File > Export > Export PSD/PSB...**. Native `File > Save As...` with a `.psd` or `.psb` destination becomes an additional entry point once the Aseprite integration is available. The extension snapshots isolated original and flattened copies, runs the bundled converter, validates the Photoshop document, and only then writes it through Aseprite's custom-format save stream. The save options let you choose whether empty pixel layers are included, and Ctrl+S reuses the selected format and option. Extension exports use Photoshop-compatible RLE channel compression automatically. Animated Aseprite documents export as genuine Photoshop Frame Animation timelines: frame count, playback order, frame durations, loop policy, and the selected active frame are preserved.
 
 Aseprite may open and truncate a native custom-format destination before the save callback runs. The extension validates the complete PSD before writing, but cannot provide transactional rollback for a failed overwrite. Use the explicit Export command to write a separate destination when the existing file must be preserved.
 
@@ -153,7 +153,13 @@ it to Aseprite RGBA8 and records `UnsupportedColor/Degraded` information loss. T
 Photoshop-only group, URL, target, message, alt text, background, outsets, and layer-association fields are recorded as `Slices/Degraded` information loss. Resource 1050 versions 6/7/8 have specification-driven tests; authentic Photoshop samples for versions 7/8 remain unverified.
 - PSB input is supported. The pinned `psd-tools` `slices.psb` fixture has passed
 Rust and TypeScript probe comparison plus conversion/read-back checks. Very large canvases remain limited by the dimensions Aseprite can represent, and performance near Photoshop's maximum dimensions has not been validated.
-- Export preserves supported groups and static layer properties. Exporting an
-Aseprite timeline as a Photoshop timeline is not supported in 0.3.1. Tilemaps use the independently flattened composite snapshot and are reported as rasterized; tag names/boundaries, slices, color profiles, and per-cel Z-Index are reported when they cannot remain editable.
+- Export preserves supported groups and static layer properties. Animated export
+  flattens Aseprite tag names and boundaries into one deterministic Photoshop
+  frame sequence, so they are reported when they cannot remain editable.
+  `linked` and `aggressive` content reuse are experimental: editing shared
+  Photoshop content can affect multiple logical frames. Tilemaps use the
+  independently flattened composite snapshot and are reported as rasterized;
+  slices, color profiles, and per-cel Z-Index are reported when they cannot
+  remain editable.
 - Small, deterministic PSD/PSB fixtures used by automated tests live under
 `tests/fixtures/`; customer artwork and large/private documents are intentionally kept out of the repository.

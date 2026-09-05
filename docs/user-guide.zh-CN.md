@@ -131,7 +131,7 @@
 
 原生集成可用后，在 `File > Open` 中取消导入对话框会明确报告 `PSD opening cancelled by user.`，不会伪装成失败的 Sprite 或半初始化文档。
 
-当前导出请使用 **File > Export > Export PSD/PSB...**。原生集成可用后，选择 **File > Save As...** 并指定 `.psd` 或 `.psb` 将成为额外入口。扩展会分别创建 隔离的原始副本与扁平副本，调用内附 converter 并验证 Photoshop 文档，最后才通过 Aseprite 自定义格式的保存流写入。保存选项可以选择是否包含空像素图层，后续 Ctrl+S 会复用已选格式和该选项。扩展导出会自动使用 Photoshop 兼容的 RLE 通道 压缩。0.3.1 暂不支持把 Aseprite 时间线导出为 Photoshop 时间线；受支持的导出 契约是静态分层 PSD/PSB 文档。
+当前导出请使用 **File > Export > Export PSD/PSB...**。原生集成可用后，选择 **File > Save As...** 并指定 `.psd` 或 `.psb` 将成为额外入口。扩展会分别创建隔离的原始副本与扁平副本，调用内附 converter 并验证 Photoshop 文档，最后才通过 Aseprite 自定义格式的保存流写入。保存选项可以选择是否包含空像素图层，后续 Ctrl+S 会复用已选格式和该选项。扩展导出会自动使用 Photoshop 兼容的 RLE 通道压缩。带时间线的 Aseprite 文档会导出为真正的 Photoshop 帧动画时间轴：保留帧数、播放顺序、逐帧时长、循环策略和选中的活动帧。
 
 Aseprite 可能在调用保存回调前就打开并截断原生目标文件。扩展会在写入前完整 验证 PSD，但无法为失败覆盖提供事务式回滚；需要保留旧文件时，请使用 Export 菜单 写入另一路径。
 
@@ -153,7 +153,10 @@ Aseprite 运行时验证。
 group、URL、target、message、alt text、background、outsets 和图层关联会明确记入 `Slices/Degraded` 信息损失报告。resource 1050 的 version 6/7/8 已有规范驱动测试， 但 version 7/8 仍缺少真实 Photoshop 样本验证。
 - 支持 PSB 输入。固定的 `psd-tools` `slices.psb` fixture 已通过 Rust/TypeScript
 probe 对比及转换回读验证；超大画布仍受 Aseprite 可表达尺寸限制，接近 Photoshop 上限的文件性能尚未验证。
-- 导出会保留受支持的组和静态图层属性。0.3.1 暂不支持把 Aseprite 时间线导出为
-Photoshop 时间线。Tilemap 使用独立扁平快照并报告为 rasterized；无法继续编辑的 tag 名称/边界、slice、颜色配置和逐 cel Z-Index 会进入信息损失报告。
+- 导出会保留受支持的组和静态图层属性。动画导出会把 Aseprite tag 名称和边界展平为
+一个确定的 Photoshop 帧序列，因此它们不会作为可编辑 tag 保留，并会记入信息损失报告。
+`linked` 与 `aggressive` 内容复用仍属实验功能：编辑共享的 Photoshop 内容可能影响多个
+逻辑帧。Tilemap 使用独立扁平快照并报告为 rasterized；无法继续编辑的 slice、颜色配置和
+逐 cel Z-Index 会进入信息损失报告。
 - 仓库仅提交小型、固定且来源有记录的 PSD/PSB 测试素材；客户 artwork 和大型/私有
 文档仍不会提交。

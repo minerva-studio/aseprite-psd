@@ -11,6 +11,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "ag-psd"
 version = "0.2.0"
+source = "git+https://github.com/minerva-studio/ag-psd-rs.git?rev=a3b8324#a3b8324add6b1bed585300adbec49003a6f36966"
 dependencies = [
  "flate2",
 ]
@@ -26,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "aseprite-psd"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "aseprite-io",
  "aseprite-psd-core",
@@ -36,7 +37,7 @@ dependencies = [
 
 [[package]]
 name = "aseprite-psd-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "ag-psd",
  "aseprite-io",
@@ -47,7 +48,7 @@ dependencies = [
 
 [[package]]
 name = "aseprite-psd-rust-probe"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "ag-psd",
  "aseprite-psd-core",
@@ -239,9 +240,9 @@ checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
 name = "syn"
-version = "3.0.4"
+version = "3.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6275cddf4610d1775e6d1fe9469b2e77d0f39fd98fb7450901b821e0c53649f"
+checksum = "12df2e0110f65b775f769bb17ef989067a1d931b2eb822bd4346631eeada89f9"
 dependencies = [
  "proc-macro2",
  "quote",

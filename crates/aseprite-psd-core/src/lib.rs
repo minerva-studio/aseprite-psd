@@ -1931,7 +1931,9 @@ pub fn convert(
 /// the source of truth; marker payloads are used only to recognize the owned layout.
 fn materialize_local_content_timeline(document: &mut NormalizedDocument) -> Result<(), String> {
     if document.root_layers.is_empty() || document.frames.is_empty() {
-        return Err("local content-reuse document has no logical roots or timeline frames".to_string());
+        return Err(
+            "local content-reuse document has no logical roots or timeline frames".to_string(),
+        );
     }
     let logical_roots = document.root_layers.clone();
     let mut frame_groups = Vec::with_capacity(document.frames.len());
@@ -1991,7 +1993,12 @@ fn materialize_local_content_layer(
         let chosen = layer
             .children
             .iter()
-            .find(|child| child.frame_states.get(frame_index).is_some_and(|state| state.enabled))
+            .find(|child| {
+                child
+                    .frame_states
+                    .get(frame_index)
+                    .is_some_and(|state| state.enabled)
+            })
             .or_else(|| layer.children.first())
             .ok_or_else(|| format!("state container {} has no variants", layer.id))?;
         let mut materialized = chosen.clone();
@@ -2019,10 +2026,9 @@ fn materialize_local_content_layer(
 fn is_local_state_container(layer: &NormalizedLayer) -> bool {
     layer.kind == NormalizedLayerKind::Group
         && layer.children.len() > 1
-        && layer
-            .children
-            .iter()
-            .all(|child| child.kind == NormalizedLayerKind::Pixel && child.name.starts_with("State "))
+        && layer.children.iter().all(|child| {
+            child.kind == NormalizedLayerKind::Pixel && child.name.starts_with("State ")
+        })
 }
 
 fn materialize_content_reuse_frame_groups(document: &mut NormalizedDocument) -> Result<(), String> {

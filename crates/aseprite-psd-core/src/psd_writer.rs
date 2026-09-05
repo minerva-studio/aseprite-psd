@@ -4329,16 +4329,12 @@ mod tests {
                 .expect("omitted frame folders")
                 .iter()
                 .all(|frame| {
-                    frame
-                        .children
-                        .as_ref()
-                        .map(|children| {
-                            children
-                                .iter()
-                                .map(|child| child.additional_info.name.as_deref())
-                                .collect::<Vec<_>>()
-                        })
-                        == Some(vec![Some("Content"), Some("Hidden Content")])
+                    frame.children.as_ref().map(|children| {
+                        children
+                            .iter()
+                            .map(|child| child.additional_info.name.as_deref())
+                            .collect::<Vec<_>>()
+                    }) == Some(vec![Some("Content"), Some("Hidden Content")])
                 })
         );
 
