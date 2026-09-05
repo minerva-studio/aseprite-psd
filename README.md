@@ -138,9 +138,17 @@ aseprite-psd export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite
 aseprite-psd export INPUT.aseprite -o OUTPUT.psb --composite COMPOSITE.aseprite --report REPORT.json --overwrite
 aseprite-psd export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite --roundtrip-metadata off
 aseprite-psd export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite --empty-layers omit
+aseprite-psd export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite --content-reuse linked
 ```
 
 Run `aseprite-psd --help` for the complete command syntax.
+
+Animated exports accept `--content-reuse none|linked|aggressive`. `none` keeps
+one physical frame folder per timeline frame. `linked` may share complete,
+identical frame-folder states only when the source Aseprite cels explicitly
+share a linked-cel target. `aggressive` also shares complete states with exact
+pixel and display-property equality. The timeline frame count and playback
+order are never shortened; these modes are experimental.
 
 Frame interpretation is explicit for PSDs without a Photoshop timeline:
 

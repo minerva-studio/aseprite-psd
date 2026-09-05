@@ -80,8 +80,27 @@ function Dialogs.new(process)
     end
     losses = visible_losses
     local loss_count = #losses
-    if loss_count == 0 then return end
+    if loss_count == 0 and report.content_reuse == nil then return end
     local lines = {"Some PSD information could not be preserved:"}
+    local reuse = report.content_reuse
+    if reuse then
+      table.insert(lines, string.format(
+        "Content reuse: %s requested, %s used; physical layers %d -> %d; output %d bytes",
+        reuse.requested or "none",
+        reuse.actual or "none",
+        reuse.baseline_physical_layer_count or 0,
+        reuse.physical_layer_count or 0,
+        reuse.output_bytes or 0))
+      if reuse.explicit_link_reuse_count and reuse.explicit_link_reuse_count > 0 then
+        table.insert(lines, string.format("  Explicit linked states reused: %d", reuse.explicit_link_reuse_count))
+      end
+      if reuse.exact_match_reuse_count and reuse.exact_match_reuse_count > 0 then
+        table.insert(lines, string.format("  Exact matching states reused: %d", reuse.exact_match_reuse_count))
+      end
+      for _, reason in ipairs(reuse.fallback_reasons or {}) do
+        table.insert(lines, "  Reuse fallback: " .. tostring(reason))
+      end
+    end
     for index = 1, math.min(loss_count, 8) do
       local loss = losses[index]
       local occurrence_count = loss.count or 0
@@ -409,7 +428,7 @@ function Dialogs.new(process)
   end
 
   --- Shows the export options shared by both export entrypoints; PSD output uses RLE automatically.
-  local function select_export_options()
+  local function select_export_options(initial)
     local dialog = Dialog{ title="Export PSD/PSB Options" }
     if not dialog then
       show_error("PSD export failed", "Aseprite does not have an available UI.")
@@ -419,8 +438,22 @@ function Dialogs.new(process)
       id="include_empty_layers",
       label="Empty pixel layers",
       text="Export empty pixel layers",
-      selected=false,
+      selected=initial and initial.include_empty_layers == true or false,
     }
+    dialog:combobox{
+      id="content_reuse",
+      label="Content reuse",
+      option=initial and initial.content_reuse == "linked" and "Reuse Linked Cels only (experimental)"
+        or initial and initial.content_reuse == "aggressive" and "Merge identical content (experimental)"
+        or "Frame folders",
+      options={
+        "Frame folders",
+        "Reuse Linked Cels only (experimental)",
+        "Merge identical content (experimental)",
+      },
+    }
+    dialog:label{ id="content_reuse_help", text="Linked reuses linked cels only when their displayed state matches." }
+    dialog:label{ id="content_reuse_warning", text="Aggressive merging means edits to shared content affect multiple frames." }
     dialog:newrow()
     dialog:button{ id="export", text="Export", focus=true }
     dialog:button{ id="cancel", text="Cancel" }
@@ -430,6 +463,9 @@ function Dialogs.new(process)
     end
     return {
       include_empty_layers = dialog.data.include_empty_layers == true,
+      content_reuse = dialog.data.content_reuse == "Reuse Linked Cels only (experimental)" and "linked"
+        or dialog.data.content_reuse == "Merge identical content (experimental)" and "aggressive"
+        or "none",
     }
   end
 

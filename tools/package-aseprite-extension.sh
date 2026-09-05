@@ -138,6 +138,9 @@ output="$output_dir/$(basename -- "$output")"
 staging="$(mktemp -d "${TMPDIR:-/tmp}/aseprite-psd.XXXXXX")"
 cleanup() {
   rm -rf -- "$staging"
+  if [[ -n "${archive_validation_root:-}" ]]; then
+    rm -rf -- "$archive_validation_root"
+  fi
 }
 trap cleanup EXIT
 
@@ -177,21 +180,36 @@ else
   cp -- "$binary" "$staging/bin/$platform/$executable_name"
 fi
 
+archive_validation_root=""
 if command -v zip >/dev/null 2>&1; then
   (cd "$staging" && zip -q -r "$output" .)
+elif command -v powershell.exe >/dev/null 2>&1; then
+  staging_windows="$(cygpath -w "$staging" 2>/dev/null || printf '%s' "$staging")"
+  output_windows="$(cygpath -w "$output" 2>/dev/null || printf '%s' "$output")"
+  powershell.exe -NoProfile -NonInteractive -Command \
+    "\$staging='$staging_windows';\$output='$output_windows';Compress-Archive -Path (Join-Path \$staging '*') -DestinationPath \$output -Force"
+  archive_validation_root="$(mktemp -d "${TMPDIR:-/tmp}/aseprite-psd-archive.XXXXXX")"
+  validation_windows="$(cygpath -w "$archive_validation_root" 2>/dev/null || printf '%s' "$archive_validation_root")"
+  powershell.exe -NoProfile -NonInteractive -Command \
+    "\$archive='$output_windows';\$destination='$validation_windows';Expand-Archive -Path \$archive -DestinationPath \$destination -Force"
 else
-  echo "error: install the zip command to create the extension archive" >&2
+  echo "error: install zip or provide PowerShell Compress-Archive to create the extension archive" >&2
   exit 69
 fi
 
-if ! command -v unzip >/dev/null 2>&1; then
-  echo "error: install the unzip command to validate the extension archive" >&2
-  exit 69
+if command -v unzip >/dev/null 2>&1; then
+  archive_entries="$(unzip -Z1 "$output")"
+else
+  archive_entries=""
 fi
-archive_entries="$(unzip -Z1 "$output")"
 require_entry() {
   local entry="$1"
-  if ! printf '%s\n' "$archive_entries" | grep -Fqx "$entry"; then
+  if [[ -n "$archive_validation_root" ]]; then
+    [[ -f "$archive_validation_root/$entry" ]] && return 0
+  elif printf '%s\n' "$archive_entries" | grep -Fqx "$entry"; then
+    return 0
+  fi
+  if [[ -z "$archive_validation_root" && -z "$archive_entries" ]] || [[ -n "$archive_validation_root" ]]; then
     echo "error: created archive is missing: $entry" >&2
     exit 1
   fi

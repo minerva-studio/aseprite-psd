@@ -118,9 +118,15 @@ aseprite-psd export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite
 aseprite-psd export INPUT.aseprite -o OUTPUT.psb --composite COMPOSITE.aseprite --report REPORT.json --overwrite
 aseprite-psd export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite --roundtrip-metadata off
 aseprite-psd export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite --empty-layers omit
+aseprite-psd export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite --content-reuse linked
 ```
 
 使用 `aseprite-psd --help` 查看完整命令格式。
+
+动画导出支持 `--content-reuse none|linked|aggressive`。`none` 为每个时间点
+保留独立的物理帧文件夹；`linked` 只在源 Aseprite cel 明确共享链接目标且完整
+显示状态一致时复用；`aggressive` 还会复用像素和显示属性完全相同的独立状态。
+时间轴帧数、顺序和播放设置不会缩短；两种复用模式均为实验性功能。
 
 没有 Photoshop 时间轴时，帧来源必须明确选择：
 

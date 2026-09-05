@@ -1980,6 +1980,8 @@ fn roundtrip_preset_falls_back_to_auto_for_unmarked_documents() {
         },
         version: None,
         frame_count: None,
+        linked_content: false,
+        local_content: false,
     })
     .expect("unmarked documents should use automatic association");
     assert!(!exact);
@@ -1995,6 +1997,8 @@ fn roundtrip_preset_keeps_invalid_markers_on_recovery_path() {
         },
         version: Some(2),
         frame_count: Some(2),
+        linked_content: false,
+        local_content: false,
     })
     .expect_err("invalid markers must require recovery");
     assert!(matches!(

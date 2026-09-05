@@ -194,7 +194,8 @@ function Process.new(plugin)
     report,
     active_frame_index,
     embed_roundtrip_metadata,
-    include_empty_layers)
+    include_empty_layers,
+    content_reuse)
     local arguments = {
       binary,
       "export",
@@ -216,6 +217,8 @@ function Process.new(plugin)
     end
     table.insert(arguments, "--empty-layers")
     table.insert(arguments, include_empty_layers == true and "include" or "omit")
+    table.insert(arguments, "--content-reuse")
+    table.insert(arguments, content_reuse or "none")
     return arguments
   end
 
@@ -322,7 +325,8 @@ function Process.new(plugin)
     report,
     active_frame_index,
     embed_roundtrip_metadata,
-    include_empty_layers)
+    include_empty_layers,
+    content_reuse)
     if not app.fs.isFile(input) or not app.fs.isFile(composite) then
       error("Aseprite export snapshots were not created.")
     end
@@ -336,7 +340,8 @@ function Process.new(plugin)
         report,
         active_frame_index,
         embed_roundtrip_metadata,
-        include_empty_layers),
+        include_empty_layers,
+        content_reuse),
       output,
       "conversion")
   end

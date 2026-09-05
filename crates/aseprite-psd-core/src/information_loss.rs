@@ -124,6 +124,20 @@ struct JsonReport<'a> {
     active_frame_index: Option<u32>,
     summary: JsonSummary,
     losses: &'a [InformationLoss],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_reuse: Option<JsonContentReuse>,
+}
+
+#[derive(Serialize)]
+struct JsonContentReuse {
+    requested: &'static str,
+    actual: &'static str,
+    baseline_physical_layer_count: usize,
+    physical_layer_count: usize,
+    explicit_link_reuse_count: usize,
+    exact_match_reuse_count: usize,
+    fallback_reasons: Vec<String>,
+    output_bytes: usize,
 }
 
 #[derive(Serialize)]
@@ -157,6 +171,46 @@ pub fn report_json_with_active_frame(
             total: report.entries.len(),
         },
         losses: &report.entries,
+        content_reuse: None,
+    })
+}
+
+/// Serializes a compatibility report with the export layout and byte statistics.
+#[allow(clippy::too_many_arguments)]
+pub fn report_json_with_export(
+    input: &Path,
+    output: &Path,
+    report: &InformationLossReport,
+    active_frame_index: Option<u32>,
+    requested: &'static str,
+    actual: &'static str,
+    baseline_physical_layer_count: usize,
+    physical_layer_count: usize,
+    explicit_link_reuse_count: usize,
+    exact_match_reuse_count: usize,
+    fallback_reasons: Vec<String>,
+    output_bytes: usize,
+) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec_pretty(&JsonReport {
+        schema_version: 3,
+        tool_version: crate::VERSION,
+        input: input.display().to_string(),
+        output: output.display().to_string(),
+        active_frame_index,
+        summary: JsonSummary {
+            total: report.entries.len(),
+        },
+        losses: &report.entries,
+        content_reuse: Some(JsonContentReuse {
+            requested,
+            actual,
+            baseline_physical_layer_count,
+            physical_layer_count,
+            explicit_link_reuse_count,
+            exact_match_reuse_count,
+            fallback_reasons,
+            output_bytes,
+        }),
     })
 }
 
@@ -181,6 +235,41 @@ pub fn write_report_with_active_frame(
     let payload = report_json_with_active_frame(input, output, report, active_frame_index)
         .map_err(io::Error::other)?;
     commit_bytes(path, &payload, true)
+}
+
+/// Atomically writes a compatibility report with export layout statistics.
+#[allow(clippy::too_many_arguments)]
+pub fn write_export_report_with_active_frame(
+    path: &Path,
+    input: &Path,
+    output: &Path,
+    report: &InformationLossReport,
+    active_frame_index: Option<u32>,
+    requested: &'static str,
+    actual: &'static str,
+    baseline_physical_layer_count: usize,
+    physical_layer_count: usize,
+    explicit_link_reuse_count: usize,
+    exact_match_reuse_count: usize,
+    fallback_reasons: Vec<String>,
+    output_bytes: usize,
+) -> io::Result<()> {
+    let bytes = report_json_with_export(
+        input,
+        output,
+        report,
+        active_frame_index,
+        requested,
+        actual,
+        baseline_physical_layer_count,
+        physical_layer_count,
+        explicit_link_reuse_count,
+        exact_match_reuse_count,
+        fallback_reasons,
+        output_bytes,
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?;
+    commit_bytes(path, &bytes, true).map_err(io::Error::other)
 }
 
 impl InformationLossReport {
@@ -316,5 +405,38 @@ mod tests {
         .expect("report JSON should decode");
         assert_eq!(value["schema_version"], 3);
         assert_eq!(value["active_frame_index"], 8);
+    }
+
+    #[test]
+    fn export_report_json_includes_content_reuse_statistics() {
+        let report = InformationLossReport::default();
+        let value: serde_json::Value = serde_json::from_slice(
+            &report_json_with_export(
+                Path::new("input.aseprite"),
+                Path::new("output.psd"),
+                &report,
+                Some(1),
+                "aggressive",
+                "aggressive",
+                12,
+                8,
+                0,
+                2,
+                vec!["tilemap input fell back to frame folders".to_string()],
+                4096,
+            )
+            .expect("export report JSON should serialize"),
+        )
+        .expect("export report JSON should decode");
+        assert_eq!(value["content_reuse"]["requested"], "aggressive");
+        assert_eq!(value["content_reuse"]["actual"], "aggressive");
+        assert_eq!(value["content_reuse"]["baseline_physical_layer_count"], 12);
+        assert_eq!(value["content_reuse"]["physical_layer_count"], 8);
+        assert_eq!(value["content_reuse"]["exact_match_reuse_count"], 2);
+        assert_eq!(value["content_reuse"]["output_bytes"], 4096);
+        assert_eq!(
+            value["content_reuse"]["fallback_reasons"][0],
+            "tilemap input fell back to frame folders"
+        );
     }
 }

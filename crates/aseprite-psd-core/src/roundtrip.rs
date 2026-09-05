@@ -8,6 +8,9 @@ const MARKER_KEY: &[u8; 4] = b"p2rt";
 const MARKER_MAGIC: &[u8; 4] = b"P2RT";
 const LEGACY_MARKER_VERSION: u16 = 1;
 const FRAME_GROUP_MARKER_VERSION: u16 = 2;
+const CONTENT_REUSE_MARKER_VERSION: u16 = 3;
+pub(crate) const LOCAL_CONTENT_REUSE_MARKER_ID: u32 = u32::MAX - 2;
+pub(crate) const LOCAL_LINKED_CONTENT_REUSE_MARKER_ID: u32 = u32::MAX - 3;
 const MARKER_SIZE: usize = 20;
 
 /// The role of one layer in a converter-owned cel materialization.
@@ -47,6 +50,10 @@ pub(crate) struct RoundTripLayout {
     pub(crate) version: Option<u16>,
     /// Declared frame count for v2 frame-group markers.
     pub(crate) frame_count: Option<u32>,
+    /// Whether a v3 content-reuse layout originated from explicit linked cels.
+    pub(crate) linked_content: bool,
+    /// Whether v3 uses logical-layer local state containers rather than root states.
+    pub(crate) local_content: bool,
 }
 
 /// Encodes one marker payload for a PSD additional-info block.
@@ -80,8 +87,12 @@ pub(crate) fn decode_marker(data: &[u8]) -> Option<LayerMarker> {
     let role = match data[6] {
         1 if version == LEGACY_MARKER_VERSION => MarkerRole::Wrapper,
         2 if version == LEGACY_MARKER_VERSION => MarkerRole::Variant,
-        3 if version == FRAME_GROUP_MARKER_VERSION => MarkerRole::FrameGroup,
-        4 if version == FRAME_GROUP_MARKER_VERSION => MarkerRole::LayerCopy,
+        3 if version == FRAME_GROUP_MARKER_VERSION || version == CONTENT_REUSE_MARKER_VERSION => {
+            MarkerRole::FrameGroup
+        }
+        4 if version == FRAME_GROUP_MARKER_VERSION || version == CONTENT_REUSE_MARKER_VERSION => {
+            MarkerRole::LayerCopy
+        }
         _ => return None,
     };
     Some(LayerMarker {
@@ -190,14 +201,35 @@ pub(crate) fn inspect_detailed(bytes: &[u8]) -> Result<RoundTripLayout, Inspecti
             },
             version: None,
             frame_count: None,
+            linked_content: false,
+            local_content: false,
         });
     }
     let version = versions.iter().next().copied();
-    if version == Some(FRAME_GROUP_MARKER_VERSION) {
+    if matches!(
+        version,
+        Some(FRAME_GROUP_MARKER_VERSION) | Some(CONTENT_REUSE_MARKER_VERSION)
+    ) {
         let mut frame_count = None;
         let mut frames = BTreeSet::new();
         let mut copies = BTreeMap::<u32, BTreeSet<u32>>::new();
         let mut valid = true;
+        let linked_content = version == Some(CONTENT_REUSE_MARKER_VERSION)
+            && markers.iter().any(|marker| {
+                marker.role == MarkerRole::FrameGroup
+                    && matches!(
+                        marker.logical_layer_id,
+                        u32::MAX | LOCAL_LINKED_CONTENT_REUSE_MARKER_ID
+                    )
+            });
+        let local_content = version == Some(CONTENT_REUSE_MARKER_VERSION)
+            && markers.iter().any(|marker| {
+                marker.role == MarkerRole::FrameGroup
+                    && matches!(
+                        marker.logical_layer_id,
+                        LOCAL_CONTENT_REUSE_MARKER_ID | LOCAL_LINKED_CONTENT_REUSE_MARKER_ID
+                    )
+            });
         for marker in markers {
             if marker.variant_count == 0 || marker.logical_layer_id == 0 {
                 valid = false;
@@ -225,12 +257,23 @@ pub(crate) fn inspect_detailed(bytes: &[u8]) -> Result<RoundTripLayout, Inspecti
             }
         }
         if let Some(count) = frame_count {
-            valid &=
-                frames.len() == count as usize && (1..=count).all(|index| frames.contains(&index));
+            if version == Some(FRAME_GROUP_MARKER_VERSION) {
+                valid &= frames.len() == count as usize
+                    && (1..=count).all(|index| frames.contains(&index));
+            } else {
+                valid &= !frames.is_empty()
+                    && frames.iter().all(|index| *index <= count)
+                    && copies
+                        .values()
+                        .all(|indices| indices.iter().all(|index| *index <= count));
+            }
             valid &= !copies.is_empty();
-            valid &= copies.values().all(|indices| {
-                indices.len() == count as usize && (1..=count).all(|index| indices.contains(&index))
-            });
+            if version == Some(FRAME_GROUP_MARKER_VERSION) {
+                valid &= copies.values().all(|indices| {
+                    indices.len() == count as usize
+                        && (1..=count).all(|index| indices.contains(&index))
+                });
+            }
         } else {
             valid = false;
         }
@@ -241,6 +284,8 @@ pub(crate) fn inspect_detailed(bytes: &[u8]) -> Result<RoundTripLayout, Inspecti
             },
             version,
             frame_count,
+            linked_content,
+            local_content,
         });
     }
     let mut wrappers = BTreeMap::<u32, u32>::new();
@@ -279,6 +324,8 @@ pub(crate) fn inspect_detailed(bytes: &[u8]) -> Result<RoundTripLayout, Inspecti
         status: RoundTripStatus { marked, valid },
         version,
         frame_count: None,
+        linked_content: false,
+        local_content: false,
     })
 }
 

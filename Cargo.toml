@@ -17,7 +17,9 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.88"
 
 [workspace.dependencies]
-ag-psd = { git = "https://github.com/minerva-studio/ag-psd-rs.git", rev = "a7a6283d11021e4a80a4779a55cadcad9fa9ebbf" }
+# Temporary local override while the Frame Animation writer work is validated.
+# Restore this to the pinned git revision after ag-psd-rs is committed.
+ag-psd = { path = "../ag-psd-rs" }
 aseprite-io = "0.2.0"
 
 [workspace.lints.rust]

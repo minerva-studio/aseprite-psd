@@ -56,6 +56,12 @@ pub(crate) struct FrameSnapshotLayer {
 /// Pixel data and placement for one frame-local cel.
 #[derive(Debug, Clone)]
 pub(crate) struct FrameSnapshotCel {
+    /// Original Aseprite frame that owns this cel's pixel record.
+    pub(crate) source_frame: u32,
+    /// Final source frame reached through the Aseprite linked-cel chain.
+    pub(crate) linked_source_frame: u32,
+    /// Whether this playback occurrence was explicitly linked in the source file.
+    pub(crate) explicitly_linked: bool,
     /// Cel width in pixels.
     pub(crate) width: u32,
     /// Cel height in pixels.
@@ -79,6 +85,9 @@ struct CelSample {
     y: i32,
     opacity: u8,
     z_index: i16,
+    source_frame: u32,
+    linked_source_frame: u32,
+    explicitly_linked: bool,
 }
 
 /// Reads an original Aseprite snapshot and its independently flattened composite snapshot.
@@ -231,6 +240,9 @@ fn build_frame_snapshot(
                 })?;
                 let cel =
                     cel_sample(file, layer_ref, source_frame)?.map(|sample| FrameSnapshotCel {
+                        source_frame: sample.source_frame,
+                        linked_source_frame: sample.linked_source_frame,
+                        explicitly_linked: sample.explicitly_linked,
                         width: sample.width,
                         height: sample.height,
                         x: sample.x,
@@ -640,6 +652,9 @@ fn build_cel_layers(
                 y: 0,
                 opacity: 255,
                 z_index: 0,
+                source_frame: 0,
+                linked_source_frame: 0,
+                explicitly_linked: false,
             },
             &vec![None; sequence.len()],
             0,
@@ -798,11 +813,11 @@ fn cel_sample(
     let Some(cel) = file.cel(layer, frame) else {
         return Ok(None);
     };
-    let (pixels, x, y) = match &cel.kind {
+    let (pixels, x, y, linked_source_frame, explicitly_linked) = match &cel.kind {
         CelKind::Raw { pixels, x, y } | CelKind::Compressed { pixels, x, y, .. } => {
-            (pixels, *x, *y)
+            (pixels, *x, *y, frame, false)
         }
-        CelKind::Linked { x, y, .. } => {
+        CelKind::Linked { x, y, source_frame } => {
             let resolved = file.resolve_cel(layer, frame).ok_or_else(|| {
                 ExportError::AsepriteRead(format!("linked cel at frame {frame} cannot be resolved"))
             })?;
@@ -814,7 +829,7 @@ fn cel_sample(
                     )));
                 }
             };
-            (pixels, *x, *y)
+            (pixels, *x, *y, *source_frame, true)
         }
         CelKind::Tilemap { .. } => return Ok(None),
         _ => {
@@ -831,6 +846,13 @@ fn cel_sample(
         y: i32::from(y),
         opacity: cel.opacity,
         z_index: cel.z_index,
+        source_frame: u32::try_from(frame).map_err(|_| {
+            ExportError::AsepriteRead("source frame exceeds PSD limits".to_string())
+        })?,
+        linked_source_frame: u32::try_from(linked_source_frame).map_err(|_| {
+            ExportError::AsepriteRead("linked source frame exceeds PSD limits".to_string())
+        })?,
+        explicitly_linked,
     }))
 }
 
@@ -1011,6 +1033,9 @@ fn composite_document(
                 y: 0,
                 opacity: 255,
                 z_index: 0,
+                source_frame: 0,
+                linked_source_frame: 0,
+                explicitly_linked: false,
             },
             &occurrences,
             index,

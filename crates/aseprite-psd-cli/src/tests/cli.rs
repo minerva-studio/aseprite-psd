@@ -362,6 +362,20 @@ fn export_requires_composite_and_preserves_all_paths() {
     assert!(command.embed_roundtrip_metadata);
     assert!(!command.include_empty_layers);
 
+    for value in ["none", "linked", "aggressive"] {
+        let parsed = export_arguments(&arguments(&[
+            "source.aseprite",
+            "-o",
+            "output.psd",
+            "--composite",
+            "flattened.aseprite",
+            "--content-reuse",
+            value,
+        ]))
+        .expect("content reuse policy should parse");
+        assert_eq!(parsed.content_reuse.as_str(), value);
+    }
+
     let command = export_arguments(&arguments(&[
         "source.aseprite",
         "-o",

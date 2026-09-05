@@ -25,8 +25,8 @@ pub use aseprite_writer::{
 pub use error::{ConversionError, ExportError, InspectionError};
 pub use information_loss::{
     InformationLocation, InformationLoss, InformationLossCode, InformationLossReport,
-    LossDisposition, report_json, report_json_with_active_frame, write_report,
-    write_report_with_active_frame,
+    LossDisposition, report_json, report_json_with_active_frame, report_json_with_export,
+    write_export_report_with_active_frame, write_report, write_report_with_active_frame,
 };
 pub use jitter::{
     JitterKind, JitterMode, JitterOptions, JitterPlan, JitterProfile, JitterReport,
@@ -53,7 +53,7 @@ pub use photoshop_animation::{
     LayerFrameState, LoopMode, PhotoshopAnimation, PhotoshopFrame, VisibleFrameLayers,
     parse_photoshop_animation,
 };
-pub use psd_writer::{ExportCompression, ExportOptions, ExportReport, export};
+pub use psd_writer::{ExportCompression, ExportContentReuse, ExportOptions, ExportReport, export};
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -1724,14 +1724,32 @@ pub fn convert(
 
     let bytes =
         fs::read(input).map_err(|error| ConversionError::InputInspection(error.to_string()))?;
-    let (exact_roundtrip, layer_association) = match options.layer_association {
-        LayerAssociation::AutoForRoundTrip => {
-            let layout = roundtrip::inspect_detailed(&bytes)
-                .map_err(|error| ConversionError::InputInspection(error.to_string()))?;
-            resolve_roundtrip_association(layout)?
-        }
-        association => (false, association),
-    };
+    let roundtrip_layout = matches!(
+        options.layer_association,
+        LayerAssociation::AutoForRoundTrip
+    )
+    .then(|| roundtrip::inspect_detailed(&bytes))
+    .transpose()
+    .map_err(|error| ConversionError::InputInspection(error.to_string()))?;
+    let (exact_roundtrip, layer_association) =
+        match (options.layer_association, roundtrip_layout.as_ref()) {
+            (LayerAssociation::AutoForRoundTrip, Some(layout)) => {
+                resolve_roundtrip_association(*layout)?
+            }
+            (association, _) => (false, association),
+        };
+    let content_reuse_roundtrip = exact_roundtrip
+        && roundtrip_layout
+            .as_ref()
+            .is_some_and(|layout| layout.version == Some(3));
+    let restore_linked_cels = content_reuse_roundtrip
+        && roundtrip_layout
+            .as_ref()
+            .is_some_and(|layout| layout.linked_content);
+    let local_content_roundtrip = content_reuse_roundtrip
+        && roundtrip_layout
+            .as_ref()
+            .is_some_and(|layout| layout.local_content);
     let (mut document, mut information_loss) = normalize_bytes(&bytes)
         .map_err(|error| ConversionError::InputInspection(error.to_string()))?;
     reject_unsupported_clipping(&information_loss)?;
@@ -1781,6 +1799,15 @@ pub fn convert(
         })
     );
     let initial_plan = if exact_roundtrip {
+        if content_reuse_roundtrip {
+            if local_content_roundtrip {
+                materialize_local_content_timeline(&mut document)
+                    .map_err(ConversionError::RoundTripRecoveryRequired)?;
+            } else {
+                materialize_content_reuse_frame_groups(&mut document)
+                    .map_err(ConversionError::RoundTripRecoveryRequired)?;
+            }
+        }
         merge_frame_group_states(&mut document)
             .map_err(ConversionError::RoundTripRecoveryRequired)?;
         Some(
@@ -1840,17 +1867,20 @@ pub fn convert(
     let jitter =
         (options.jitter.mode != crate::JitterMode::Off).then(|| jitter_plan.report.clone());
     let association = plan.as_ref().map(|plan| plan.report.clone());
+    let linked_cel_mode = restore_linked_cels
+        .then_some(LinkedCelMode::Identical)
+        .unwrap_or(options.linked_cels);
     let encoded = match plan.as_ref() {
         None => aseprite_writer::encode_with_linked_cels_and_jitter_and_metadata(
             &document,
-            options.linked_cels,
+            linked_cel_mode,
             &jitter_plan,
             options.preserve_photoshop_metadata,
         ),
         Some(plan) => aseprite_writer::encode_with_plan_and_linked_cels_and_jitter_and_metadata(
             &document,
             plan,
-            options.linked_cels,
+            linked_cel_mode,
             &jitter_plan,
             options.preserve_photoshop_metadata,
         ),
@@ -1871,14 +1901,12 @@ pub fn convert(
         );
     }
     match plan.as_ref() {
-        None => {
-            validate_aseprite_output(&encoded.bytes, &document, options.linked_cels, &jitter_plan)?
-        }
+        None => validate_aseprite_output(&encoded.bytes, &document, linked_cel_mode, &jitter_plan)?,
         Some(plan) => validate_planned_aseprite_output(
             &encoded.bytes,
             &document,
             plan,
-            options.linked_cels,
+            linked_cel_mode,
             &jitter_plan,
         )?,
     }
@@ -1896,6 +1924,161 @@ pub fn convert(
     })
 }
 
+/// Expands physical State roots back into one logical root per timeline frame.
+///
+/// Version 3 exports deliberately keep the Photoshop timeline length independent from
+/// the number of physical state roots. Current PSD pixels and animation visibility are
+/// the source of truth; marker payloads are used only to recognize the owned layout.
+fn materialize_local_content_timeline(document: &mut NormalizedDocument) -> Result<(), String> {
+    if document.root_layers.is_empty() || document.frames.is_empty() {
+        return Err("local content-reuse document has no logical roots or timeline frames".to_string());
+    }
+    let logical_roots = document.root_layers.clone();
+    let mut frame_groups = Vec::with_capacity(document.frames.len());
+    for frame_index in 0..document.frames.len() {
+        let children = logical_roots
+            .iter()
+            .map(|layer| materialize_local_content_layer(layer, frame_index))
+            .collect::<Result<Vec<_>, _>>()?;
+        frame_groups.push(NormalizedLayer {
+            id: u32::MAX.saturating_sub(frame_index as u32),
+            name: format!("Frame {}", frame_index + 1),
+            kind: NormalizedLayerKind::Group,
+            bounds: NormalizedBounds {
+                left: 0,
+                top: 0,
+                right: document.canvas.0 as i32,
+                bottom: document.canvas.1 as i32,
+            },
+            opacity: None,
+            blend_mode: None,
+            hidden: Some(false),
+            pixels: None,
+            children,
+            frame_states: vec![NormalizedLayerFrameState {
+                frame_index: 0,
+                record_present: true,
+                enabled: true,
+                explicit_enable: true,
+                offset: None,
+                reference_point: None,
+                opacity: None,
+            }],
+        });
+    }
+    document.root_layers = frame_groups;
+    Ok(())
+}
+
+fn materialize_local_content_layer(
+    layer: &NormalizedLayer,
+    frame_index: usize,
+) -> Result<NormalizedLayer, String> {
+    let state = layer
+        .frame_states
+        .get(frame_index)
+        .cloned()
+        .unwrap_or(NormalizedLayerFrameState {
+            frame_index: frame_index as u32,
+            record_present: false,
+            enabled: !layer.hidden.unwrap_or(false),
+            explicit_enable: false,
+            offset: None,
+            reference_point: None,
+            opacity: None,
+        });
+    if layer.kind == NormalizedLayerKind::Group && is_local_state_container(layer) {
+        let chosen = layer
+            .children
+            .iter()
+            .find(|child| child.frame_states.get(frame_index).is_some_and(|state| state.enabled))
+            .or_else(|| layer.children.first())
+            .ok_or_else(|| format!("state container {} has no variants", layer.id))?;
+        let mut materialized = chosen.clone();
+        materialized.id = layer.id;
+        materialized.name = layer.name.clone();
+        materialized.frame_states = vec![NormalizedLayerFrameState {
+            frame_index: 0,
+            ..state.clone()
+        }];
+        return Ok(materialized);
+    }
+    let mut materialized = layer.clone();
+    materialized.frame_states = vec![NormalizedLayerFrameState {
+        frame_index: 0,
+        ..state
+    }];
+    materialized.children = layer
+        .children
+        .iter()
+        .map(|child| materialize_local_content_layer(child, frame_index))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(materialized)
+}
+
+fn is_local_state_container(layer: &NormalizedLayer) -> bool {
+    layer.kind == NormalizedLayerKind::Group
+        && layer.children.len() > 1
+        && layer
+            .children
+            .iter()
+            .all(|child| child.kind == NormalizedLayerKind::Pixel && child.name.starts_with("State "))
+}
+
+fn materialize_content_reuse_frame_groups(document: &mut NormalizedDocument) -> Result<(), String> {
+    if document.root_layers.is_empty() || document.frames.is_empty() {
+        return Err("content-reuse document has no state roots or timeline frames".to_string());
+    }
+    let states = document.root_layers.clone();
+    let mut roots = Vec::with_capacity(document.frames.len());
+    for frame_index in 0..document.frames.len() {
+        let source = states
+            .iter()
+            .find(|root| {
+                root.frame_states
+                    .get(frame_index)
+                    .is_some_and(|state| state.enabled)
+            })
+            .ok_or_else(|| format!("no content-reuse state is enabled for frame {frame_index}"))?;
+        let mut root = materialize_content_reuse_layer(source, frame_index)?;
+        root.name = format!("Frame {}", frame_index + 1);
+        roots.push(root);
+    }
+    document.root_layers = roots;
+    Ok(())
+}
+
+fn materialize_content_reuse_layer(
+    layer: &NormalizedLayer,
+    frame_index: usize,
+) -> Result<NormalizedLayer, String> {
+    let state = layer
+        .frame_states
+        .get(frame_index)
+        .cloned()
+        .ok_or_else(|| format!("layer {} has no state for frame {frame_index}", layer.id))?;
+    let mut materialized = layer.clone();
+    let mut states = layer.frame_states.clone();
+    if states.is_empty() {
+        states.push(NormalizedLayerFrameState {
+            frame_index: 0,
+            ..state
+        });
+    } else {
+        states[0] = NormalizedLayerFrameState {
+            frame_index: 0,
+            ..state
+        };
+    }
+    materialized.frame_states = states;
+    materialized.children = layer
+        .children
+        .iter()
+        .map(|child| materialize_content_reuse_layer(child, frame_index))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(materialized)
+}
+
 /// Resolves the internal round-trip preset while preserving automatic fallback semantics.
 fn resolve_roundtrip_association(
     layout: roundtrip::RoundTripLayout,
@@ -1905,7 +2088,7 @@ fn resolve_roundtrip_association(
             "converter-owned frame-group metadata is missing, damaged, or inconsistent".to_string(),
         ));
     }
-    if layout.version == Some(2) {
+    if matches!(layout.version, Some(2) | Some(3)) {
         return Ok((true, LayerAssociation::Preserve));
     }
     Ok((

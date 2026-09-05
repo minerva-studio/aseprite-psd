@@ -79,7 +79,8 @@ function Workflows.new(process, dialogs, documents)
         report_filename,
         active_frame_index,
         plugin.preferences.embed_roundtrip_metadata ~= false,
-        export_options.include_empty_layers == true)
+        export_options.include_empty_layers == true,
+        export_options.content_reuse or "none")
       local bytes = process.read_file(output_filename)
       if bytes == "" then
         error("The converter produced an empty Photoshop document.")
@@ -123,7 +124,8 @@ function Workflows.new(process, dialogs, documents)
     if not destination then
       return
     end
-    local export_options = dialogs.select_export_options()
+    local session = state.export_sessions[app.sprite]
+    local export_options = dialogs.select_export_options(session and session.filename == destination and session or nil)
     if not export_options then
       return
     end
@@ -132,6 +134,11 @@ function Workflows.new(process, dialogs, documents)
       local bytes, report = create_export_document(app.sprite, extension, export_options, plugin)
       process.write_file(destination, bytes)
       dialogs.show_information_loss(report, "export")
+      state.export_sessions[app.sprite] = {
+        filename = destination,
+        include_empty_layers = export_options.include_empty_layers == true,
+        content_reuse = export_options.content_reuse or "none",
+      }
     end)
     if not success then
       dialogs.show_error("PSD export failed", tostring(result))
@@ -154,9 +161,10 @@ function Workflows.new(process, dialogs, documents)
     if session and session.filename == ev.filename then
       export_options = {
         include_empty_layers = session.include_empty_layers,
+        content_reuse = session.content_reuse,
       }
     else
-      export_options = dialogs.select_export_options()
+      export_options = dialogs.select_export_options(session)
     end
     if not export_options then
       return false
@@ -169,6 +177,7 @@ function Workflows.new(process, dialogs, documents)
       state.export_sessions[ev.sprite] = {
         filename = ev.filename,
         include_empty_layers = export_options.include_empty_layers == true,
+        content_reuse = export_options.content_reuse or "none",
       }
     end)
     if not success then

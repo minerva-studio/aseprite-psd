@@ -37,6 +37,46 @@ pub struct ExportOptions {
     pub embed_roundtrip_metadata: bool,
     /// Include pixel layers that contain no cels in the exported document.
     pub include_empty_layers: bool,
+    /// Physical-content reuse policy for animated Aseprite exports.
+    pub content_reuse: ExportContentReuse,
+}
+
+/// Controls how an animated export reuses physical Photoshop layer content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportContentReuse {
+    /// Materialize every playback frame independently.
+    None,
+    /// Reuse only Aseprite cels that explicitly share a linked-cel source.
+    Linked,
+    /// Also reuse independently authored states whose complete data is equal.
+    Aggressive,
+}
+
+impl ExportContentReuse {
+    /// Returns the stable CLI token for this reuse policy.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Linked => "linked",
+            Self::Aggressive => "aggressive",
+        }
+    }
+
+    /// Parses a stable CLI token.
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "none" => Self::None,
+            "linked" => Self::Linked,
+            "aggressive" => Self::Aggressive,
+            _ => return None,
+        })
+    }
+}
+
+impl Default for ExportContentReuse {
+    fn default() -> Self {
+        Self::None
+    }
 }
 
 /// Compression modes supported by the PSD/PSB writer.
@@ -99,6 +139,7 @@ impl Default for ExportOptions {
             compression: None,
             embed_roundtrip_metadata: true,
             include_empty_layers: false,
+            content_reuse: ExportContentReuse::None,
         }
     }
 }
@@ -116,6 +157,22 @@ pub struct ExportReport {
     pub information_loss: InformationLossReport,
     /// Active frame index written to the Photoshop document, when supplied.
     pub active_frame_index: Option<u32>,
+    /// Reuse policy requested by the caller.
+    pub requested_content_reuse: ExportContentReuse,
+    /// Reuse policy actually used for the physical layout.
+    pub actual_content_reuse: ExportContentReuse,
+    /// Number of physical PSD layer records in the frame-by-frame baseline layout.
+    pub baseline_physical_layer_count: usize,
+    /// Number of physical PSD layer records emitted by the selected layout.
+    pub physical_layer_count: usize,
+    /// Number of explicit Aseprite linked-cel states reused by the layout.
+    pub explicit_link_reuse_count: usize,
+    /// Number of independently authored exact states reused by the layout.
+    pub exact_match_reuse_count: usize,
+    /// Reasons the requested layout was conservatively unavailable.
+    pub content_reuse_fallbacks: Vec<String>,
+    /// Final encoded PSD/PSB byte count.
+    pub output_bytes: usize,
 }
 
 /// Exports one original/composite Aseprite snapshot pair to a validated PSD or PSB.
@@ -158,7 +215,7 @@ pub fn export(
             .entries
             .retain(|entry| entry.code != crate::InformationLossCode::EmptyPixelLayer);
     }
-    let (model, metadata, frame_first) = if let Some(snapshots) = source
+    let (model, metadata, frame_first, mut reuse_stats) = if let Some(snapshots) = source
         .frame_snapshots
         .as_deref()
         .filter(|snapshots| snapshots.len() > 1)
@@ -170,6 +227,7 @@ pub fn export(
             &mut information_loss,
             options.embed_roundtrip_metadata,
             options.include_empty_layers,
+            options.content_reuse,
         )?
     } else {
         if !options.include_empty_layers {
@@ -178,8 +236,32 @@ pub fn export(
         let (model, _frame_ids) =
             build_psd(&source.document, &source.composites, &mut information_loss)?;
         let metadata = animation_metadata(&source.document, options.embed_roundtrip_metadata)?;
-        (model, metadata, false)
+        (
+            model.clone(),
+            metadata,
+            false,
+            ContentReuseStats {
+                baseline_layers: count_psd_layer_records(&model),
+                ..Default::default()
+            },
+        )
     };
+    if options.content_reuse != ExportContentReuse::None {
+        if information_loss
+            .entries
+            .iter()
+            .any(|entry| entry.code == crate::InformationLossCode::Tilemap)
+        {
+            reuse_stats.fallbacks.push(
+                "tilemap rasterization is not eligible for structural content reuse".to_string(),
+            );
+        }
+        if !frame_first {
+            reuse_stats
+                .fallbacks
+                .push("content reuse requires multiple playback frames".to_string());
+        }
+    }
     validate_frame_animation(&model).map_err(|error| {
         ExportError::Writer(format!(
             "generated frame animation failed validation: {error}"
@@ -205,6 +287,7 @@ pub fn export(
         psb,
         Some(compression),
         frame_first,
+        reuse_stats.local_layout,
     )?;
     commit_bytes(output, &encoded, options.overwrite).map_err(ExportError::OutputIo)?;
 
@@ -214,7 +297,44 @@ pub fn export(
         output: output.to_path_buf(),
         information_loss,
         active_frame_index: source.document.active_frame_index,
+        requested_content_reuse: options.content_reuse,
+        actual_content_reuse: reuse_stats.actual,
+        baseline_physical_layer_count: reuse_stats.baseline_layers,
+        physical_layer_count: count_psd_layer_records(&model),
+        explicit_link_reuse_count: reuse_stats.explicit_link_reuse_count,
+        exact_match_reuse_count: reuse_stats.exact_match_reuse_count,
+        content_reuse_fallbacks: reuse_stats.fallbacks,
+        output_bytes: encoded.len(),
     })
+}
+
+#[derive(Debug, Default)]
+struct ContentReuseStats {
+    actual: ExportContentReuse,
+    baseline_layers: usize,
+    explicit_link_reuse_count: usize,
+    exact_match_reuse_count: usize,
+    fallbacks: Vec<String>,
+    local_layout: bool,
+}
+
+/// Counts emitted Photoshop records, including each group closing divider.
+fn count_psd_layer_records(psd: &Psd) -> usize {
+    let mut count = 0;
+    let mut stack = psd
+        .children
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .collect::<Vec<_>>();
+    while let Some(layer) = stack.pop() {
+        count += 1;
+        if layer.children.is_some() {
+            count += 1;
+        }
+        stack.extend(layer.children.iter().flatten());
+    }
+    count
 }
 
 /// Removes pixel layers with no enabled cel while preserving all groups and populated siblings.
@@ -314,7 +434,8 @@ fn build_frame_first_psd(
     report: &mut InformationLossReport,
     embed_roundtrip_metadata: bool,
     include_empty_layers: bool,
-) -> Result<(Psd, HashMap<u32, LayerMarker>, bool), ExportError> {
+    content_reuse: ExportContentReuse,
+) -> Result<(Psd, HashMap<u32, LayerMarker>, bool, ContentReuseStats), ExportError> {
     if snapshots.len() != document.frames.len() || snapshots.is_empty() {
         return Err(ExportError::Writer(
             "frame snapshot count differs from normalized document".to_string(),
@@ -351,8 +472,55 @@ fn build_frame_first_psd(
         .iter()
         .map(|snapshot| filter_frame_snapshot_layers(&snapshot.layers, include_empty_layers))
         .collect::<Vec<_>>();
-    let mut physical_layer_count = snapshots.len();
-    for layers in &filtered_layers {
+    if content_reuse != ExportContentReuse::None {
+        if let Some(local) = try_build_local_reuse_psd(
+            document,
+            snapshots,
+            composites,
+            report,
+            embed_roundtrip_metadata,
+            include_empty_layers,
+            content_reuse,
+        )? {
+            return Ok(local);
+        }
+    }
+    let mut frame_owners = Vec::with_capacity(snapshots.len());
+    let mut physical_frames = Vec::<usize>::new();
+    let mut explicit_link_reuse_count = 0;
+    let mut exact_match_reuse_count = 0;
+    for frame_index in 0..snapshots.len() {
+        let owner = if content_reuse == ExportContentReuse::None {
+            None
+        } else {
+            physical_frames.iter().position(|candidate| {
+                snapshots_equal(
+                    &filtered_layers[frame_index],
+                    &filtered_layers[*candidate],
+                    content_reuse,
+                )
+            })
+        };
+        if let Some(owner) = owner {
+            frame_owners.push(owner);
+            if content_reuse == ExportContentReuse::Linked {
+                explicit_link_reuse_count += 1;
+            } else {
+                exact_match_reuse_count += 1;
+            }
+        } else {
+            frame_owners.push(physical_frames.len());
+            physical_frames.push(frame_index);
+        }
+    }
+    let actual_content_reuse = if physical_frames.len() < snapshots.len() {
+        content_reuse
+    } else {
+        ExportContentReuse::None
+    };
+    let mut physical_layer_count = physical_frames.len();
+    for frame_index in &physical_frames {
+        let layers = &filtered_layers[*frame_index];
         physical_layer_count = physical_layer_count
             .checked_add(count_frame_snapshot_layers(layers)?)
             .ok_or_else(|| ExportError::Writer("PSD layer count exceeds ID limits".to_string()))?;
@@ -393,18 +561,28 @@ fn build_frame_first_psd(
     let mut next_id = 1_u32;
     let mut metadata = HashMap::new();
     let mut layer_availability = HashMap::new();
-    let mut children = Vec::with_capacity(snapshots.len());
-    for (frame_index, _snapshot) in snapshots.iter().enumerate() {
+    let mut children = Vec::with_capacity(physical_frames.len());
+    for (physical_index, frame_index) in physical_frames.iter().copied().enumerate() {
         let id = take_export_id(&mut next_id)?;
         layer_availability.insert(id, true);
         if embed_roundtrip_metadata {
             metadata.insert(
                 id,
                 LayerMarker {
-                    version: 2,
+                    version: if actual_content_reuse == ExportContentReuse::None {
+                        2
+                    } else {
+                        3
+                    },
                     role: MarkerRole::FrameGroup,
-                    logical_layer_id: u32::MAX,
-                    variant_index: u32::try_from(frame_index + 1).map_err(|_| {
+                    logical_layer_id: if actual_content_reuse == ExportContentReuse::Linked {
+                        u32::MAX
+                    } else if actual_content_reuse == ExportContentReuse::Aggressive {
+                        u32::MAX - 1
+                    } else {
+                        u32::MAX
+                    },
+                    variant_index: u32::try_from(physical_index + 1).map_err(|_| {
                         ExportError::Writer("frame count exceeds PSD ID limits".to_string())
                     })?,
                     variant_count: u32::try_from(snapshots.len()).map_err(|_| {
@@ -422,10 +600,19 @@ fn build_frame_first_psd(
             &mut metadata,
             &mut layer_availability,
             embed_roundtrip_metadata,
+            if actual_content_reuse == ExportContentReuse::None {
+                2
+            } else {
+                3
+            },
         )?;
         children.push(Layer {
             additional_info: LayerAdditionalInfo {
-                name: Some(format!("Frame {}", frame_index + 1)),
+                name: Some(if actual_content_reuse == ExportContentReuse::None {
+                    format!("Frame {}", physical_index + 1)
+                } else {
+                    format!("State {}", physical_index + 1)
+                }),
                 id: Some(f64::from(id)),
                 ..Default::default()
             },
@@ -473,12 +660,652 @@ fn build_frame_first_psd(
         .ok_or_else(|| {
             ExportError::Writer("frame animation directory was not created".to_string())
         })?;
-    let tracks = collect_generated_frame_tracks(&model, &frame_ids, &layer_availability)?;
+    let tracks =
+        collect_generated_frame_tracks(&model, &frame_ids, &layer_availability, &frame_owners)?;
     replace_frame_animation(&mut model, animations, tracks.clone()).map_err(|error| {
         ExportError::Writer(format!("invalid generated frame animation: {error}"))
     })?;
     apply_static_visibility_from_tracks(&mut model, &tracks)?;
-    Ok((model, metadata, true))
+    let baseline_layers = snapshots
+        .iter()
+        .map(|snapshot| {
+            count_frame_snapshot_layers(&filter_frame_snapshot_layers(
+                &snapshot.layers,
+                include_empty_layers,
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .sum::<usize>()
+        + snapshots.len();
+    Ok((
+        model,
+        metadata,
+        true,
+        ContentReuseStats {
+            actual: actual_content_reuse,
+            baseline_layers,
+            explicit_link_reuse_count,
+            exact_match_reuse_count,
+            fallbacks: Vec::new(),
+            local_layout: false,
+        },
+    ))
+}
+
+#[derive(Debug, Clone)]
+struct LocalReusePlan {
+    source: FrameSnapshotLayer,
+    cels: Vec<Option<crate::aseprite_reader::FrameSnapshotCel>>,
+    state_indices: Vec<Option<usize>>,
+    children: Vec<LocalReusePlan>,
+}
+
+/// Attempts a logical-layer layout that shares repeated pixel-layer states across frames.
+///
+/// This planner is intentionally conservative: it requires stable source IDs, names, kinds,
+/// child order, and base display properties across every playback frame. Unsupported topology
+/// falls back to the frame-folder layout selected by the caller.
+#[allow(clippy::too_many_arguments)]
+fn try_build_local_reuse_psd(
+    document: &NormalizedDocument,
+    snapshots: &[FrameSnapshot],
+    composites: &[Vec<u8>],
+    report: &mut InformationLossReport,
+    embed_roundtrip_metadata: bool,
+    include_empty_layers: bool,
+    content_reuse: ExportContentReuse,
+) -> Result<
+    Option<(Psd, HashMap<u32, LayerMarker>, bool, ContentReuseStats)>,
+    ExportError,
+> {
+    let mut plans = Vec::new();
+    for template in &snapshots[0].layers {
+        match build_local_reuse_plan(template, snapshots, content_reuse, include_empty_layers) {
+            Some(plan) => plans.push(plan),
+            None if !include_empty_layers
+                && !snapshot_layer_has_any_cel(template, snapshots) => {}
+            None => return Ok(None),
+        }
+    }
+    if plans.is_empty() {
+        return Ok(None);
+    }
+    let baseline_layers = snapshots
+        .iter()
+        .map(|snapshot| {
+            count_frame_snapshot_layers(&filter_frame_snapshot_layers(
+                &snapshot.layers,
+                include_empty_layers,
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .sum::<usize>()
+        + snapshots.len();
+    let local_layers = plans
+        .iter()
+        .map(count_local_reuse_records)
+        .sum::<usize>();
+    if local_layers + 1 >= baseline_layers {
+        return Ok(None);
+    }
+
+    let active_frame = usize::try_from(document.active_frame_index.unwrap_or(0)).map_err(|_| {
+        ExportError::Writer("active frame index exceeds platform limits".to_string())
+    })?;
+    let mut next_id = 1_u32;
+    let mut metadata = HashMap::new();
+    let mut availability = HashMap::<u32, Vec<bool>>::new();
+    let mut roots = Vec::with_capacity(plans.len());
+    for plan in &plans {
+        roots.push(build_local_reuse_layer(
+            plan,
+            snapshots.len(),
+            &mut next_id,
+            report,
+            &mut metadata,
+            &mut availability,
+            embed_roundtrip_metadata,
+        )?);
+    }
+    if let Some(root) = roots.first() {
+        if let Some(id) = root.additional_info.id.and_then(exact_export_id) {
+            if embed_roundtrip_metadata {
+                metadata.insert(
+                    id,
+                    LayerMarker {
+                        version: 3,
+                        role: MarkerRole::FrameGroup,
+                        logical_layer_id: if content_reuse == ExportContentReuse::Linked {
+                            crate::roundtrip::LOCAL_LINKED_CONTENT_REUSE_MARKER_ID
+                        } else {
+                            crate::roundtrip::LOCAL_CONTENT_REUSE_MARKER_ID
+                        },
+                        variant_index: 1,
+                        variant_count: u32::try_from(snapshots.len()).map_err(|_| {
+                            ExportError::Writer("frame count exceeds PSD limits".to_string())
+                        })?,
+                    },
+                );
+            }
+        }
+    }
+    let frame_ids = (0..snapshots.len())
+        .map(|_| Ok(f64::from(take_export_id(&mut next_id)?)))
+        .collect::<Result<Vec<_>, ExportError>>()?;
+    let frames = document
+        .frames
+        .iter()
+        .enumerate()
+        .map(|(index, frame)| AnimationFrameInfo {
+            id: frame_ids[index],
+            delay: f64::from(frame.duration_ms.unwrap_or(100)) / 1000.0,
+            dispose: Some(AnimationDispose::Auto),
+        })
+        .collect::<Vec<_>>();
+    let repeats = match document.loop_mode {
+        Some(NormalizedLoopMode::Infinite) | None => Some(0.0),
+        Some(NormalizedLoopMode::Finite(value)) => Some(f64::from(value)),
+    };
+    let mut model = Psd {
+        width: f64::from(document.canvas.0),
+        height: f64::from(document.canvas.1),
+        channels: Some(4.0),
+        bits_per_channel: Some(8.0),
+        color_mode: Some(ColorMode::Rgb),
+        children: Some(roots),
+        image_data: Some(PixelData {
+            width: document.canvas.0,
+            height: document.canvas.1,
+            data: composites[active_frame].clone(),
+        }),
+        image_resources: Some(ImageResources {
+            ids_seed_number: Some(f64::from(next_id.saturating_sub(1))),
+            animations: Some(Animations {
+                frames,
+                animations: vec![AnimationInfo {
+                    id: 0.0,
+                    frames: frame_ids.clone(),
+                    repeats,
+                    active_frame: document.active_frame_index.map(f64::from),
+                }],
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let animations = model
+        .image_resources
+        .as_mut()
+        .and_then(|resources| resources.animations.take())
+        .ok_or_else(|| ExportError::Writer("frame animation directory was not created".to_string()))?;
+    let tracks = collect_local_frame_tracks(&model, &frame_ids, &availability)?;
+    replace_frame_animation(&mut model, animations, tracks.clone()).map_err(|error| {
+        ExportError::Writer(format!("invalid generated frame animation: {error}"))
+    })?;
+    apply_static_visibility_from_tracks(&mut model, &tracks)?;
+    let (explicit_link_reuse_count, exact_match_reuse_count) = count_local_reuse_matches(&plans, content_reuse);
+    Ok(Some((
+        model,
+        metadata,
+        true,
+        ContentReuseStats {
+            actual: content_reuse,
+            baseline_layers,
+            explicit_link_reuse_count,
+            exact_match_reuse_count,
+            fallbacks: Vec::new(),
+            local_layout: true,
+        },
+    )))
+}
+
+fn build_local_reuse_plan(
+    template: &FrameSnapshotLayer,
+    snapshots: &[FrameSnapshot],
+    mode: ExportContentReuse,
+    include_empty_layers: bool,
+) -> Option<LocalReusePlan> {
+    let matching = snapshots
+        .iter()
+        .map(|snapshot| find_snapshot_layer(&snapshot.layers, template.source_layer_id))
+        .collect::<Option<Vec<_>>>()?;
+    if matching.iter().any(|layer| {
+        layer.name != template.name
+            || layer.kind != template.kind
+            || layer.opacity != template.opacity
+            || layer.blend_mode != template.blend_mode
+            || layer.children.iter().map(|child| child.source_layer_id).collect::<Vec<_>>()
+                != template.children.iter().map(|child| child.source_layer_id).collect::<Vec<_>>()
+    }) {
+        return None;
+    }
+    if template.kind == NormalizedLayerKind::Pixel {
+        let cels = matching.iter().map(|layer| layer.cel.clone()).collect::<Vec<_>>();
+        if !include_empty_layers && cels.iter().all(Option::is_none) {
+            return None;
+        }
+        let mut unique = Vec::<Option<crate::aseprite_reader::FrameSnapshotCel>>::new();
+        let mut state_indices = Vec::with_capacity(cels.len());
+        for cel in &cels {
+            let state = unique.iter().position(|candidate| match (candidate, cel) {
+                (None, None) => true,
+                (Some(left), Some(right)) => snapshot_cel_equal(left, right, mode),
+                _ => false,
+            });
+            let index = state.unwrap_or_else(|| {
+                unique.push(cel.clone());
+                unique.len() - 1
+            });
+            state_indices.push(Some(index));
+        }
+        return Some(LocalReusePlan {
+            source: template.clone(),
+            cels: unique,
+            state_indices,
+            children: Vec::new(),
+        });
+    }
+    let mut children = Vec::new();
+    for child in &template.children {
+        match build_local_reuse_plan(child, snapshots, mode, include_empty_layers) {
+            Some(plan) => children.push(plan),
+            None if !include_empty_layers && !snapshot_layer_has_any_cel(child, snapshots) => {}
+            None => return None,
+        }
+    }
+    if !include_empty_layers && !template.children.is_empty() && children.is_empty() {
+        return None;
+    }
+    Some(LocalReusePlan {
+        source: template.clone(),
+        cels: vec![None],
+        state_indices: vec![Some(0); snapshots.len()],
+        children,
+    })
+}
+
+fn snapshot_layer_has_any_cel(template: &FrameSnapshotLayer, snapshots: &[FrameSnapshot]) -> bool {
+    snapshots.iter().any(|snapshot| {
+        find_snapshot_layer(&snapshot.layers, template.source_layer_id).is_some_and(|layer| {
+            layer.cel.is_some()
+                || layer
+                    .children
+                    .iter()
+                    .any(|child| snapshot_layer_has_any_cel(child, snapshots))
+        })
+    })
+}
+
+fn find_snapshot_layer<'a>(layers: &'a [FrameSnapshotLayer], id: u32) -> Option<&'a FrameSnapshotLayer> {
+    layers.iter().find_map(|layer| {
+        (layer.source_layer_id == id).then_some(layer).or_else(|| find_snapshot_layer(&layer.children, id))
+    })
+}
+
+fn snapshot_cel_equal(
+    left: &crate::aseprite_reader::FrameSnapshotCel,
+    right: &crate::aseprite_reader::FrameSnapshotCel,
+    mode: ExportContentReuse,
+) -> bool {
+    let same_display = left.width == right.width
+        && left.height == right.height
+        && left.x == right.x
+        && left.y == right.y
+        && left.opacity == right.opacity
+        && left.pixels == right.pixels;
+    if !same_display {
+        return false;
+    }
+    match mode {
+        ExportContentReuse::Aggressive => true,
+        ExportContentReuse::Linked => {
+            left.linked_source_frame == right.linked_source_frame
+                && ((left.explicitly_linked && right.explicitly_linked)
+                    || (!left.explicitly_linked
+                        && !right.explicitly_linked
+                        && left.source_frame == right.source_frame)
+                    || (left.explicitly_linked && right.source_frame == right.linked_source_frame)
+                    || (right.explicitly_linked && left.source_frame == left.linked_source_frame))
+        }
+        ExportContentReuse::None => false,
+    }
+}
+
+fn count_local_reuse_records(plan: &LocalReusePlan) -> usize {
+    if plan.source.kind == NormalizedLayerKind::Pixel {
+        if plan.cels.len() <= 1 {
+            1
+        } else {
+            plan.cels.len() + 2
+        }
+    } else {
+        2 + plan.children.iter().map(count_local_reuse_records).sum::<usize>()
+    }
+}
+
+fn count_local_reuse_matches(
+    plans: &[LocalReusePlan],
+    mode: ExportContentReuse,
+) -> (usize, usize) {
+    fn walk(plan: &LocalReusePlan, mode: ExportContentReuse, explicit: &mut usize, exact: &mut usize) {
+        if plan.source.kind == NormalizedLayerKind::Pixel {
+            let mut first = HashMap::<usize, usize>::new();
+            for (frame, state) in plan.state_indices.iter().enumerate() {
+                if let Some(state) = state {
+                    if first.insert(*state, frame).is_some() {
+                        if mode == ExportContentReuse::Linked { *explicit += 1; }
+                        if mode == ExportContentReuse::Aggressive { *exact += 1; }
+                    }
+                }
+            }
+        }
+        for child in &plan.children { walk(child, mode, explicit, exact); }
+    }
+    let mut explicit = 0;
+    let mut exact = 0;
+    for plan in plans { walk(plan, mode, &mut explicit, &mut exact); }
+    (explicit, exact)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_local_reuse_layer(
+    plan: &LocalReusePlan,
+    frame_count: usize,
+    next_id: &mut u32,
+    report: &mut InformationLossReport,
+    metadata: &mut HashMap<u32, LayerMarker>,
+    availability: &mut HashMap<u32, Vec<bool>>,
+    embed_roundtrip_metadata: bool,
+) -> Result<Layer, ExportError> {
+    let source = &plan.source;
+    let id = take_export_id(next_id)?;
+    let (blend_mode, unknown_blend) = psd_blend_mode(source.blend_mode.as_deref());
+    if unknown_blend {
+        report.add(
+            crate::InformationLossCode::UnknownBlendMode,
+            crate::LossDisposition::Degraded,
+            crate::InformationLocation {
+                layer_id: Some(source.source_layer_id),
+                path: source.name.clone(),
+                frame_index: None,
+            },
+            "A blend mode that is not supported by the PSD writer was written as Normal",
+            true,
+            true,
+        );
+    }
+    if source.kind == NormalizedLayerKind::Group {
+        let children = plan
+            .children
+            .iter()
+            .map(|child| {
+                build_local_reuse_layer(
+                    child,
+                    frame_count,
+                    next_id,
+                    report,
+                    metadata,
+                    availability,
+                    embed_roundtrip_metadata,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let divider_id = take_export_id(next_id)?;
+        availability.insert(id, vec![source.visible; frame_count]);
+        availability.insert(divider_id, vec![source.visible; frame_count]);
+        if embed_roundtrip_metadata {
+            insert_frame_snapshot_marker(metadata, id, source.source_layer_id, 0, frame_count, true, 3)?;
+        }
+        return Ok(Layer {
+            additional_info: LayerAdditionalInfo {
+                name: Some(source.name.clone()),
+                id: Some(f64::from(id)),
+                ..Default::default()
+            },
+            children: Some(children),
+            bounding_divider_additional_info: Some(LayerAdditionalInfo {
+                name: Some("</Layer group>".to_string()),
+                id: Some(f64::from(divider_id)),
+                ..Default::default()
+            }),
+            opened: Some(true),
+            hidden: Some(!source.visible),
+            blend_mode: Some(blend_mode),
+            opacity: source.opacity.map(|value| f64::from(value) / 255.0),
+            ..Default::default()
+        });
+    }
+
+    let build_pixel = |name: String,
+                       cel: Option<&crate::aseprite_reader::FrameSnapshotCel>,
+                       id: u32|
+     -> Layer {
+        let mut layer = Layer {
+            additional_info: LayerAdditionalInfo {
+                name: Some(name),
+                id: Some(f64::from(id)),
+                ..Default::default()
+            },
+            blend_mode: Some(blend_mode),
+            opacity: source.opacity.map(|value| f64::from(value) / 255.0),
+            hidden: Some(false),
+            ..Default::default()
+        };
+        if let Some(cel) = cel {
+            layer.opacity = Some(f64::from(cel.opacity) / 255.0);
+            layer.top = Some(f64::from(cel.y));
+            layer.left = Some(f64::from(cel.x));
+            layer.bottom = Some(f64::from(cel.y) + f64::from(cel.height));
+            layer.right = Some(f64::from(cel.x) + f64::from(cel.width));
+            layer.image_data = Some(PixelData {
+                width: cel.width,
+                height: cel.height,
+                data: cel.pixels.clone(),
+            });
+        } else {
+            layer.top = Some(0.0);
+            layer.left = Some(0.0);
+            layer.bottom = Some(1.0);
+            layer.right = Some(1.0);
+            layer.image_data = Some(PixelData {
+                width: 1,
+                height: 1,
+                data: vec![0, 0, 0, 0],
+            });
+        }
+        layer
+    };
+    let mut variants = Vec::with_capacity(plan.cels.len());
+    let has_wrapper = plan.cels.len() > 1;
+    for (variant_index, cel) in plan.cels.iter().enumerate() {
+        let variant_id = if !has_wrapper && variant_index == 0 {
+            id
+        } else {
+            take_export_id(next_id)?
+        };
+        let name = if plan.cels.len() == 1 {
+            source.name.clone()
+        } else {
+            format!("State {}", variant_index + 1)
+        };
+        let layer = build_pixel(name, cel.as_ref(), variant_id);
+        let enabled = plan
+            .state_indices
+            .iter()
+            .map(|state| source.visible && state == &Some(variant_index))
+            .collect::<Vec<_>>();
+        availability.insert(variant_id, enabled);
+        if embed_roundtrip_metadata {
+            let representative = plan
+                .state_indices
+                .iter()
+                .position(|state| state == &Some(variant_index))
+                .unwrap_or(0);
+            insert_frame_snapshot_marker(
+                metadata,
+                variant_id,
+                source.source_layer_id,
+                representative,
+                frame_count,
+                true,
+                3,
+            )?;
+        }
+        variants.push(layer);
+    }
+    if variants.len() == 1 {
+        return Ok(variants.remove(0));
+    }
+    availability.insert(id, vec![source.visible; frame_count]);
+    let divider_id = take_export_id(next_id)?;
+    availability.insert(divider_id, vec![source.visible; frame_count]);
+    Ok(Layer {
+        additional_info: LayerAdditionalInfo {
+            name: Some(source.name.clone()),
+            id: Some(f64::from(id)),
+            ..Default::default()
+        },
+        children: Some(variants),
+        bounding_divider_additional_info: Some(LayerAdditionalInfo {
+            name: Some("</Layer group>".to_string()),
+            id: Some(f64::from(divider_id)),
+            ..Default::default()
+        }),
+        opened: Some(true),
+        hidden: Some(!source.visible),
+        blend_mode: Some(blend_mode),
+        opacity: source.opacity.map(|value| f64::from(value) / 255.0),
+        ..Default::default()
+    })
+}
+
+fn collect_local_frame_tracks(
+    psd: &Psd,
+    frame_ids: &[f64],
+    availability: &HashMap<u32, Vec<bool>>,
+) -> Result<Vec<LayerFrameTrack>, ExportError> {
+    let mut tracks = Vec::new();
+    let mut stack = psd
+        .children
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .collect::<Vec<_>>();
+    while let Some(layer) = stack.pop() {
+        let id = layer
+            .additional_info
+            .id
+            .and_then(exact_export_id)
+            .ok_or_else(|| ExportError::Writer("generated layer has no valid id".to_string()))?;
+        let states = availability.get(&id).ok_or_else(|| {
+            ExportError::Writer(format!("generated layer {id} has no availability state"))
+        })?;
+        if states.len() != frame_ids.len() {
+            return Err(ExportError::Writer("local reuse track length differs from timeline".to_string()));
+        }
+        tracks.push(LayerFrameTrack {
+            layer_id: id,
+            states: frame_ids
+                .iter()
+                .enumerate()
+                .map(|(index, frame_id)| AnimationFrame {
+                    frames: vec![*frame_id],
+                    enable: Some(states[index]),
+                    offset: None,
+                    reference_point: None,
+                    opacity: None,
+                    effects: None,
+                })
+                .collect(),
+            flags: None,
+        });
+        if let Some(divider) = layer.bounding_divider_additional_info.as_ref() {
+            let divider_id = divider.id.and_then(exact_export_id).ok_or_else(|| {
+                ExportError::Writer("generated divider has no valid id".to_string())
+            })?;
+            let states = availability.get(&divider_id).ok_or_else(|| {
+                ExportError::Writer(format!("generated divider {divider_id} has no availability state"))
+            })?;
+            tracks.push(LayerFrameTrack {
+                layer_id: divider_id,
+                states: frame_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(index, frame_id)| AnimationFrame {
+                        frames: vec![*frame_id],
+                        enable: Some(states[index]),
+                        offset: None,
+                        reference_point: None,
+                        opacity: None,
+                        effects: None,
+                    })
+                    .collect(),
+                flags: None,
+            });
+        }
+        stack.extend(layer.children.iter().flatten());
+    }
+    Ok(tracks)
+}
+
+/// Compares complete frame-local layer trees without crossing source-layer boundaries.
+fn snapshots_equal(
+    left: &[FrameSnapshotLayer],
+    right: &[FrameSnapshotLayer],
+    mode: ExportContentReuse,
+) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| snapshot_layer_equal(left, right, mode))
+}
+
+fn snapshot_layer_equal(
+    left: &FrameSnapshotLayer,
+    right: &FrameSnapshotLayer,
+    mode: ExportContentReuse,
+) -> bool {
+    left.source_layer_id == right.source_layer_id
+        && left.name == right.name
+        && left.kind == right.kind
+        && left.opacity == right.opacity
+        && left.blend_mode == right.blend_mode
+        && left.visible == right.visible
+        && match (&left.cel, &right.cel) {
+            (None, None) => true,
+            (Some(left), Some(right)) => {
+                let same_display = left.width == right.width
+                    && left.height == right.height
+                    && left.x == right.x
+                    && left.y == right.y
+                    && left.opacity == right.opacity
+                    && left.pixels == right.pixels;
+                let same_link = left.linked_source_frame == right.linked_source_frame
+                    && ((left.explicitly_linked && right.explicitly_linked)
+                        || (!left.explicitly_linked
+                            && !right.explicitly_linked
+                            && left.source_frame == right.source_frame)
+                        || left.explicitly_linked
+                            && right.source_frame == right.linked_source_frame
+                        || right.explicitly_linked
+                            && left.source_frame == left.linked_source_frame);
+                match mode {
+                    ExportContentReuse::Linked => same_link && same_display,
+                    ExportContentReuse::Aggressive => same_display,
+                    ExportContentReuse::None => false,
+                }
+            }
+            _ => false,
+        }
+        && left.children.len() == right.children.len()
+        && left
+            .children
+            .iter()
+            .zip(&right.children)
+            .all(|(left, right)| snapshot_layer_equal(left, right, mode))
 }
 
 /// Counts physical layer records in a frame snapshot without recursing through user depth.
@@ -504,6 +1331,7 @@ fn collect_generated_frame_tracks(
     psd: &Psd,
     frame_ids: &[f64],
     layer_availability: &HashMap<u32, bool>,
+    frame_owners: &[usize],
 ) -> Result<Vec<LayerFrameTrack>, ExportError> {
     let mut tracks = Vec::new();
     let mut stack = psd
@@ -530,7 +1358,7 @@ fn collect_generated_frame_tracks(
             .enumerate()
             .map(|(index, frame_id)| AnimationFrame {
                 frames: vec![*frame_id],
-                enable: Some(enabled && index == owner_frame),
+                enable: Some(enabled && frame_owners[index] == owner_frame),
                 offset: None,
                 reference_point: None,
                 opacity: None,
@@ -558,7 +1386,7 @@ fn collect_generated_frame_tracks(
                     .enumerate()
                     .map(|(index, frame_id)| AnimationFrame {
                         frames: vec![*frame_id],
-                        enable: Some(divider_enabled && index == owner_frame),
+                        enable: Some(divider_enabled && frame_owners[index] == owner_frame),
                         offset: None,
                         reference_point: None,
                         opacity: None,
@@ -664,6 +1492,7 @@ fn build_frame_snapshot_layers(
     metadata: &mut HashMap<u32, LayerMarker>,
     layer_availability: &mut HashMap<u32, bool>,
     embed_roundtrip_metadata: bool,
+    marker_version: u16,
 ) -> Result<Vec<Layer>, ExportError> {
     struct Node<'a> {
         source: &'a FrameSnapshotLayer,
@@ -723,6 +1552,7 @@ fn build_frame_snapshot_layers(
             metadata,
             layer_availability,
             embed_roundtrip_metadata,
+            marker_version,
             &node.path,
             children,
         )?);
@@ -748,6 +1578,7 @@ fn build_frame_snapshot_layer(
     metadata: &mut HashMap<u32, LayerMarker>,
     layer_availability: &mut HashMap<u32, bool>,
     embed_roundtrip_metadata: bool,
+    marker_version: u16,
     parent_path: &str,
     children: Vec<Layer>,
 ) -> Result<Layer, ExportError> {
@@ -827,6 +1658,7 @@ fn build_frame_snapshot_layer(
                     frame_index,
                     frame_count,
                     embed_roundtrip_metadata,
+                    marker_version,
                 )?;
                 return Ok(layer);
             };
@@ -849,6 +1681,7 @@ fn build_frame_snapshot_layer(
         frame_index,
         frame_count,
         embed_roundtrip_metadata,
+        marker_version,
     )?;
     Ok(layer)
 }
@@ -861,11 +1694,12 @@ fn insert_frame_snapshot_marker(
     frame_index: usize,
     frame_count: usize,
     embed_roundtrip_metadata: bool,
+    marker_version: u16,
 ) -> Result<(), ExportError> {
     let marker = embed_roundtrip_metadata
         .then(|| {
             Ok(LayerMarker {
-                version: 2,
+                version: marker_version,
                 role: MarkerRole::LayerCopy,
                 logical_layer_id,
                 variant_index: u32::try_from(frame_index + 1).map_err(|_| {
@@ -1668,6 +2502,7 @@ fn validate_output(
     psb: bool,
     compression: Option<ExportCompression>,
     frame_first: bool,
+    local_layout: bool,
 ) -> Result<(), ExportError> {
     let layout = validate_container_structure(bytes, psb)?;
     let options = ReadOptions {
@@ -1678,7 +2513,7 @@ fn validate_output(
     let parsed = ag_psd::read_psd(bytes, &options)
         .map_err(|error| ExportError::OutputValidation(error.to_string()))?;
     validate_export_contract(&parsed, &layout, expected, compression)?;
-    validate_export_semantics(bytes, &parsed, expected, composites, frame_first)?;
+    validate_export_semantics(bytes, &parsed, expected, composites, frame_first, local_layout)?;
     Ok(())
 }
 
@@ -1767,9 +2602,14 @@ fn validate_export_semantics(
     expected: &NormalizedDocument,
     composites: &[Vec<u8>],
     frame_first: bool,
+    local_layout: bool,
 ) -> Result<(), ExportError> {
     if frame_first {
-        validate_frame_group_roots(parsed, expected)?;
+        if local_layout {
+            validate_local_reuse_roots(parsed, expected)?;
+        } else {
+            validate_frame_group_roots(parsed, expected)?;
+        }
     } else {
         let (normalized, _) = crate::normalize_bytes(bytes)
             .map_err(|error| ExportError::OutputValidation(error.to_string()))?;
@@ -1818,6 +2658,34 @@ fn validate_export_semantics(
     Ok(())
 }
 
+/// Verifies the logical-layer root contract for a local content-reuse export.
+fn validate_local_reuse_roots(
+    parsed: &Psd,
+    expected: &NormalizedDocument,
+) -> Result<(), ExportError> {
+    let roots = parsed.children.as_deref().ok_or_else(|| {
+        ExportError::OutputValidation("local reuse export has no root layers".to_string())
+    })?;
+    if roots.is_empty() || roots.len() > expected.root_layers.len() {
+        return Err(ExportError::OutputValidation(format!(
+            "local reuse export has {} physical roots for {} logical roots",
+            roots.len(),
+            expected.root_layers.len()
+        )));
+    }
+    for root in roots {
+        if root.additional_info.name.as_deref().is_none_or(|name| {
+            name.starts_with("Frame ") || name.starts_with("State ")
+        }) || root.additional_info.animation_frames.is_none()
+        {
+            return Err(ExportError::OutputValidation(
+                "local reuse export root is missing its logical name or animation track".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Verifies that the editable export retains one root folder for each Aseprite frame.
 fn validate_frame_group_roots(
     parsed: &Psd,
@@ -1826,17 +2694,20 @@ fn validate_frame_group_roots(
     let roots = parsed.children.as_deref().ok_or_else(|| {
         ExportError::OutputValidation("frame-folder export has no root layers".to_string())
     })?;
-    if roots.len() != expected.frames.len() {
+    if roots.is_empty() || roots.len() > expected.frames.len() {
         return Err(ExportError::OutputValidation(format!(
-            "frame-folder export has {} root layers for {} frames",
+            "frame-folder export has {} physical root layers for {} timeline frames",
             roots.len(),
             expected.frames.len()
         )));
     }
     for (index, root) in roots.iter().enumerate() {
         let expected_name = format!("Frame {}", index + 1);
-        if root.additional_info.name.as_deref() != Some(expected_name.as_str())
-            || root.children.as_ref().is_none_or(Vec::is_empty)
+        let state_name = format!("State {}", index + 1);
+        if !matches!(
+            root.additional_info.name.as_deref(),
+            Some(name) if name == expected_name || name == state_name
+        ) || root.children.as_ref().is_none_or(Vec::is_empty)
         {
             return Err(ExportError::OutputValidation(format!(
                 "frame-folder export is missing populated root {expected_name}"
@@ -2412,6 +3283,8 @@ mod tests {
         let input = directory.join("source.aseprite");
         let composite = directory.join("composite.aseprite");
         let output = directory.join("output.psd");
+        let reused_output = directory.join("reused-output.psd");
+        let aggressive_output = directory.join("aggressive-output.psd");
         let active_output = directory.join("active-output.psd");
         let roundtrip = directory.join("roundtrip.aseprite");
         let psb_output = directory.join("output.psb");
@@ -2523,6 +3396,130 @@ mod tests {
                 valid: true,
             }
         );
+
+        let reused_report = export(
+            &input,
+            &composite,
+            &reused_output,
+            &ExportOptions {
+                content_reuse: ExportContentReuse::Linked,
+                ..Default::default()
+            },
+        )
+        .expect("export linked-content PSD");
+        assert_eq!(
+            reused_report.actual_content_reuse,
+            ExportContentReuse::Linked
+        );
+        assert_eq!(reused_report.explicit_link_reuse_count, 1);
+        assert_eq!(reused_report.physical_layer_count, 4);
+        let reused_bytes = fs::read(&reused_output).expect("read linked-content PSD");
+        assert_eq!(
+            crate::roundtrip::inspect(&reused_bytes).expect("inspect v3 reuse metadata"),
+            crate::roundtrip::RoundTripStatus {
+                marked: true,
+                valid: true,
+            }
+        );
+        let reused = ag_psd::read_psd(&reused_bytes, &ag_psd::psd::ReadOptions::default())
+            .expect("read linked-content PSD");
+        assert_eq!(
+            reused
+                .image_resources
+                .as_ref()
+                .and_then(|resources| resources.animations.as_ref())
+                .expect("linked-content animation directory")
+                .frames
+                .len(),
+            3
+        );
+        assert_eq!(reused.children.as_ref().map_or(0, Vec::len), 1);
+        let reused_root = &reused.children.as_ref().expect("local reuse roots")[0];
+        assert_eq!(reused_root.additional_info.name.as_deref(), Some("动画层"));
+        assert_eq!(reused_root.children.as_ref().map_or(0, Vec::len), 2);
+        assert!(reused_root
+            .children
+            .as_ref()
+            .expect("local reuse state variants")
+            .iter()
+            .all(|layer| layer
+                .additional_info
+                .name
+                .as_deref()
+                .is_some_and(|name| name.starts_with("State "))));
+        let reused_roundtrip = directory.join("reused-roundtrip.aseprite");
+        crate::convert(
+            &reused_output,
+            &reused_roundtrip,
+            &crate::ConvertOptions {
+                layer_association: crate::LayerAssociation::AutoForRoundTrip,
+                ..Default::default()
+            },
+        )
+        .expect("v3 content-reuse metadata should restore the logical timeline");
+        let reused_file = AsepriteFile::from_reader(
+            fs::read(&reused_roundtrip)
+                .expect("read v3 content-reuse roundtrip")
+                .as_slice(),
+        )
+        .expect("parse v3 content-reuse roundtrip");
+        assert_eq!(reused_file.frames().len(), 3);
+        assert_eq!(reused_file.layers().len(), 1);
+        assert_eq!(reused_file.layers()[0].name, "动画层");
+        let reused_layer = reused_file.layer_ref(0).expect("roundtrip logical layer");
+        assert!(matches!(
+            reused_file.cel(reused_layer, 2).expect("linked roundtrip cel").kind,
+            aseprite::CelKind::Linked { .. }
+        ));
+
+        let aggressive_report = export(
+            &input,
+            &composite,
+            &aggressive_output,
+            &ExportOptions {
+                content_reuse: ExportContentReuse::Aggressive,
+                ..Default::default()
+            },
+        )
+        .expect("export aggressive-content PSD");
+        assert_eq!(
+            aggressive_report.actual_content_reuse,
+            ExportContentReuse::Aggressive
+        );
+        assert_eq!(aggressive_report.exact_match_reuse_count, 1);
+        assert_eq!(aggressive_report.physical_layer_count, 4);
+        let aggressive_bytes = fs::read(&aggressive_output).expect("read aggressive-content PSD");
+        assert_eq!(
+            crate::roundtrip::inspect(&aggressive_bytes).expect("inspect aggressive metadata"),
+            crate::roundtrip::RoundTripStatus {
+                marked: true,
+                valid: true,
+            }
+        );
+        let aggressive_roundtrip = directory.join("aggressive-roundtrip.aseprite");
+        crate::convert(
+            &aggressive_output,
+            &aggressive_roundtrip,
+            &crate::ConvertOptions {
+                layer_association: crate::LayerAssociation::AutoForRoundTrip,
+                ..Default::default()
+            },
+        )
+        .expect("aggressive v3 metadata should restore the logical timeline");
+        let aggressive_file = AsepriteFile::from_reader(
+            fs::read(&aggressive_roundtrip)
+                .expect("read aggressive roundtrip")
+                .as_slice(),
+        )
+        .expect("parse aggressive roundtrip");
+        assert_eq!(aggressive_file.frames().len(), 3);
+        assert!(matches!(
+            aggressive_file
+                .cel(aggressive_file.layer_ref(0).expect("aggressive logical layer"), 2)
+                .expect("aggressive roundtrip cel")
+                .kind,
+            aseprite::CelKind::Raw { .. } | aseprite::CelKind::Compressed { .. }
+        ));
         let mut corrupted = bytes.clone();
         let marker_offset = corrupted
             .windows(4)
@@ -3026,6 +4023,9 @@ mod tests {
             blend_mode: None,
             visible: true,
             cel: has_cel.then_some(crate::aseprite_reader::FrameSnapshotCel {
+                source_frame: 0,
+                linked_source_frame: 0,
+                explicitly_linked: false,
                 width: 1,
                 height: 1,
                 x: 0,
@@ -3065,6 +4065,51 @@ mod tests {
             .map(|layers| filter_frame_snapshot_layers(layers, true))
             .collect::<Vec<_>>();
         assert!(included.iter().all(|layers| layers.len() == 3));
+    }
+
+    /// Verifies content-reuse matching keeps source identity and display attributes in scope.
+    #[test]
+    fn content_reuse_matches_explicit_links_but_not_position_changes() {
+        let layer = |x: i32, linked: bool| FrameSnapshotLayer {
+            source_layer_id: 7,
+            name: "Body".to_string(),
+            kind: NormalizedLayerKind::Pixel,
+            opacity: Some(255),
+            blend_mode: Some("normal".to_string()),
+            visible: true,
+            cel: Some(crate::aseprite_reader::FrameSnapshotCel {
+                source_frame: 2,
+                linked_source_frame: 2,
+                explicitly_linked: linked,
+                width: 1,
+                height: 1,
+                x,
+                y: 0,
+                opacity: 255,
+                pixels: vec![255, 0, 0, 255],
+            }),
+            children: Vec::new(),
+        };
+        assert!(snapshots_equal(
+            &[layer(0, true)],
+            &[layer(0, true)],
+            ExportContentReuse::Linked
+        ));
+        assert!(!snapshots_equal(
+            &[layer(0, true)],
+            &[layer(1, true)],
+            ExportContentReuse::Linked
+        ));
+        assert!(snapshots_equal(
+            &[layer(0, false)],
+            &[layer(0, true)],
+            ExportContentReuse::Linked
+        ));
+        assert!(snapshots_equal(
+            &[layer(0, false)],
+            &[layer(0, true)],
+            ExportContentReuse::Aggressive
+        ));
     }
 
     /// Generates a deterministic PSD fixture and verifies the complete Jitter import path.
