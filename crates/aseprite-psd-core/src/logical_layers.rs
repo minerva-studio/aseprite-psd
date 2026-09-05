@@ -14,8 +14,8 @@ use self::association::AssociationEngine;
 use self::association::merge_feature_tracks;
 use self::feature_grouping::organize_feature_nodes;
 use self::layout::{
-    build_nodes, choose_group_paths, flatten_redundant_common_root, plan_candidate_groups,
-    validate_candidate_group_topology,
+    build_nodes_with_keys, choose_group_paths, flatten_redundant_common_root,
+    plan_candidate_groups, validate_candidate_group_topology, PlannedNodeBuilder,
 };
 use self::observation::{
     ObservationCollectionState, ObservationStore, collect_observations, collect_pixel_layer_ids,
@@ -617,7 +617,12 @@ pub(crate) fn build_layer_write_plan_with_context(
     } else {
         (Vec::new(), HashMap::new())
     };
-    let mut root_nodes = build_nodes(&group_paths, &track_order, &candidate_group_paths);
+    let keyed_root_nodes = build_nodes_with_keys(&group_paths, &track_order, &candidate_group_paths);
+    validate_candidate_group_topology(&keyed_root_nodes, &candidate_groups)?;
+    let mut root_nodes = keyed_root_nodes
+        .into_iter()
+        .map(PlannedNodeBuilder::into_planned_node)
+        .collect::<Vec<_>>();
     let feature_group_diagnostics = if evidence_policy == AssociationEvidencePolicy::Feature {
         let feature_meta = feature_containers
             .iter()
@@ -634,7 +639,6 @@ pub(crate) fn build_layer_write_plan_with_context(
     } else {
         Vec::new()
     };
-    validate_candidate_group_topology(&root_nodes, &candidate_groups)?;
     let mut plan = LayerWritePlan {
         root_nodes,
         tracks: tracks

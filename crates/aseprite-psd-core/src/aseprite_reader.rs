@@ -76,6 +76,18 @@ pub(crate) struct FrameSnapshotCel {
     pub(crate) pixels: Vec<u8>,
 }
 
+/// Returns whether a pixel cel contributes any writable RGBA content.
+///
+/// A missing cel, zero cel opacity, malformed RGBA data, and pixels whose alpha
+/// channel is entirely zero are treated as empty. Layer visibility is deliberately
+/// not part of this predicate so hidden authored content remains editable.
+pub(crate) fn is_writable_pixel_cel(opacity: Option<f64>, pixels: Option<&[u8]>) -> bool {
+    opacity.is_some_and(|value| value > 0.0)
+        && pixels.is_some_and(|data| {
+            data.len().is_multiple_of(4) && data.chunks_exact(4).any(|pixel| pixel[3] != 0)
+        })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CelSample {
     pixels: Vec<u8>,

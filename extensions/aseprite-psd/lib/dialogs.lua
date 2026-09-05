@@ -437,7 +437,7 @@ function Dialogs.new(process)
     dialog:check{
       id="include_empty_layers",
       label="Empty pixel layers",
-      text="Export empty pixel layers",
+      text="Export empty pixel layers (no cel or no visible pixels)",
       selected=initial and initial.include_empty_layers == true or false,
     }
     dialog:combobox{

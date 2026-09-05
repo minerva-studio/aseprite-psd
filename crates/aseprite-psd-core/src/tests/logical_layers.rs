@@ -3,7 +3,10 @@ use std::rc::Rc;
 use super::association::{
     decision, merge_feature_tracks, new_track, parse_layer_name, record_assignment,
 };
-use super::layout::{CandidateGroupPath, candidate_members_form_complete_interval};
+use super::layout::{
+    CandidateGroupPath, PlannedNodeBuilder, candidate_members_form_complete_interval,
+    validate_candidate_group_topology,
+};
 use super::observation::{
     FeatureIdentity, FrameContainerInfo, LayerEvidence, Observation, ObservationId,
 };
@@ -1915,7 +1918,10 @@ fn same_candidate_display_name_with_distinct_keys_stays_separate() {
             },
         ),
     ]);
-    let nodes = build_nodes(&group_paths, &[0, 1], &candidate_paths);
+    let nodes = super::layout::build_nodes_with_keys(&group_paths, &[0, 1], &candidate_paths)
+        .into_iter()
+        .map(PlannedNodeBuilder::into_planned_node)
+        .collect::<Vec<_>>();
     assert_eq!(nodes.len(), 2);
     assert!(matches!(
         &nodes[0],
@@ -1927,6 +1933,88 @@ fn same_candidate_display_name_with_distinct_keys_stays_separate() {
         PlannedNode::Group { children, .. }
             if children == &vec![PlannedNode::Track { track_id: 1 }]
     ));
+
+    let reports = vec![
+        CandidateGroupReport {
+            name: "候选 - wing".to_string(),
+            anchor_track_id: 0,
+            member_track_ids: vec![0],
+            evidence: Vec::new(),
+            relations: Vec::new(),
+            complete_interval: true,
+            emitted: true,
+            rejection_reason: None,
+        },
+        CandidateGroupReport {
+            name: "候选 - wing".to_string(),
+            anchor_track_id: 1,
+            member_track_ids: vec![1],
+            evidence: Vec::new(),
+            relations: Vec::new(),
+            complete_interval: true,
+            emitted: true,
+            rejection_reason: None,
+        },
+    ];
+    let keyed_nodes = super::layout::build_nodes_with_keys(&group_paths, &[0, 1], &candidate_paths);
+    validate_candidate_group_topology(&keyed_nodes, &reports)
+        .expect("same-name candidate groups with distinct keys should validate");
+}
+
+#[test]
+fn candidate_topology_rejects_duplicate_anchor_emission() {
+    let nodes = vec![
+        PlannedNodeBuilder::Group {
+            key: super::GroupKey::Candidate(0),
+            name: "候选 - wing".to_string(),
+            source_layer_id: None,
+            children: vec![PlannedNodeBuilder::Track { track_id: 0 }],
+        },
+        PlannedNodeBuilder::Group {
+            key: super::GroupKey::Candidate(0),
+            name: "候选 - wing".to_string(),
+            source_layer_id: None,
+            children: vec![PlannedNodeBuilder::Track { track_id: 1 }],
+        },
+    ];
+    let reports = vec![CandidateGroupReport {
+        name: "候选 - wing".to_string(),
+        anchor_track_id: 0,
+        member_track_ids: vec![0],
+        evidence: Vec::new(),
+        relations: Vec::new(),
+        complete_interval: true,
+        emitted: true,
+        rejection_reason: None,
+    }];
+
+    let error = validate_candidate_group_topology(&nodes, &reports)
+        .expect_err("duplicate candidate anchor emission must fail topology validation");
+    assert!(error.contains("emitted 2 times instead of once"));
+}
+
+#[test]
+fn candidate_topology_rejects_wrong_descendant_track_set() {
+    let nodes = vec![PlannedNodeBuilder::Group {
+        key: super::GroupKey::Candidate(0),
+        name: "候选 - wing".to_string(),
+        source_layer_id: None,
+        children: vec![PlannedNodeBuilder::Track { track_id: 0 }],
+    }];
+    let reports = vec![CandidateGroupReport {
+        name: "候选 - wing".to_string(),
+        anchor_track_id: 0,
+        member_track_ids: vec![0, 1],
+        evidence: Vec::new(),
+        relations: Vec::new(),
+        complete_interval: true,
+        emitted: true,
+        rejection_reason: None,
+    }];
+
+    let error = validate_candidate_group_topology(&nodes, &reports)
+        .expect_err("candidate descendant track mismatch must fail topology validation");
+    assert!(error.contains("contains tracks [0], expected [0, 1]"));
 }
 
 #[test]

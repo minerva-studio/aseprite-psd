@@ -542,11 +542,12 @@ fn track_is_uncertain(
         })
 }
 
-pub(super) fn build_nodes(
+/// Builds the keyed intermediate tree used by candidate-folder topology checks.
+pub(super) fn build_nodes_with_keys(
     group_paths: &[Vec<GroupSegment>],
     track_order: &[usize],
     candidate_group_paths: &HashMap<usize, CandidateGroupPath>,
-) -> Vec<PlannedNode> {
+) -> Vec<PlannedNodeBuilder> {
     let mut roots = Vec::new();
     for &track_id in track_order {
         let mut path = Vec::new();
@@ -561,9 +562,6 @@ pub(super) fn build_nodes(
         insert_track(&mut roots, &path, track_id);
     }
     roots
-        .into_iter()
-        .map(PlannedNodeBuilder::into_planned_node)
-        .collect()
 }
 
 /// Inserts one track into the keyed intermediate tree.
@@ -593,7 +591,7 @@ fn insert_track(nodes: &mut Vec<PlannedNodeBuilder>, path: &[GroupSegment], trac
 
 impl PlannedNodeBuilder {
     /// Removes planning-only identities and produces the public writer tree.
-    fn into_planned_node(self) -> PlannedNode {
+    pub(super) fn into_planned_node(self) -> PlannedNode {
         match self {
             Self::Group {
                 name,
@@ -612,12 +610,12 @@ impl PlannedNodeBuilder {
 
 /// Verifies that every emitted candidate folder exists once with exactly its reported tracks.
 pub(super) fn validate_candidate_group_topology(
-    root_nodes: &[PlannedNode],
+    root_nodes: &[PlannedNodeBuilder],
     reports: &[CandidateGroupReport],
 ) -> Result<(), String> {
     for report in reports.iter().filter(|report| report.emitted) {
         let mut matching_groups = Vec::new();
-        collect_candidate_groups(root_nodes, &report.name, &mut matching_groups);
+        collect_candidate_groups(root_nodes, report.anchor_track_id, &mut matching_groups);
         if matching_groups.len() != 1 {
             return Err(format!(
                 "candidate folder {} was emitted {} times instead of once",
@@ -640,33 +638,37 @@ pub(super) fn validate_candidate_group_topology(
     Ok(())
 }
 
-/// Collects synthetic candidate groups with the requested display name.
+/// Collects synthetic candidate groups with the requested planning identity.
 fn collect_candidate_groups<'a>(
-    nodes: &'a [PlannedNode],
-    name: &str,
-    output: &mut Vec<&'a [PlannedNode]>,
+    nodes: &'a [PlannedNodeBuilder],
+    anchor_track_id: usize,
+    output: &mut Vec<&'a [PlannedNodeBuilder]>,
 ) {
     for node in nodes {
-        if let PlannedNode::Group {
-            name: group_name,
-            source_layer_id,
+        if let PlannedNodeBuilder::Group {
+            key: GroupKey::Candidate(anchor),
             children,
+            ..
         } = node
         {
-            if source_layer_id.is_none() && group_name == name {
+            if *anchor == anchor_track_id {
                 output.push(children);
             }
-            collect_candidate_groups(children, name, output);
+            collect_candidate_groups(children, anchor_track_id, output);
+        } else if let PlannedNodeBuilder::Group { children, .. } = node {
+            collect_candidate_groups(children, anchor_track_id, output);
         }
     }
 }
 
 /// Collects every logical track below one planned subtree.
-fn collect_planned_track_ids(nodes: &[PlannedNode], output: &mut Vec<usize>) {
+fn collect_planned_track_ids(nodes: &[PlannedNodeBuilder], output: &mut Vec<usize>) {
     for node in nodes {
         match node {
-            PlannedNode::Group { children, .. } => collect_planned_track_ids(children, output),
-            PlannedNode::Track { track_id } => output.push(*track_id),
+            PlannedNodeBuilder::Group { children, .. } => {
+                collect_planned_track_ids(children, output)
+            }
+            PlannedNodeBuilder::Track { track_id } => output.push(*track_id),
         }
     }
 }

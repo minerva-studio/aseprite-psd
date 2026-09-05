@@ -88,8 +88,9 @@ cargo build --release --locked -p aseprite-psd
 导出命令支持 `--compression raw|rle|zip|zip-prediction` 和
 `--empty-layers include|omit`；省略压缩时默认使用 Photoshop 兼容的 RLE。
 ZIP 模式仍可用于诊断，但不属于 Photoshop 兼容目标。省略空图层选项时默认不导出
-空像素图层。`omit` 只移除所有帧都没有 cel 的像素图层，
-部分帧暂时没有 cel 的图层仍保留隐藏占位，以维持帧结构一致。
+空像素图层。`omit` 按帧过滤没有 cel、cel 不透明度为 0，或 RGBA 像素 alpha 全为 0
+的像素层，并递归裁掉空组；仅因隐藏但仍有非透明像素的图层会保留。`include` 保留
+完整的空/透明状态布局。
 
 版本更新记录见 [Changelog](CHANGELOG.md)；测试、扩展打包、CI 和发布说明见
 [开发工作流](docs/development.md)。

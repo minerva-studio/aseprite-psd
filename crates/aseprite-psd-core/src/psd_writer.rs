@@ -15,7 +15,8 @@ use ag_psd::writer::{
 };
 
 use crate::aseprite_reader::{
-    FrameSnapshot, FrameSnapshotLayer, read_aseprite_export_with_active_frame,
+    FrameSnapshot, FrameSnapshotLayer, is_writable_pixel_cel,
+    read_aseprite_export_with_active_frame,
 };
 use crate::atomic_output::commit_bytes;
 use crate::roundtrip::{LayerMarker, MarkerRole, encode_marker};
@@ -337,14 +338,20 @@ fn count_psd_layer_records(psd: &Psd) -> usize {
     count
 }
 
-/// Removes pixel layers with no enabled cel while preserving all groups and populated siblings.
+/// Removes pixel layers with no writable cel while pruning empty group branches.
 fn omit_empty_pixel_layers(layers: &mut Vec<NormalizedLayer>) {
     for layer in layers.iter_mut() {
         omit_empty_pixel_layers(&mut layer.children);
     }
-    layers.retain(|layer| {
-        layer.kind != NormalizedLayerKind::Pixel
-            || layer.frame_states.iter().any(|state| state.enabled)
+    layers.retain(|layer| match layer.kind {
+        NormalizedLayerKind::Group => !layer.children.is_empty(),
+        NormalizedLayerKind::Pixel => layer.frame_states.iter().any(|state| {
+            let opacity = state.opacity.or_else(|| state.enabled.then_some(1.0));
+            is_writable_pixel_cel(
+                opacity,
+                layer.pixels.as_ref().map(|pixels| pixels.data.as_slice()),
+            )
+        }),
     });
 }
 
@@ -401,7 +408,9 @@ fn filter_frame_snapshot_layers(
     for index in (0..nodes.len()).rev() {
         let node = &nodes[index];
         built[index] = match node.source.kind {
-            NormalizedLayerKind::Pixel => node.source.cel.is_some().then(|| node.source.clone()),
+            NormalizedLayerKind::Pixel => {
+                snapshot_cel_is_writable(node.source.cel.as_ref()).then(|| node.source.clone())
+            }
             NormalizedLayerKind::Group => {
                 let children = node
                     .children
@@ -715,16 +724,13 @@ fn try_build_local_reuse_psd(
     embed_roundtrip_metadata: bool,
     include_empty_layers: bool,
     content_reuse: ExportContentReuse,
-) -> Result<
-    Option<(Psd, HashMap<u32, LayerMarker>, bool, ContentReuseStats)>,
-    ExportError,
-> {
+) -> Result<Option<(Psd, HashMap<u32, LayerMarker>, bool, ContentReuseStats)>, ExportError> {
     let mut plans = Vec::new();
     for template in &snapshots[0].layers {
         match build_local_reuse_plan(template, snapshots, content_reuse, include_empty_layers) {
             Some(plan) => plans.push(plan),
             None if !include_empty_layers
-                && !snapshot_layer_has_any_cel(template, snapshots) => {}
+                && !snapshot_layer_has_writable_cel(template, snapshots) => {}
             None => return Ok(None),
         }
     }
@@ -743,10 +749,7 @@ fn try_build_local_reuse_psd(
         .into_iter()
         .sum::<usize>()
         + snapshots.len();
-    let local_layers = plans
-        .iter()
-        .map(count_local_reuse_records)
-        .sum::<usize>();
+    let local_layers = plans.iter().map(count_local_reuse_records).sum::<usize>();
     if local_layers + 1 >= baseline_layers {
         return Ok(None);
     }
@@ -839,13 +842,16 @@ fn try_build_local_reuse_psd(
         .image_resources
         .as_mut()
         .and_then(|resources| resources.animations.take())
-        .ok_or_else(|| ExportError::Writer("frame animation directory was not created".to_string()))?;
+        .ok_or_else(|| {
+            ExportError::Writer("frame animation directory was not created".to_string())
+        })?;
     let tracks = collect_local_frame_tracks(&model, &frame_ids, &availability)?;
     replace_frame_animation(&mut model, animations, tracks.clone()).map_err(|error| {
         ExportError::Writer(format!("invalid generated frame animation: {error}"))
     })?;
     apply_static_visibility_from_tracks(&mut model, &tracks)?;
-    let (explicit_link_reuse_count, exact_match_reuse_count) = count_local_reuse_matches(&plans, content_reuse);
+    let (explicit_link_reuse_count, exact_match_reuse_count) =
+        count_local_reuse_matches(&plans, content_reuse);
     Ok(Some((
         model,
         metadata,
@@ -876,19 +882,38 @@ fn build_local_reuse_plan(
             || layer.kind != template.kind
             || layer.opacity != template.opacity
             || layer.blend_mode != template.blend_mode
-            || layer.children.iter().map(|child| child.source_layer_id).collect::<Vec<_>>()
-                != template.children.iter().map(|child| child.source_layer_id).collect::<Vec<_>>()
+            || layer
+                .children
+                .iter()
+                .map(|child| child.source_layer_id)
+                .collect::<Vec<_>>()
+                != template
+                    .children
+                    .iter()
+                    .map(|child| child.source_layer_id)
+                    .collect::<Vec<_>>()
     }) {
         return None;
     }
     if template.kind == NormalizedLayerKind::Pixel {
-        let cels = matching.iter().map(|layer| layer.cel.clone()).collect::<Vec<_>>();
-        if !include_empty_layers && cels.iter().all(Option::is_none) {
+        let cels = matching
+            .iter()
+            .map(|layer| layer.cel.clone())
+            .collect::<Vec<_>>();
+        if !include_empty_layers
+            && cels
+                .iter()
+                .all(|cel| !snapshot_cel_is_writable(cel.as_ref()))
+        {
             return None;
         }
         let mut unique = Vec::<Option<crate::aseprite_reader::FrameSnapshotCel>>::new();
         let mut state_indices = Vec::with_capacity(cels.len());
         for cel in &cels {
+            if !include_empty_layers && !snapshot_cel_is_writable(cel.as_ref()) {
+                state_indices.push(None);
+                continue;
+            }
             let state = unique.iter().position(|candidate| match (candidate, cel) {
                 (None, None) => true,
                 (Some(left), Some(right)) => snapshot_cel_equal(left, right, mode),
@@ -911,7 +936,8 @@ fn build_local_reuse_plan(
     for child in &template.children {
         match build_local_reuse_plan(child, snapshots, mode, include_empty_layers) {
             Some(plan) => children.push(plan),
-            None if !include_empty_layers && !snapshot_layer_has_any_cel(child, snapshots) => {}
+            None if !include_empty_layers && !snapshot_layer_has_writable_cel(child, snapshots) => {
+            }
             None => return None,
         }
     }
@@ -926,21 +952,39 @@ fn build_local_reuse_plan(
     })
 }
 
-fn snapshot_layer_has_any_cel(template: &FrameSnapshotLayer, snapshots: &[FrameSnapshot]) -> bool {
+fn snapshot_layer_has_writable_cel(
+    template: &FrameSnapshotLayer,
+    snapshots: &[FrameSnapshot],
+) -> bool {
     snapshots.iter().any(|snapshot| {
         find_snapshot_layer(&snapshot.layers, template.source_layer_id).is_some_and(|layer| {
-            layer.cel.is_some()
+            snapshot_cel_is_writable(layer.cel.as_ref())
                 || layer
                     .children
                     .iter()
-                    .any(|child| snapshot_layer_has_any_cel(child, snapshots))
+                    .any(|child| snapshot_layer_has_writable_cel(child, snapshots))
         })
     })
 }
 
-fn find_snapshot_layer<'a>(layers: &'a [FrameSnapshotLayer], id: u32) -> Option<&'a FrameSnapshotLayer> {
+/// Applies the shared cel predicate to one frame-local snapshot cel.
+fn snapshot_cel_is_writable(cel: Option<&crate::aseprite_reader::FrameSnapshotCel>) -> bool {
+    cel.is_some_and(|cel| {
+        is_writable_pixel_cel(
+            Some(f64::from(cel.opacity) / 255.0),
+            Some(cel.pixels.as_slice()),
+        )
+    })
+}
+
+fn find_snapshot_layer<'a>(
+    layers: &'a [FrameSnapshotLayer],
+    id: u32,
+) -> Option<&'a FrameSnapshotLayer> {
     layers.iter().find_map(|layer| {
-        (layer.source_layer_id == id).then_some(layer).or_else(|| find_snapshot_layer(&layer.children, id))
+        (layer.source_layer_id == id)
+            .then_some(layer)
+            .or_else(|| find_snapshot_layer(&layer.children, id))
     })
 }
 
@@ -981,31 +1025,45 @@ fn count_local_reuse_records(plan: &LocalReusePlan) -> usize {
             plan.cels.len() + 2
         }
     } else {
-        2 + plan.children.iter().map(count_local_reuse_records).sum::<usize>()
+        2 + plan
+            .children
+            .iter()
+            .map(count_local_reuse_records)
+            .sum::<usize>()
     }
 }
 
-fn count_local_reuse_matches(
-    plans: &[LocalReusePlan],
-    mode: ExportContentReuse,
-) -> (usize, usize) {
-    fn walk(plan: &LocalReusePlan, mode: ExportContentReuse, explicit: &mut usize, exact: &mut usize) {
+fn count_local_reuse_matches(plans: &[LocalReusePlan], mode: ExportContentReuse) -> (usize, usize) {
+    fn walk(
+        plan: &LocalReusePlan,
+        mode: ExportContentReuse,
+        explicit: &mut usize,
+        exact: &mut usize,
+    ) {
         if plan.source.kind == NormalizedLayerKind::Pixel {
             let mut first = HashMap::<usize, usize>::new();
             for (frame, state) in plan.state_indices.iter().enumerate() {
                 if let Some(state) = state {
                     if first.insert(*state, frame).is_some() {
-                        if mode == ExportContentReuse::Linked { *explicit += 1; }
-                        if mode == ExportContentReuse::Aggressive { *exact += 1; }
+                        if mode == ExportContentReuse::Linked {
+                            *explicit += 1;
+                        }
+                        if mode == ExportContentReuse::Aggressive {
+                            *exact += 1;
+                        }
                     }
                 }
             }
         }
-        for child in &plan.children { walk(child, mode, explicit, exact); }
+        for child in &plan.children {
+            walk(child, mode, explicit, exact);
+        }
     }
     let mut explicit = 0;
     let mut exact = 0;
-    for plan in plans { walk(plan, mode, &mut explicit, &mut exact); }
+    for plan in plans {
+        walk(plan, mode, &mut explicit, &mut exact);
+    }
     (explicit, exact)
 }
 
@@ -1056,7 +1114,15 @@ fn build_local_reuse_layer(
         availability.insert(id, vec![source.visible; frame_count]);
         availability.insert(divider_id, vec![source.visible; frame_count]);
         if embed_roundtrip_metadata {
-            insert_frame_snapshot_marker(metadata, id, source.source_layer_id, 0, frame_count, true, 3)?;
+            insert_frame_snapshot_marker(
+                metadata,
+                id,
+                source.source_layer_id,
+                0,
+                frame_count,
+                true,
+                3,
+            )?;
         }
         return Ok(Layer {
             additional_info: LayerAdditionalInfo {
@@ -1078,45 +1144,43 @@ fn build_local_reuse_layer(
         });
     }
 
-    let build_pixel = |name: String,
-                       cel: Option<&crate::aseprite_reader::FrameSnapshotCel>,
-                       id: u32|
-     -> Layer {
-        let mut layer = Layer {
-            additional_info: LayerAdditionalInfo {
-                name: Some(name),
-                id: Some(f64::from(id)),
+    let build_pixel =
+        |name: String, cel: Option<&crate::aseprite_reader::FrameSnapshotCel>, id: u32| -> Layer {
+            let mut layer = Layer {
+                additional_info: LayerAdditionalInfo {
+                    name: Some(name),
+                    id: Some(f64::from(id)),
+                    ..Default::default()
+                },
+                blend_mode: Some(blend_mode),
+                opacity: source.opacity.map(|value| f64::from(value) / 255.0),
+                hidden: Some(false),
                 ..Default::default()
-            },
-            blend_mode: Some(blend_mode),
-            opacity: source.opacity.map(|value| f64::from(value) / 255.0),
-            hidden: Some(false),
-            ..Default::default()
+            };
+            if let Some(cel) = cel {
+                layer.opacity = Some(f64::from(cel.opacity) / 255.0);
+                layer.top = Some(f64::from(cel.y));
+                layer.left = Some(f64::from(cel.x));
+                layer.bottom = Some(f64::from(cel.y) + f64::from(cel.height));
+                layer.right = Some(f64::from(cel.x) + f64::from(cel.width));
+                layer.image_data = Some(PixelData {
+                    width: cel.width,
+                    height: cel.height,
+                    data: cel.pixels.clone(),
+                });
+            } else {
+                layer.top = Some(0.0);
+                layer.left = Some(0.0);
+                layer.bottom = Some(1.0);
+                layer.right = Some(1.0);
+                layer.image_data = Some(PixelData {
+                    width: 1,
+                    height: 1,
+                    data: vec![0, 0, 0, 0],
+                });
+            }
+            layer
         };
-        if let Some(cel) = cel {
-            layer.opacity = Some(f64::from(cel.opacity) / 255.0);
-            layer.top = Some(f64::from(cel.y));
-            layer.left = Some(f64::from(cel.x));
-            layer.bottom = Some(f64::from(cel.y) + f64::from(cel.height));
-            layer.right = Some(f64::from(cel.x) + f64::from(cel.width));
-            layer.image_data = Some(PixelData {
-                width: cel.width,
-                height: cel.height,
-                data: cel.pixels.clone(),
-            });
-        } else {
-            layer.top = Some(0.0);
-            layer.left = Some(0.0);
-            layer.bottom = Some(1.0);
-            layer.right = Some(1.0);
-            layer.image_data = Some(PixelData {
-                width: 1,
-                height: 1,
-                data: vec![0, 0, 0, 0],
-            });
-        }
-        layer
-    };
     let mut variants = Vec::with_capacity(plan.cels.len());
     let has_wrapper = plan.cels.len() > 1;
     for (variant_index, cel) in plan.cels.iter().enumerate() {
@@ -1203,7 +1267,9 @@ fn collect_local_frame_tracks(
             ExportError::Writer(format!("generated layer {id} has no availability state"))
         })?;
         if states.len() != frame_ids.len() {
-            return Err(ExportError::Writer("local reuse track length differs from timeline".to_string()));
+            return Err(ExportError::Writer(
+                "local reuse track length differs from timeline".to_string(),
+            ));
         }
         tracks.push(LayerFrameTrack {
             layer_id: id,
@@ -1226,7 +1292,9 @@ fn collect_local_frame_tracks(
                 ExportError::Writer("generated divider has no valid id".to_string())
             })?;
             let states = availability.get(&divider_id).ok_or_else(|| {
-                ExportError::Writer(format!("generated divider {divider_id} has no availability state"))
+                ExportError::Writer(format!(
+                    "generated divider {divider_id} has no availability state"
+                ))
             })?;
             tracks.push(LayerFrameTrack {
                 layer_id: divider_id,
@@ -2513,7 +2581,14 @@ fn validate_output(
     let parsed = ag_psd::read_psd(bytes, &options)
         .map_err(|error| ExportError::OutputValidation(error.to_string()))?;
     validate_export_contract(&parsed, &layout, expected, compression)?;
-    validate_export_semantics(bytes, &parsed, expected, composites, frame_first, local_layout)?;
+    validate_export_semantics(
+        bytes,
+        &parsed,
+        expected,
+        composites,
+        frame_first,
+        local_layout,
+    )?;
     Ok(())
 }
 
@@ -2674,12 +2749,16 @@ fn validate_local_reuse_roots(
         )));
     }
     for root in roots {
-        if root.additional_info.name.as_deref().is_none_or(|name| {
-            name.starts_with("Frame ") || name.starts_with("State ")
-        }) || root.additional_info.animation_frames.is_none()
+        if root
+            .additional_info
+            .name
+            .as_deref()
+            .is_none_or(|name| name.starts_with("Frame ") || name.starts_with("State "))
+            || root.additional_info.animation_frames.is_none()
         {
             return Err(ExportError::OutputValidation(
-                "local reuse export root is missing its logical name or animation track".to_string(),
+                "local reuse export root is missing its logical name or animation track"
+                    .to_string(),
             ));
         }
     }
@@ -3129,8 +3208,8 @@ mod tests {
         JitterProfile, LayerAssociation, NormalizedBounds,
     };
     use aseprite::{
-        AsepriteFile, BlendMode as AseBlendMode, ColorMode as AseColorMode, LayerOptions, Pixels,
-        Tileset, TilesetData, TilesetFlags,
+        AsepriteFile, BlendMode as AseBlendMode, CelOptions, ColorMode as AseColorMode,
+        LayerOptions, Pixels, Tileset, TilesetData, TilesetFlags,
     };
 
     fn assert_physical_tracks(layers: &[ag_psd::psd::Layer], frame_count: usize) -> usize {
@@ -3437,16 +3516,18 @@ mod tests {
         let reused_root = &reused.children.as_ref().expect("local reuse roots")[0];
         assert_eq!(reused_root.additional_info.name.as_deref(), Some("动画层"));
         assert_eq!(reused_root.children.as_ref().map_or(0, Vec::len), 2);
-        assert!(reused_root
-            .children
-            .as_ref()
-            .expect("local reuse state variants")
-            .iter()
-            .all(|layer| layer
-                .additional_info
-                .name
-                .as_deref()
-                .is_some_and(|name| name.starts_with("State "))));
+        assert!(
+            reused_root
+                .children
+                .as_ref()
+                .expect("local reuse state variants")
+                .iter()
+                .all(|layer| layer
+                    .additional_info
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.starts_with("State ")))
+        );
         let reused_roundtrip = directory.join("reused-roundtrip.aseprite");
         crate::convert(
             &reused_output,
@@ -3468,7 +3549,10 @@ mod tests {
         assert_eq!(reused_file.layers()[0].name, "动画层");
         let reused_layer = reused_file.layer_ref(0).expect("roundtrip logical layer");
         assert!(matches!(
-            reused_file.cel(reused_layer, 2).expect("linked roundtrip cel").kind,
+            reused_file
+                .cel(reused_layer, 2)
+                .expect("linked roundtrip cel")
+                .kind,
             aseprite::CelKind::Linked { .. }
         ));
 
@@ -3515,7 +3599,12 @@ mod tests {
         assert_eq!(aggressive_file.frames().len(), 3);
         assert!(matches!(
             aggressive_file
-                .cel(aggressive_file.layer_ref(0).expect("aggressive logical layer"), 2)
+                .cel(
+                    aggressive_file
+                        .layer_ref(0)
+                        .expect("aggressive logical layer"),
+                    2
+                )
                 .expect("aggressive roundtrip cel")
                 .kind,
             aseprite::CelKind::Raw { .. } | aseprite::CelKind::Compressed { .. }
@@ -3973,18 +4062,18 @@ mod tests {
     }
 
     #[test]
-    fn empty_pixel_layer_policy_omits_only_layers_without_any_cel() {
+    fn empty_pixel_layer_policy_omits_non_writable_layers_and_empty_groups() {
         assert!(!ExportOptions::default().include_empty_layers);
-        let state = |enabled| crate::NormalizedLayerFrameState {
+        let state = |enabled, opacity| crate::NormalizedLayerFrameState {
             frame_index: 0,
             record_present: true,
             enabled,
             explicit_enable: true,
             offset: None,
             reference_point: None,
-            opacity: None,
+            opacity,
         };
-        let pixel = |id, enabled| NormalizedLayer {
+        let pixel = |id, enabled, opacity, data| NormalizedLayer {
             id,
             name: format!("layer-{id}"),
             kind: NormalizedLayerKind::Pixel,
@@ -4002,43 +4091,102 @@ mod tests {
                 height: 1,
                 left: 0,
                 top: 0,
-                data: vec![0; 4],
+                data,
             }),
             children: Vec::new(),
-            frame_states: vec![state(enabled)],
+            frame_states: vec![state(enabled, opacity)],
         };
-        let mut layers = vec![pixel(1, false), pixel(2, true)];
+        let empty_group = NormalizedLayer {
+            id: 6,
+            name: "empty-group".to_string(),
+            kind: NormalizedLayerKind::Group,
+            bounds: crate::NormalizedBounds {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            },
+            opacity: None,
+            blend_mode: None,
+            hidden: None,
+            pixels: None,
+            children: vec![pixel(7, false, Some(1.0), vec![0; 4])],
+            frame_states: vec![state(true, None)],
+        };
+        let mut layers = vec![
+            pixel(1, false, None, vec![255, 0, 0, 255]),
+            pixel(2, true, Some(0.0), vec![255, 0, 0, 255]),
+            pixel(3, true, Some(1.0), vec![0; 4]),
+            pixel(4, true, Some(1.0), vec![255, 0, 0, 255]),
+            pixel(5, false, Some(1.0), vec![255, 0, 0, 255]),
+            empty_group,
+        ];
         omit_empty_pixel_layers(&mut layers);
-        assert_eq!(layers.len(), 1);
-        assert_eq!(layers[0].id, 2);
+        assert_eq!(
+            layers.iter().map(|layer| layer.id).collect::<Vec<_>>(),
+            vec![4, 5],
+            "missing cels, zero-opacity cels, transparent cels, and empty groups are omitted"
+        );
+    }
+
+    #[test]
+    fn writable_pixel_cel_predicate_covers_opacity_alpha_and_hidden_content() {
+        assert!(!is_writable_pixel_cel(None, Some(&[255, 0, 0, 255])));
+        assert!(!is_writable_pixel_cel(Some(0.0), Some(&[255, 0, 0, 255])));
+        assert!(!is_writable_pixel_cel(Some(1.0), Some(&[255, 0, 0, 0])));
+        assert!(is_writable_pixel_cel(Some(1.0), Some(&[255, 0, 0, 255])));
+        assert!(
+            is_writable_pixel_cel(Some(1.0), Some(&[255, 0, 0, 255])),
+            "layer visibility is intentionally outside the cel predicate"
+        );
     }
 
     #[test]
     fn frame_snapshot_empty_policy_is_sparse_per_frame() {
-        let pixel = |id: u32, has_cel: bool| FrameSnapshotLayer {
+        let pixel = |id: u32, cel: Option<(u8, Vec<u8>)>| FrameSnapshotLayer {
             source_layer_id: id,
             name: format!("layer-{id}"),
             kind: NormalizedLayerKind::Pixel,
             opacity: None,
             blend_mode: None,
             visible: true,
-            cel: has_cel.then_some(crate::aseprite_reader::FrameSnapshotCel {
-                source_frame: 0,
-                linked_source_frame: 0,
-                explicitly_linked: false,
-                width: 1,
-                height: 1,
-                x: 0,
-                y: 0,
-                opacity: 255,
-                pixels: vec![255, 0, 0, 255],
-            }),
+            cel: cel.map(
+                |(opacity, pixels)| crate::aseprite_reader::FrameSnapshotCel {
+                    source_frame: 0,
+                    linked_source_frame: 0,
+                    explicitly_linked: false,
+                    width: 1,
+                    height: 1,
+                    x: 0,
+                    y: 0,
+                    opacity,
+                    pixels,
+                },
+            ),
             children: Vec::new(),
         };
         let snapshots = [
-            vec![pixel(1, true), pixel(2, false), pixel(3, false)],
-            vec![pixel(1, false), pixel(2, true), pixel(3, false)],
-            vec![pixel(1, false), pixel(2, false), pixel(3, true)],
+            vec![
+                pixel(1, Some((255, vec![255, 0, 0, 255]))),
+                pixel(2, None),
+                pixel(3, Some((0, vec![255, 0, 0, 255]))),
+                pixel(4, Some((255, vec![255, 0, 0, 0]))),
+                pixel(5, Some((255, vec![255, 0, 0, 255]))),
+            ],
+            vec![
+                pixel(1, None),
+                pixel(2, Some((255, vec![255, 0, 0, 255]))),
+                pixel(3, None),
+                pixel(4, None),
+                pixel(5, Some((255, vec![255, 0, 0, 255]))),
+            ],
+            vec![
+                pixel(1, None),
+                pixel(2, None),
+                pixel(3, Some((255, vec![255, 0, 0, 255]))),
+                pixel(4, None),
+                pixel(5, Some((255, vec![255, 0, 0, 255]))),
+            ],
         ];
 
         let omitted = snapshots
@@ -4050,7 +4198,7 @@ mod tests {
                 .iter()
                 .map(|layers| layers.len())
                 .collect::<Vec<_>>(),
-            vec![1, 1, 1]
+            vec![2, 2, 2]
         );
         assert_eq!(
             omitted
@@ -4059,12 +4207,450 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
+        assert!(
+            omitted
+                .iter()
+                .all(|layers| layers.iter().any(|layer| { layer.source_layer_id == 5 }))
+        );
 
         let included = snapshots
             .iter()
             .map(|layers| filter_frame_snapshot_layers(layers, true))
             .collect::<Vec<_>>();
-        assert!(included.iter().all(|layers| layers.len() == 3));
+        assert!(included.iter().all(|layers| layers.len() == 5));
+    }
+
+    #[test]
+    fn frame_folder_export_filters_non_writable_cels_and_roundtrips_frames() {
+        let directory = std::env::temp_dir().join(format!(
+            "aseprite-psd-empty-cel-export-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).expect("create empty-cel fixture directory");
+        let input = directory.join("source.aseprite");
+        let composite = directory.join("composite.aseprite");
+        let omitted_output = directory.join("omitted.psd");
+        let included_output = directory.join("included.psd");
+        let roundtrip = directory.join("roundtrip.aseprite");
+        let linked_output = directory.join("linked.psd");
+        let linked_roundtrip = directory.join("linked-roundtrip.aseprite");
+        let aggressive_output = directory.join("aggressive.psd");
+        let aggressive_roundtrip = directory.join("aggressive-roundtrip.aseprite");
+
+        let opaque_pixels = || {
+            Pixels::new(vec![255, 0, 0, 255, 0, 0, 0, 0], 2, 1, AseColorMode::Rgba)
+                .expect("opaque fixture pixels")
+        };
+        let transparent_pixels = || {
+            Pixels::new(vec![0; 8], 2, 1, AseColorMode::Rgba).expect("transparent fixture pixels")
+        };
+        let mut source = AsepriteFile::new(2, 1, AseColorMode::Rgba);
+        let content = source.add_layer("Content");
+        let no_cel = source.add_layer("No Cel");
+        let zero_opacity = source.add_layer_with("Zero Opacity", LayerOptions::default());
+        let transparent = source.add_layer("Transparent");
+        let hidden = source.add_layer_with(
+            "Hidden Content",
+            LayerOptions {
+                visible: false,
+                ..Default::default()
+            },
+        );
+        let first = source.add_frame(120);
+        let second = source.add_frame(80);
+        source
+            .set_cel(content, first, opaque_pixels(), 0, 0)
+            .expect("content first cel");
+        source
+            .set_linked_cel(content, second, first)
+            .expect("content linked cel");
+        for frame in [first, second] {
+            source
+                .set_cel_with(
+                    zero_opacity,
+                    frame,
+                    CelOptions {
+                        pixels: opaque_pixels(),
+                        opacity: 0,
+                        ..Default::default()
+                    },
+                )
+                .expect("zero-opacity cel");
+            source
+                .set_cel(transparent, frame, transparent_pixels(), 0, 0)
+                .expect("transparent cel");
+        }
+        source
+            .set_cel(hidden, first, opaque_pixels(), 0, 0)
+            .expect("hidden first cel");
+        source
+            .set_linked_cel(hidden, second, first)
+            .expect("hidden linked cel");
+        let _ = no_cel;
+        write_aseprite(&input, &source);
+
+        let mut flattened = AsepriteFile::new(2, 1, AseColorMode::Rgba);
+        let composite_layer = flattened.add_layer("Composite");
+        let first = flattened.add_frame(120);
+        let second = flattened.add_frame(80);
+        for frame in [first, second] {
+            flattened
+                .set_cel(composite_layer, frame, opaque_pixels(), 0, 0)
+                .expect("composite cel");
+        }
+        write_aseprite(&composite, &flattened);
+
+        export(
+            &input,
+            &composite,
+            &omitted_output,
+            &ExportOptions::default(),
+        )
+        .expect("export omitted empty cels");
+        let omitted = ag_psd::read_psd(
+            &fs::read(&omitted_output).expect("read omitted PSD"),
+            &ag_psd::psd::ReadOptions::default(),
+        )
+        .expect("parse omitted PSD");
+        let omitted_animations = omitted
+            .image_resources
+            .as_ref()
+            .and_then(|resources| resources.animations.as_ref())
+            .expect("omitted animation directory");
+        assert_eq!(omitted_animations.frames.len(), 2);
+        assert_eq!(omitted.children.as_ref().map_or(0, Vec::len), 2);
+        assert!(
+            omitted
+                .children
+                .as_ref()
+                .expect("omitted frame folders")
+                .iter()
+                .all(|frame| {
+                    frame
+                        .children
+                        .as_ref()
+                        .map(|children| {
+                            children
+                                .iter()
+                                .map(|child| child.additional_info.name.as_deref())
+                                .collect::<Vec<_>>()
+                        })
+                        == Some(vec![Some("Content"), Some("Hidden Content")])
+                })
+        );
+
+        export(
+            &input,
+            &composite,
+            &included_output,
+            &ExportOptions {
+                include_empty_layers: true,
+                ..Default::default()
+            },
+        )
+        .expect("export included empty cels");
+        let included = ag_psd::read_psd(
+            &fs::read(&included_output).expect("read included PSD"),
+            &ag_psd::psd::ReadOptions::default(),
+        )
+        .expect("parse included PSD");
+        assert_eq!(
+            included
+                .children
+                .as_ref()
+                .expect("included frame folders")
+                .iter()
+                .map(|frame| frame.children.as_ref().map_or(0, Vec::len))
+                .collect::<Vec<_>>(),
+            vec![5, 5]
+        );
+
+        let linked_report = export(
+            &input,
+            &composite,
+            &linked_output,
+            &ExportOptions {
+                content_reuse: ExportContentReuse::Linked,
+                ..Default::default()
+            },
+        )
+        .expect("export linked sparse cels");
+        assert_eq!(
+            linked_report.actual_content_reuse,
+            ExportContentReuse::Linked
+        );
+        assert!(linked_report.explicit_link_reuse_count > 0);
+        let linked = ag_psd::read_psd(
+            &fs::read(&linked_output).expect("read linked sparse PSD"),
+            &ag_psd::psd::ReadOptions {
+                use_image_data: Some(true),
+                ..Default::default()
+            },
+        )
+        .expect("parse linked sparse PSD");
+        assert_eq!(
+            linked.children.as_ref().expect("linked sparse roots").len(),
+            2
+        );
+        assert!(
+            linked
+                .children
+                .as_ref()
+                .expect("linked sparse roots")
+                .iter()
+                .all(|layer| layer
+                    .image_data
+                    .as_ref()
+                    .is_some_and(|pixels| pixels.width == 2 && pixels.height == 1))
+        );
+        crate::convert(
+            &linked_output,
+            &linked_roundtrip,
+            &crate::ConvertOptions {
+                layer_association: crate::LayerAssociation::AutoForRoundTrip,
+                ..Default::default()
+            },
+        )
+        .expect("roundtrip linked sparse PSD");
+        let linked_file = AsepriteFile::from_reader(
+            fs::read(&linked_roundtrip)
+                .expect("read linked sparse roundtrip")
+                .as_slice(),
+        )
+        .expect("parse linked sparse roundtrip");
+        assert_eq!(linked_file.frames().len(), 2);
+        let linked_content = linked_file
+            .layers()
+            .iter()
+            .position(|layer| layer.name == "Content")
+            .and_then(|index| linked_file.layer_ref(index))
+            .expect("linked roundtrip content layer");
+        assert!(matches!(
+            linked_file
+                .cel(linked_content, 1)
+                .expect("linked roundtrip content cel")
+                .kind,
+            aseprite::CelKind::Linked { .. }
+        ));
+
+        let aggressive_report = export(
+            &input,
+            &composite,
+            &aggressive_output,
+            &ExportOptions {
+                content_reuse: ExportContentReuse::Aggressive,
+                ..Default::default()
+            },
+        )
+        .expect("export aggressive sparse cels");
+        assert_eq!(
+            aggressive_report.actual_content_reuse,
+            ExportContentReuse::Aggressive
+        );
+        assert!(aggressive_report.exact_match_reuse_count > 0);
+        crate::convert(
+            &aggressive_output,
+            &aggressive_roundtrip,
+            &crate::ConvertOptions {
+                layer_association: crate::LayerAssociation::AutoForRoundTrip,
+                ..Default::default()
+            },
+        )
+        .expect("roundtrip aggressive sparse PSD");
+        let aggressive_file = AsepriteFile::from_reader(
+            fs::read(&aggressive_roundtrip)
+                .expect("read aggressive sparse roundtrip")
+                .as_slice(),
+        )
+        .expect("parse aggressive sparse roundtrip");
+        assert_eq!(aggressive_file.frames().len(), 2);
+        let aggressive_content = aggressive_file
+            .layers()
+            .iter()
+            .position(|layer| layer.name == "Content")
+            .and_then(|index| aggressive_file.layer_ref(index))
+            .expect("aggressive roundtrip content layer");
+        assert!(matches!(
+            aggressive_file
+                .cel(aggressive_content, 1)
+                .expect("aggressive roundtrip content cel")
+                .kind,
+            aseprite::CelKind::Raw { .. } | aseprite::CelKind::Compressed { .. }
+        ));
+
+        crate::convert(
+            &omitted_output,
+            &roundtrip,
+            &crate::ConvertOptions {
+                layer_association: crate::LayerAssociation::AutoForRoundTrip,
+                ..Default::default()
+            },
+        )
+        .expect("roundtrip omitted PSD");
+        let roundtrip_file = AsepriteFile::from_reader(
+            fs::read(&roundtrip)
+                .expect("read omitted roundtrip")
+                .as_slice(),
+        )
+        .expect("parse omitted roundtrip");
+        assert_eq!(
+            roundtrip_file
+                .frames()
+                .iter()
+                .map(|frame| frame.duration_ms)
+                .collect::<Vec<_>>(),
+            vec![120, 80]
+        );
+
+        fs::remove_dir_all(directory).expect("remove empty-cel fixture directory");
+    }
+
+    #[test]
+    fn local_reuse_omits_transparent_states_without_placeholder_layers() {
+        let cel = |source_frame: u32, opacity: u8, pixels: Vec<u8>| {
+            crate::aseprite_reader::FrameSnapshotCel {
+                source_frame,
+                linked_source_frame: source_frame,
+                explicitly_linked: false,
+                width: 2,
+                height: 1,
+                x: 0,
+                y: 0,
+                opacity,
+                pixels,
+            }
+        };
+        let pixel = |id: u32, visible: bool, cel| FrameSnapshotLayer {
+            source_layer_id: id,
+            name: format!("layer-{id}"),
+            kind: NormalizedLayerKind::Pixel,
+            opacity: None,
+            blend_mode: Some("normal".to_string()),
+            visible,
+            cel,
+            children: Vec::new(),
+        };
+        let transparent = vec![0, 0, 0, 0, 0, 0, 0, 0];
+        let opaque = vec![255, 0, 0, 255, 0, 0, 0, 0];
+        let linked = |source_frame, pixels| {
+            let mut cel = cel(source_frame, 255, pixels);
+            cel.linked_source_frame = 0;
+            cel.explicitly_linked = true;
+            cel
+        };
+        let snapshots = vec![
+            FrameSnapshot {
+                layers: vec![
+                    pixel(1, true, Some(cel(0, 255, opaque.clone()))),
+                    pixel(2, true, Some(cel(0, 255, transparent.clone()))),
+                    pixel(3, false, Some(linked(0, opaque.clone()))),
+                ],
+            },
+            FrameSnapshot {
+                layers: vec![
+                    pixel(1, true, None),
+                    pixel(2, true, Some(cel(1, 0, opaque.clone()))),
+                    pixel(3, false, Some(linked(1, opaque.clone()))),
+                ],
+            },
+            FrameSnapshot {
+                layers: vec![
+                    pixel(1, true, Some(cel(2, 255, opaque.clone()))),
+                    pixel(2, true, None),
+                    pixel(3, false, Some(linked(2, opaque.clone()))),
+                ],
+            },
+        ];
+        let document = NormalizedDocument {
+            canvas: (2, 1),
+            frames: (0..3)
+                .map(|index| crate::NormalizedFrame {
+                    index,
+                    source_id: Some(index),
+                    duration_ms: Some(100),
+                    dispose: None,
+                })
+                .collect(),
+            loop_mode: Some(NormalizedLoopMode::Infinite),
+            active_frame_index: Some(0),
+            ..Default::default()
+        };
+        let composites = vec![opaque.clone(), opaque.clone(), opaque];
+
+        for mode in [ExportContentReuse::Linked, ExportContentReuse::Aggressive] {
+            let mut report = InformationLossReport::default();
+            let Some((psd, _, _, stats)) = try_build_local_reuse_psd(
+                &document,
+                &snapshots,
+                &composites,
+                &mut report,
+                true,
+                false,
+                mode,
+            )
+            .expect("sparse local reuse plan") else {
+                panic!("sparse local reuse should be selected for {mode:?}");
+            };
+            assert!(stats.local_layout);
+            let roots = psd.children.as_ref().expect("local reuse roots");
+            assert_eq!(roots.len(), 2, "transparent-only layer must be removed");
+            assert!(roots.iter().all(|layer| {
+                layer
+                    .image_data
+                    .as_ref()
+                    .is_none_or(|pixels| pixels.width != 1 || pixels.height != 1)
+            }));
+            let sparse_track = roots
+                .iter()
+                .find(|layer| layer.additional_info.name.as_deref() == Some("layer-1"))
+                .expect("sparse logical layer");
+            let state_layer = sparse_track
+                .children
+                .as_ref()
+                .and_then(|children| children.first())
+                .unwrap_or(sparse_track);
+            let states = state_layer
+                .additional_info
+                .animation_frames
+                .as_ref()
+                .expect("sparse logical animation track");
+            assert_eq!(states.len(), 3);
+            assert_eq!(states[1].enable, Some(false));
+        }
+
+        let mut report = InformationLossReport::default();
+        let Some((included, _, _, _)) = try_build_local_reuse_psd(
+            &document,
+            &snapshots,
+            &composites,
+            &mut report,
+            true,
+            true,
+            ExportContentReuse::Aggressive,
+        )
+        .expect("included local reuse plan") else {
+            panic!("include policy should preserve transparent states");
+        };
+        assert!(
+            included
+                .children
+                .as_ref()
+                .expect("included roots")
+                .iter()
+                .any(|layer| layer
+                    .children
+                    .as_ref()
+                    .is_some_and(|children| children.iter().any(|child| {
+                        child
+                            .image_data
+                            .as_ref()
+                            .is_some_and(|pixels| pixels.width == 1 && pixels.height == 1)
+                    }))),
+            "include policy keeps transparent placeholder state"
+        );
     }
 
     /// Verifies content-reuse matching keeps source identity and display attributes in scope.

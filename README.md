@@ -104,9 +104,11 @@ cargo build --release --locked -p aseprite-psd
 The export command accepts `--compression raw|rle|zip|zip-prediction` and
 `--empty-layers include|omit`. Compression defaults to Photoshop-compatible
 RLE, while empty layers default to `omit`. ZIP modes remain available for
-diagnostics but are outside the Photoshop compatibility target. `omit`
-removes only pixel layers with no cel in any frame; a layer that is empty in
-some frames still gets a hidden placeholder so frame topology stays aligned.
+diagnostics but are outside the Photoshop compatibility target. With `omit`,
+each frame filters pixel layers that have no cel, zero cel opacity, or no
+non-transparent RGBA pixels; empty groups are pruned as well. Hidden layers
+with non-transparent pixels remain editable, and `include` preserves the
+complete empty/transparent state layout.
 
 See the [changelog](CHANGELOG.md) for release notes and
 [the development workflow](docs/development.md) for testing, extension
