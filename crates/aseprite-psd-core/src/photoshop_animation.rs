@@ -54,7 +54,7 @@ pub struct PhotoshopFrame {
     pub id: u32,
     /// Frame duration in milliseconds.
     pub duration_ms: u32,
-    /// Disposal policy as authored by Photoshop, if present.
+    /// Normalized disposal policy; omitted Photoshop `FrDs` means `auto`.
     pub dispose: Option<String>,
 }
 
@@ -182,7 +182,7 @@ pub fn parse_photoshop_animation(
     if scanned.animation_descriptors.is_empty() && !has_layer_animation {
         return Ok(None);
     }
-    // Static PSDs can contain a 4000/4003-looking resource without the
+    // Static PSDs can contain a plug-in resource with an animation-looking ID without the
     // per-layer metadata that makes it a Photoshop Frame Animation.
     if !has_layer_animation {
         return Ok(None);
@@ -190,7 +190,7 @@ pub fn parse_photoshop_animation(
     validate_input_layers(layers)?;
     if scanned.animation_descriptors.is_empty() {
         return Err(AnimationParseError::InvalidData(
-            "layer animation metadata exists without a 4000/4003 frame catalog".to_string(),
+            "layer animation metadata exists without a maniIRFR frame catalog".to_string(),
         ));
     }
 
@@ -350,7 +350,7 @@ fn scan_psd_metadata(bytes: &[u8]) -> Result<ScanResult, AnimationParseError> {
     Ok(result)
 }
 
-/// Reads image resources and extracts 4000/4003 animation descriptors.
+/// Reads plug-in image resources and extracts descriptors by their `maniIRFR` payload signature.
 fn scan_resources(resources: &[u8], result: &mut ScanResult) -> Result<(), AnimationParseError> {
     let mut cursor = Cursor::new(resources);
     while cursor.remaining() > 0 {
@@ -366,7 +366,7 @@ fn scan_resources(resources: &[u8], result: &mut ScanResult) -> Result<(), Anima
         if !data_length.is_multiple_of(2) {
             cursor.skip(1, "image resource data padding")?;
         }
-        if (id == 4000 || id == 4003)
+        if (4000..=4999).contains(&id)
             && let Some(descriptor) = parse_animation_resource(data)?
         {
             result.animation_descriptors.push((id, descriptor));
@@ -696,15 +696,17 @@ fn parse_catalog_frame(descriptor: &Descriptor) -> Result<PhotoshopFrame, Animat
         AnimationParseError::InvalidData(format!("frame {id} has no FrDl duration"))
     })?;
     let duration_ms = number_to_u32(delay * 10.0, "FrDl")?;
-    let dispose = descriptor_enum(descriptor, "FrDs")?.map(|value| {
-        let suffix = value.rsplit('.').next().unwrap_or(&value);
-        match suffix.to_ascii_lowercase().as_str() {
-            "auto" => "auto".to_string(),
-            "none" => "none".to_string(),
-            "dispose" => "dispose".to_string(),
-            _ => value,
-        }
-    });
+    let dispose = descriptor_enum(descriptor, "FrDs")?
+        .map(|value| {
+            let suffix = value.rsplit('.').next().unwrap_or(&value);
+            match suffix.to_ascii_lowercase().as_str() {
+                "auto" => "auto".to_string(),
+                "none" => "none".to_string(),
+                "dispose" => "dispose".to_string(),
+                _ => value,
+            }
+        })
+        .or_else(|| Some("auto".to_string()));
     Ok(PhotoshopFrame {
         id,
         duration_ms,
@@ -731,7 +733,10 @@ fn index_raw_layers(layers: Vec<RawLayer>) -> Result<HashMap<u32, RawLayer>, Ani
     Ok(indexed)
 }
 
-/// Resolves enable inheritance and optional per-frame properties.
+/// Resolves per-frame enable values in catalog order and optional properties.
+///
+/// A present `LaSt` record without `enab` inherits the preceding catalog frame's
+/// state. A missing record deliberately retains the existing hidden fallback.
 fn resolve_layer_states(
     layer: &AnimationLayerInput,
     raw: &RawLayer,
@@ -753,9 +758,7 @@ fn resolve_layer_states(
             });
             let record_present = record.is_some();
             let explicit_enable = record.and_then(|item| item.enable).is_some();
-            if layer.is_group && !layer.is_container_group && has_animation_records {
-                previous_enabled = record.and_then(|item| item.enable).unwrap_or(false);
-            } else if record_present {
+            if record_present {
                 if let Some(enable) = record.and_then(|item| item.enable) {
                     previous_enabled = enable;
                 }
@@ -786,6 +789,7 @@ fn resolve_visible_layers(
     states: &[LayerAnimationState],
     frames: &[PhotoshopFrame],
 ) -> Vec<VisibleFrameLayers> {
+    let structural_container_ids = find_structural_container_ids(layers, states, frames);
     frames
         .iter()
         .map(|frame| {
@@ -797,11 +801,17 @@ fn resolve_visible_layers(
                         && state_for_frame(state, frame.id).is_some_and(|state| {
                             state.enabled
                                 && layer.ancestor_ids.iter().all(|ancestor_id| {
-                                    states
-                                        .iter()
-                                        .find(|candidate| candidate.layer_id == *ancestor_id)
-                                        .and_then(|candidate| state_for_frame(candidate, frame.id))
-                                        .is_some_and(|ancestor| ancestor.enabled)
+                                    if structural_container_ids.contains(ancestor_id) {
+                                        true
+                                    } else {
+                                        states
+                                            .iter()
+                                            .find(|candidate| candidate.layer_id == *ancestor_id)
+                                            .and_then(|candidate| {
+                                                state_for_frame(candidate, frame.id)
+                                            })
+                                            .is_some_and(|ancestor| ancestor.enabled)
+                                    }
                                 })
                         })
                 })
@@ -811,6 +821,53 @@ fn resolve_visible_layers(
                 frame_id: frame.id,
                 layer_ids,
             }
+        })
+        .collect()
+}
+
+/// Finds hidden Photoshop groups whose descendants carry the actual frame activity.
+fn find_structural_container_ids(
+    layers: &[AnimationLayerInput],
+    states: &[LayerAnimationState],
+    frames: &[PhotoshopFrame],
+) -> HashSet<u32> {
+    layers
+        .iter()
+        .filter(|layer| layer.is_group)
+        .filter_map(|group| {
+            let group_state = states.iter().find(|state| state.layer_id == group.id)?;
+            let has_group_records = group_state.frames.iter().any(|state| state.record_present);
+            let group_is_always_disabled = group_state.frames.iter().all(|state| !state.enabled);
+            if !has_group_records || !group_is_always_disabled {
+                return None;
+            }
+
+            let descendants = layers
+                .iter()
+                .filter(|layer| !layer.is_group && layer.ancestor_ids.contains(&group.id));
+            let descendant_ids = descendants
+                .clone()
+                .map(|layer| layer.id)
+                .collect::<HashSet<_>>();
+            let has_animated_descendant = states.iter().any(|state| {
+                descendant_ids.contains(&state.layer_id)
+                    && state.frames.iter().any(|frame| frame.record_present)
+            });
+            if !has_animated_descendant {
+                return None;
+            }
+
+            let active_frame_count = frames
+                .iter()
+                .filter(|frame| {
+                    states.iter().any(|state| {
+                        descendant_ids.contains(&state.layer_id)
+                            && state_for_frame(state, frame.id)
+                                .is_some_and(|layer_state| layer_state.enabled)
+                    })
+                })
+                .count();
+            (active_frame_count >= 2).then_some(group.id)
         })
         .collect()
 }

@@ -40,6 +40,19 @@ pub struct NormalizedDocument {
     pub animation_frame_flags: Option<crate::AnimationFlags>,
     /// Photoshop slices in source group and slice order.
     pub slices: Vec<NormalizedSlice>,
+    /// Named playback ranges preserved when a layer hierarchy supplies separate animations.
+    pub animation_tags: Vec<NormalizedTag>,
+}
+
+/// A named inclusive frame range in normalized playback order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedTag {
+    /// User-authored animation name.
+    pub name: String,
+    /// First frame included by this tag.
+    pub from_frame: u32,
+    /// Last frame included by this tag.
+    pub to_frame: u32,
 }
 
 /// A named PSD slice and the source fields that Aseprite cannot represent.
@@ -197,11 +210,21 @@ pub struct NormalizedLayerFrameState {
 impl NormalizedLayer {
     /// Returns whether this layer is enabled after applying an ancestor result.
     pub fn is_effectively_visible(&self, frame_index: usize, ancestors_visible: bool) -> bool {
-        ancestors_visible
-            && self
-                .frame_states
-                .get(frame_index)
-                .is_some_and(|state| state.enabled)
+        let enabled = self
+            .frame_states
+            .get(frame_index)
+            .is_some_and(|state| state.enabled);
+        let structural_visibility = self
+            .is_structural_animation_container()
+            .then(|| self.has_visible_pixel_for_container(frame_index))
+            .unwrap_or(false);
+        ancestors_visible && (enabled || structural_visibility)
+    }
+
+    /// Returns whether the layer must be visible in Aseprite's static layer baseline.
+    pub(crate) fn is_visible_in_any_frame(&self) -> bool {
+        self.frame_states.iter().any(|state| state.enabled)
+            || self.is_structural_animation_container()
     }
 
     /// Appends visible pixel-layer IDs for one frame in tree order.
@@ -220,6 +243,68 @@ impl NormalizedLayer {
             }
             NormalizedLayerKind::Pixel if visible => output.push(self.id),
             NormalizedLayerKind::Pixel => {}
+        }
+    }
+
+    /// Identifies a Photoshop group whose hidden base state is only a container state.
+    ///
+    /// Photoshop can place the actual frame selection on descendants while the containing
+    /// group itself remains hidden in the static layer record. Such a group must not suppress
+    /// its animated descendants during normalized playback. Ordinary hidden groups do not meet
+    /// all of these conditions and retain normal ancestor visibility semantics.
+    fn is_structural_animation_container(&self) -> bool {
+        if self.kind != NormalizedLayerKind::Group
+            || self.children.is_empty()
+            || self.frame_states.len() < 2
+            || !self.frame_states.iter().any(|state| state.record_present)
+            || self.frame_states.iter().any(|state| state.enabled)
+        {
+            return false;
+        }
+
+        let has_animated_descendant = self
+            .children
+            .iter()
+            .any(NormalizedLayer::contains_animation_record);
+        if !has_animated_descendant {
+            return false;
+        }
+
+        (0..self.frame_states.len())
+            .filter(|frame_index| {
+                self.children
+                    .iter()
+                    .any(|child| child.has_visible_pixel_for_container(*frame_index))
+            })
+            .count()
+            >= 2
+    }
+
+    /// Returns whether this subtree contains source-provided frame metadata.
+    fn contains_animation_record(&self) -> bool {
+        self.frame_states.iter().any(|state| state.record_present)
+            || self
+                .children
+                .iter()
+                .any(NormalizedLayer::contains_animation_record)
+    }
+
+    /// Finds pixel content below a possible structural container without using its base state.
+    fn has_visible_pixel_for_container(&self, frame_index: usize) -> bool {
+        let enabled = self
+            .frame_states
+            .get(frame_index)
+            .is_some_and(|state| state.enabled);
+        match self.kind {
+            NormalizedLayerKind::Pixel => enabled,
+            NormalizedLayerKind::Group => {
+                let visible = enabled || self.is_structural_animation_container();
+                visible
+                    && self
+                        .children
+                        .iter()
+                        .any(|child| child.has_visible_pixel_for_container(frame_index))
+            }
         }
     }
 }

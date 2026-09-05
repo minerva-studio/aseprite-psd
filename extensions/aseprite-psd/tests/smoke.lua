@@ -96,6 +96,19 @@ assert(automatic_text:find("--association-strategy\0compact", 1, true))
 assert(automatic_text:find("--z-order\0stable", 1, true))
 assert(automatic_text:find("--stable-order\0consensus", 1, true))
 
+local feature_arguments = process.build_arguments("converter", "input.psd", "output.aseprite", {
+  frame_source = "layer-depth:1",
+  layer_association = "auto",
+  association_strategy = "Feature tracks",
+  z_order = "stable",
+  stable_order = "consensus",
+  jitter_mode = "off",
+})
+local feature_text = table.concat(feature_arguments, "\0")
+assert(feature_text:find("--frame-source\0layer-depth:1", 1, true))
+assert(feature_text:find("--association-strategy\0feature", 1, true))
+assert(not feature_text:find("--uncertain-layers", 1, true))
+
 local preserve_arguments = process.build_arguments("converter", "input.psd", "output.aseprite", {
   report = "report.json",
   overwrite = true,

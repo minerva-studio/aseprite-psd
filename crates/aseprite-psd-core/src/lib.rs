@@ -46,7 +46,7 @@ pub use logical_layers::{
 pub use model::{
     DocumentInspection, NormalizedBounds, NormalizedDocument, NormalizedFrame, NormalizedLayer,
     NormalizedLayerFrameState, NormalizedLayerKind, NormalizedLoopMode, NormalizedPixels,
-    NormalizedSlice, NormalizedSliceKey,
+    NormalizedSlice, NormalizedSliceKey, NormalizedTag,
 };
 pub use photoshop_animation::{
     AnimationFlags, AnimationLayerInput, AnimationParseError, AnimationPoint, LayerAnimationState,
@@ -91,6 +91,10 @@ pub enum FrameSource {
     Static,
     /// Treat each non-background top-level layer or group as one playback frame.
     TopLevel,
+    /// Require the authored Photoshop frame-animation resource and layer states.
+    Timeline,
+    /// Treat layers at one explicit hierarchy depth as playback frames.
+    LayerDepth(u32),
 }
 
 /// Selects whether identical cels are emitted as links to an earlier cel.
@@ -160,6 +164,7 @@ fn normalize_bytes(
     validate_slice_resources(bytes)?;
     let options = ag_psd::psd::ReadOptions {
         use_image_data: Some(true),
+        skip_composite_image_data: Some(true),
         skip_thumbnail: Some(true),
         ..Default::default()
     };
@@ -268,6 +273,7 @@ fn normalize_bytes(
             animation_resource_ids: resource_ids,
             animation_frame_flags: frame_flags,
             slices,
+            animation_tags: Vec::new(),
         },
         information_loss,
     ))
@@ -1068,13 +1074,31 @@ fn normalize_enum_name(value: &str) -> String {
     spaced.replace('_', " ").to_ascii_lowercase()
 }
 
-/// Applies an explicit non-timeline frame interpretation before logical association.
+/// Applies the requested playback interpretation before logical association.
 fn apply_frame_source(
     document: &mut NormalizedDocument,
     frame_source: FrameSource,
 ) -> Result<Vec<String>, String> {
+    apply_frame_source_with_feature_mode(document, frame_source, false)
+}
+
+/// Applies a frame source and optionally enables Feature's timeline-aware layer expansion.
+fn apply_frame_source_with_feature_mode(
+    document: &mut NormalizedDocument,
+    frame_source: FrameSource,
+    feature_mode: bool,
+) -> Result<Vec<String>, String> {
     match frame_source {
-        FrameSource::Auto => return Ok(Vec::new()),
+        FrameSource::Auto if !document.animation_resource_ids.is_empty() => {
+            return Ok(vec!["frame source: Photoshop timeline".to_string()]);
+        }
+        // Keep automatic import conservative.  Layer hierarchy animation is opt-in because
+        // ordinary static PSDs frequently have several top-level art layers.
+        FrameSource::Auto => {
+            return Ok(vec![
+                "frame source: static document (no Photoshop timeline)".to_string(),
+            ]);
+        }
         FrameSource::Static => {
             apply_static_states(&mut document.root_layers);
             document.frames = vec![NormalizedFrame {
@@ -1087,43 +1111,101 @@ fn apply_frame_source(
             document.active_frame_index = None;
             document.animation_resource_ids.clear();
             document.animation_frame_flags = None;
+            document.animation_tags.clear();
             return Ok(vec!["frame source: static document".to_string()]);
         }
-        FrameSource::TopLevel if !document.animation_resource_ids.is_empty() => {
-            return Err(
-                "top-level frame source cannot replace a Photoshop timeline; use --frame-source auto or static"
-                    .to_string(),
-            );
+        FrameSource::Timeline => {
+            if document.animation_resource_ids.is_empty() {
+                return Err(
+                    "Photoshop timeline frame source found no maniIRFR/shmd timeline".to_string(),
+                );
+            }
+            return Ok(vec!["frame source: Photoshop timeline".to_string()]);
         }
-        FrameSource::TopLevel => {}
+        FrameSource::TopLevel => {
+            return apply_layer_depth_frame_source(document, 0, feature_mode);
+        }
+        FrameSource::LayerDepth(depth) => {
+            return apply_layer_depth_frame_source(document, depth, feature_mode);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LayerDepthFrame {
+    id: u32,
+    ancestor_ids: Vec<u32>,
+    tag_name: Option<String>,
+    timeline_source_frame: Option<usize>,
+    feature_root_id: Option<u32>,
+    feature_root_ids: HashSet<u32>,
+    feature_ancestor_ids: Vec<u32>,
+}
+
+#[derive(Debug)]
+struct LayerDepthContainer {
+    parent_id: Option<u32>,
+    parent_name: Option<String>,
+    ancestor_ids: Vec<u32>,
+    tag_name: Option<String>,
+    child_ids: Vec<u32>,
+}
+
+/// Turns one hierarchy depth into a deterministic frame sequence without changing the layer tree.
+fn apply_layer_depth_frame_source(
+    document: &mut NormalizedDocument,
+    target_depth: u32,
+    feature_mode: bool,
+) -> Result<Vec<String>, String> {
+    let previous_frames = document.frames.clone();
+    if feature_mode && document.animation_resource_ids.len() > 0 && previous_frames.len() > 1 {
+        return apply_feature_aware_layer_depth(document, target_depth, &previous_frames);
     }
 
-    let frame_roots = document
-        .root_layers
+    let mut frames = Vec::new();
+    collect_layer_depth_frames(
+        &document.root_layers,
+        0,
+        target_depth,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &mut frames,
+    );
+    if frames.is_empty() {
+        return Err(format!(
+            "layer-depth:{target_depth} frame source found no non-background layers"
+        ));
+    }
+
+    let reuse_durations = previous_frames.len() == frames.len();
+    for (frame_index, selected) in frames.iter().enumerate() {
+        for layer in &mut document.root_layers {
+            apply_layer_depth_states(
+                layer,
+                selected,
+                frame_index,
+                frames.len(),
+                is_shared_background(layer),
+                false,
+            );
+        }
+    }
+
+    if u32::try_from(frames.len()).is_err() {
+        return Err("frame count exceeds u32".to_string());
+    }
+    document.frames = frames
         .iter()
         .enumerate()
-        .filter(|(_, layer)| !is_shared_background(layer))
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    if frame_roots.is_empty() {
-        return Err("top-level frame source found no frame layers".to_string());
-    }
-    let frame_count = frame_roots.len();
-    for (root_index, layer) in document.root_layers.iter_mut().enumerate() {
-        let active_frame = frame_roots.iter().position(|index| *index == root_index);
-        apply_top_level_frame_states(
-            layer,
-            frame_count,
-            active_frame,
-            active_frame.is_some(),
-            true,
-        );
-    }
-    document.frames = (0..frame_count)
-        .map(|index| NormalizedFrame {
+        .map(|(index, _)| NormalizedFrame {
             index: index as u32,
             source_id: None,
-            duration_ms: Some(u32::from(DEFAULT_FRAME_DURATION_MS)),
+            duration_ms: Some(
+                reuse_durations
+                    .then(|| previous_frames[index].duration_ms)
+                    .flatten()
+                    .unwrap_or(u32::from(DEFAULT_FRAME_DURATION_MS)),
+            ),
             dispose: None,
         })
         .collect();
@@ -1131,52 +1213,499 @@ fn apply_frame_source(
     document.active_frame_index = Some(0);
     document.animation_resource_ids.clear();
     document.animation_frame_flags = None;
-    let shared = document
-        .root_layers
-        .iter()
-        .filter(|layer| is_shared_background(layer))
-        .map(|layer| layer.name.as_str())
-        .collect::<Vec<_>>();
+    document.animation_tags = layer_depth_tags(&frames)?;
     Ok(vec![format!(
-        "frame source: {frame_count} top-level frames; shared layers: {}",
-        if shared.is_empty() {
-            "none".to_string()
+        "frame source: layer-depth:{target_depth}; {} frames; durations: {}",
+        frames.len(),
+        if reuse_durations {
+            "source timeline"
         } else {
-            shared.join(", ")
+            "100 ms fallback"
         }
     )])
+}
+
+/// Collects target frame layers and their tag context in source order.
+fn collect_layer_depth_frames(
+    layers: &[NormalizedLayer],
+    depth: u32,
+    target_depth: u32,
+    ancestors: &mut Vec<u32>,
+    ancestor_names: &mut Vec<String>,
+    output: &mut Vec<LayerDepthFrame>,
+) {
+    for layer in layers {
+        if depth == target_depth {
+            if !(depth == 0 && is_shared_background(layer)) {
+                output.push(LayerDepthFrame {
+                    id: layer.id,
+                    ancestor_ids: ancestors.clone(),
+                    tag_name: (!ancestor_names.is_empty()).then(|| ancestor_names.join(" / ")),
+                    timeline_source_frame: None,
+                    feature_root_id: None,
+                    feature_root_ids: HashSet::new(),
+                    feature_ancestor_ids: Vec::new(),
+                });
+            }
+            continue;
+        }
+        ancestors.push(layer.id);
+        ancestor_names.push(layer.name.clone());
+        collect_layer_depth_frames(
+            &layer.children,
+            depth.saturating_add(1),
+            target_depth,
+            ancestors,
+            ancestor_names,
+            output,
+        );
+        ancestor_names.pop();
+        ancestors.pop();
+    }
+}
+
+/// Expands hierarchy containers and timeline-bound feature containers into one frame sequence.
+fn apply_feature_aware_layer_depth(
+    document: &mut NormalizedDocument,
+    target_depth: u32,
+    source_frames: &[NormalizedFrame],
+) -> Result<Vec<String>, String> {
+    let mut containers = Vec::new();
+    collect_layer_depth_containers(
+        &document.root_layers,
+        0,
+        target_depth,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &mut containers,
+    );
+    let source_states = collect_layer_states(&document.root_layers);
+    let feature_root_ids = containers
+        .iter()
+        .filter(|container| {
+            is_exclusive_feature_container(document, container, source_frames.len())
+        })
+        .filter_map(|container| container.parent_id)
+        .collect::<HashSet<_>>();
+
+    let mut frames = Vec::new();
+    let mut timeline_bound_container_count = 0usize;
+    for container in containers {
+        let is_timeline_bound =
+            is_timeline_bound_container(document, &container, source_frames.len());
+        if is_timeline_bound {
+            timeline_bound_container_count += 1;
+            let timeline_container_id = container
+                .parent_id
+                .expect("timeline-bound containers have a parent");
+            let mut timeline_ancestor_ids = container.ancestor_ids.clone();
+            timeline_ancestor_ids.push(timeline_container_id);
+            for source_frame_index in 0..source_frames.len() {
+                frames.push(LayerDepthFrame {
+                    id: timeline_container_id,
+                    ancestor_ids: timeline_ancestor_ids.clone(),
+                    tag_name: container.parent_name.clone(),
+                    timeline_source_frame: Some(source_frame_index),
+                    feature_root_id: Some(timeline_container_id),
+                    feature_root_ids: feature_root_ids.clone(),
+                    feature_ancestor_ids: container.ancestor_ids.clone(),
+                });
+            }
+        } else {
+            for child_id in container.child_ids {
+                frames.push(LayerDepthFrame {
+                    id: child_id,
+                    ancestor_ids: {
+                        let mut ids = container.ancestor_ids.clone();
+                        if let Some(parent_id) = container.parent_id {
+                            ids.push(parent_id);
+                        }
+                        ids
+                    },
+                    tag_name: container.tag_name.clone(),
+                    timeline_source_frame: None,
+                    feature_root_id: None,
+                    feature_root_ids: HashSet::new(),
+                    feature_ancestor_ids: Vec::new(),
+                });
+            }
+        }
+    }
+    if frames.is_empty() {
+        return Err(format!(
+            "layer-depth:{target_depth} frame source found no non-background layers"
+        ));
+    }
+    let frame_count = frames.len();
+    let frame_count_u32 = u32::try_from(frame_count)
+        .map_err(|_| "feature-aware frame count exceeds u32".to_string())?;
+    for (frame_index, selected) in frames.iter().enumerate() {
+        for layer in &mut document.root_layers {
+            if let Some(source_frame_index) = selected.timeline_source_frame {
+                apply_feature_timeline_states(
+                    layer,
+                    &source_states,
+                    source_frame_index,
+                    frame_index,
+                    frame_count_u32,
+                    selected.feature_root_id.expect("feature frame has a root"),
+                    &selected.feature_root_ids,
+                    &selected.feature_ancestor_ids,
+                    false,
+                );
+            } else {
+                apply_layer_depth_states(
+                    layer,
+                    selected,
+                    frame_index,
+                    frame_count,
+                    is_shared_background(layer),
+                    false,
+                );
+            }
+        }
+    }
+
+    document.frames = frames
+        .iter()
+        .enumerate()
+        .map(|(index, frame)| {
+            let source = frame
+                .timeline_source_frame
+                .and_then(|source_index| source_frames.get(source_index));
+            NormalizedFrame {
+                index: index as u32,
+                source_id: None,
+                duration_ms: Some(
+                    source
+                        .and_then(|source_frame| source_frame.duration_ms)
+                        .unwrap_or(u32::from(DEFAULT_FRAME_DURATION_MS)),
+                ),
+                dispose: source.and_then(|source_frame| source_frame.dispose.clone()),
+            }
+        })
+        .collect();
+    document.loop_mode = Some(NormalizedLoopMode::Infinite);
+    document.active_frame_index = Some(0);
+    document.animation_resource_ids.clear();
+    document.animation_frame_flags = None;
+    document.animation_tags = layer_depth_tags(&frames)?;
+    let hierarchy_frames = frames
+        .iter()
+        .filter(|frame| frame.timeline_source_frame.is_none())
+        .count();
+    let timeline_frames = frames.len() - hierarchy_frames;
+    Ok(vec![format!(
+        "frame source: layer-depth:{target_depth}; feature-aware; {} frames; hierarchy frames: {}; timeline-bound frames: {}; timeline-bound containers: {}; exclusive feature containers: {}",
+        frames.len(),
+        hierarchy_frames,
+        timeline_frames,
+        timeline_bound_container_count,
+        feature_root_ids.len()
+    )])
+}
+
+/// Collects containers whose direct children are candidates at the requested depth.
+fn collect_layer_depth_containers(
+    layers: &[NormalizedLayer],
+    depth: u32,
+    target_depth: u32,
+    ancestors: &mut Vec<u32>,
+    ancestor_names: &mut Vec<String>,
+    output: &mut Vec<LayerDepthContainer>,
+) {
+    if target_depth == 0 {
+        for layer in layers {
+            if !is_shared_background(layer) {
+                output.push(LayerDepthContainer {
+                    parent_id: None,
+                    parent_name: None,
+                    ancestor_ids: Vec::new(),
+                    tag_name: None,
+                    child_ids: vec![layer.id],
+                });
+            }
+        }
+        return;
+    }
+    if depth.saturating_add(1) == target_depth {
+        for layer in layers {
+            if layer.children.is_empty() {
+                continue;
+            }
+            let mut tag_parts = ancestor_names.clone();
+            tag_parts.push(layer.name.clone());
+            output.push(LayerDepthContainer {
+                parent_id: Some(layer.id),
+                parent_name: Some(layer.name.clone()),
+                ancestor_ids: ancestors.clone(),
+                tag_name: Some(tag_parts.join(" / ")),
+                child_ids: layer.children.iter().map(|child| child.id).collect(),
+            });
+        }
+        return;
+    }
+    for layer in layers {
+        ancestors.push(layer.id);
+        ancestor_names.push(layer.name.clone());
+        collect_layer_depth_containers(
+            &layer.children,
+            depth.saturating_add(1),
+            target_depth,
+            ancestors,
+            ancestor_names,
+            output,
+        );
+        ancestor_names.pop();
+        ancestors.pop();
+    }
+}
+
+/// Returns whether a layer subtree contains a state change in the source timeline.
+fn layer_has_timeline_variation(layer: &NormalizedLayer, frame_count: usize) -> bool {
+    let states_vary = layer.frame_states.len() == frame_count
+        && layer.frame_states.windows(2).any(|pair| {
+            pair[0].enabled != pair[1].enabled
+                || pair[0].offset != pair[1].offset
+                || pair[0].reference_point != pair[1].reference_point
+                || pair[0].opacity != pair[1].opacity
+        });
+    states_vary
+        || layer
+            .children
+            .iter()
+            .any(|child| layer_has_timeline_variation(child, frame_count))
+}
+
+/// Identifies an outer container whose descendants are authored by the Photoshop timeline.
+fn is_timeline_bound_container(
+    document: &NormalizedDocument,
+    container: &LayerDepthContainer,
+    frame_count: usize,
+) -> bool {
+    if frame_count <= 1 || container.parent_id.is_none() || container.child_ids.is_empty() {
+        return false;
+    }
+    let Some(parent_id) = container.parent_id else {
+        return false;
+    };
+    let Some(parent) = document.find_layer(parent_id) else {
+        return false;
+    };
+    if !layer_has_timeline_variation(parent, frame_count) {
+        return false;
+    }
+
+    // A container with an explicit Photoshop state on even one source frame still needs the
+    // complete source timeline so that its empty source frames remain at their original indices.
+    (0..frame_count).any(|frame_index| has_timeline_visible_pixel(parent, frame_index, true))
+}
+
+/// Finds source pixels below an animated container without requiring the container's static bit.
+fn has_timeline_visible_pixel(
+    layer: &NormalizedLayer,
+    frame_index: usize,
+    ancestors_visible: bool,
+) -> bool {
+    let state_enabled = layer
+        .frame_states
+        .get(frame_index)
+        .is_some_and(|state| state.enabled);
+    match layer.kind {
+        NormalizedLayerKind::Pixel => ancestors_visible && state_enabled,
+        NormalizedLayerKind::Group => {
+            let timeline_container = layer.frame_states.iter().any(|state| state.record_present);
+            let visible = ancestors_visible && (state_enabled || timeline_container);
+            visible
+                && layer
+                    .children
+                    .iter()
+                    .any(|child| has_timeline_visible_pixel(child, frame_index, visible))
+        }
+    }
+}
+
+/// Identifies an outer container whose direct pixel children form an exclusive feature.
+fn is_exclusive_feature_container(
+    document: &NormalizedDocument,
+    container: &LayerDepthContainer,
+    frame_count: usize,
+) -> bool {
+    if frame_count <= 1 || container.child_ids.is_empty() {
+        return false;
+    }
+    let all_pixel_children = container.child_ids.iter().all(|id| {
+        document
+            .find_layer(*id)
+            .is_some_and(|layer| layer.kind == NormalizedLayerKind::Pixel)
+    });
+    if !all_pixel_children {
+        return false;
+    }
+    container.parent_id.is_some_and(|parent_id| {
+        document
+            .find_layer(parent_id)
+            .is_some_and(|parent| layer_has_timeline_variation(parent, frame_count))
+    })
+}
+
+/// Copies one source timeline state into the derived output frame.
+fn apply_feature_timeline_states(
+    layer: &mut NormalizedLayer,
+    source_states: &HashMap<u32, Vec<NormalizedLayerFrameState>>,
+    source_frame_index: usize,
+    output_frame_index: usize,
+    frame_count: u32,
+    selected_feature_root: u32,
+    feature_root_ids: &HashSet<u32>,
+    selected_feature_ancestor_ids: &[u32],
+    disabled_feature_descendant: bool,
+) {
+    let selected_container =
+        layer.id == selected_feature_root || selected_feature_ancestor_ids.contains(&layer.id);
+    let is_feature_root = feature_root_ids.contains(&layer.id);
+    let disabled_feature =
+        disabled_feature_descendant || (is_feature_root && layer.id != selected_feature_root);
+    let source = source_states
+        .get(&layer.id)
+        .and_then(|states| states.get(source_frame_index));
+    let enabled = if is_shared_background(layer) {
+        true
+    } else if selected_container {
+        true
+    } else if disabled_feature {
+        false
+    } else {
+        source.is_some_and(|state| state.enabled)
+    };
+    let mut state = source
+        .cloned()
+        .unwrap_or_else(|| NormalizedLayerFrameState {
+            frame_index: output_frame_index as u32,
+            record_present: false,
+            enabled: false,
+            explicit_enable: false,
+            offset: None,
+            reference_point: None,
+            opacity: None,
+        });
+    state.frame_index = output_frame_index as u32;
+    state.record_present = true;
+    state.explicit_enable = true;
+    state.enabled = enabled;
+    if layer.frame_states.len() != frame_count as usize {
+        layer.frame_states = Vec::with_capacity(frame_count as usize);
+        for index in 0..frame_count {
+            layer.frame_states.push(NormalizedLayerFrameState {
+                frame_index: index,
+                record_present: true,
+                enabled: false,
+                explicit_enable: true,
+                offset: None,
+                reference_point: None,
+                opacity: None,
+            });
+        }
+    }
+    layer.frame_states[output_frame_index] = state;
+    let child_disabled_feature =
+        disabled_feature || (is_feature_root && layer.id != selected_feature_root);
+    for child in &mut layer.children {
+        apply_feature_timeline_states(
+            child,
+            source_states,
+            source_frame_index,
+            output_frame_index,
+            frame_count,
+            selected_feature_root,
+            feature_root_ids,
+            selected_feature_ancestor_ids,
+            child_disabled_feature,
+        );
+    }
+}
+
+/// Collects source animation states without copying pixel payloads.
+fn collect_layer_states(
+    layers: &[NormalizedLayer],
+) -> HashMap<u32, Vec<NormalizedLayerFrameState>> {
+    let mut states = HashMap::new();
+    for layer in layers {
+        states.insert(layer.id, layer.frame_states.clone());
+        states.extend(collect_layer_states(&layer.children));
+    }
+    states
+}
+
+/// Applies one generated frame state while preserving a root `Background` subtree as static.
+fn apply_layer_depth_states(
+    layer: &mut NormalizedLayer,
+    selected: &LayerDepthFrame,
+    frame_index: usize,
+    frame_count: usize,
+    static_subtree: bool,
+    selected_descendant: bool,
+) {
+    let selected_path = selected.ancestor_ids.contains(&layer.id) || layer.id == selected.id;
+    // Layer-hierarchy playback treats the selected frame node as an authored picture.
+    // Source visibility belongs to the original Photoshop timeline and must not hide
+    // descendants after the caller explicitly chooses a hierarchy-derived frame.
+    let enabled = static_subtree || selected_descendant || selected_path;
+    if layer.frame_states.len() != frame_count {
+        layer.frame_states = (0..frame_count)
+            .map(|index| NormalizedLayerFrameState {
+                frame_index: u32::try_from(index).unwrap_or(u32::MAX),
+                record_present: true,
+                enabled: false,
+                explicit_enable: true,
+                offset: None,
+                reference_point: None,
+                opacity: None,
+            })
+            .collect();
+    }
+    if let Some(state) = layer.frame_states.get_mut(frame_index) {
+        state.enabled = enabled;
+    }
+    let child_selected_descendant = selected_descendant || layer.id == selected.id;
+    for child in &mut layer.children {
+        apply_layer_depth_states(
+            child,
+            selected,
+            frame_index,
+            frame_count,
+            static_subtree,
+            child_selected_descendant,
+        );
+    }
+}
+
+/// Groups contiguous hierarchy-derived frames that share the same parent context.
+fn layer_depth_tags(frames: &[LayerDepthFrame]) -> Result<Vec<NormalizedTag>, String> {
+    let mut tags = Vec::new();
+    let mut start = 0usize;
+    while start < frames.len() {
+        let Some(name) = frames[start].tag_name.as_ref() else {
+            start += 1;
+            continue;
+        };
+        let mut end = start;
+        while end + 1 < frames.len() && frames[end + 1].tag_name.as_ref() == Some(name) {
+            end += 1;
+        }
+        tags.push(NormalizedTag {
+            name: name.clone(),
+            from_frame: u32::try_from(start).map_err(|_| "tag start exceeds u32".to_string())?,
+            to_frame: u32::try_from(end).map_err(|_| "tag end exceeds u32".to_string())?,
+        });
+        start = end + 1;
+    }
+    Ok(tags)
 }
 
 /// Returns whether a top-level layer is the explicit shared Procreate background.
 fn is_shared_background(layer: &NormalizedLayer) -> bool {
     layer.name.trim().eq_ignore_ascii_case("background")
-}
-
-/// Replaces one static layer subtree with states for a top-level frame interpretation.
-fn apply_top_level_frame_states(
-    layer: &mut NormalizedLayer,
-    frame_count: usize,
-    active_frame: Option<usize>,
-    force_selected_root: bool,
-    ancestors_active: bool,
-) {
-    let source_enabled = !layer.hidden.unwrap_or(false);
-    layer.frame_states = (0..frame_count)
-        .map(|frame_index| NormalizedLayerFrameState {
-            frame_index: frame_index as u32,
-            record_present: false,
-            enabled: ancestors_active
-                && (force_selected_root || source_enabled)
-                && active_frame.is_none_or(|active| active == frame_index),
-            explicit_enable: false,
-            offset: None,
-            reference_point: None,
-            opacity: None,
-        })
-        .collect();
-    for child in &mut layer.children {
-        apply_top_level_frame_states(child, frame_count, active_frame, false, ancestors_active);
-    }
 }
 
 /// Converts a PSD into an Aseprite file after validation and mapping.
@@ -1206,8 +1735,22 @@ pub fn convert(
     let (mut document, mut information_loss) = normalize_bytes(&bytes)
         .map_err(|error| ConversionError::InputInspection(error.to_string()))?;
     reject_unsupported_clipping(&information_loss)?;
-    let frame_source_warnings = apply_frame_source(&mut document, options.frame_source)
-        .map_err(ConversionError::InputInspection)?;
+    let feature_layer_depth = matches!(
+        layer_association,
+        LayerAssociation::Auto(AutoAssociationOptions {
+            strategy: AssociationStrategy::Feature,
+            ..
+        })
+    ) && matches!(
+        options.frame_source,
+        FrameSource::TopLevel | FrameSource::LayerDepth(_)
+    );
+    let frame_source_warnings = if feature_layer_depth {
+        apply_frame_source_with_feature_mode(&mut document, options.frame_source, true)
+    } else {
+        apply_frame_source(&mut document, options.frame_source)
+    }
+    .map_err(ConversionError::InputInspection)?;
     if document.bits_per_channel != Some(8)
         || !matches!(document.color_mode.as_deref(), Some("rgb" | "rgba"))
     {
@@ -1227,15 +1770,16 @@ pub fn convert(
             true,
         );
     }
-    let allow_inferred_cross_source_matches =
-        !matches!(options.frame_source, FrameSource::TopLevel)
-            || !matches!(
-                layer_association,
-                LayerAssociation::Auto(AutoAssociationOptions {
-                    strategy: AssociationStrategy::Conservative { .. },
-                    ..
-                })
-            );
+    let allow_inferred_cross_source_matches = !matches!(
+        options.frame_source,
+        FrameSource::TopLevel | FrameSource::LayerDepth(_)
+    ) || !matches!(
+        layer_association,
+        LayerAssociation::Auto(AutoAssociationOptions {
+            strategy: AssociationStrategy::Conservative { .. },
+            ..
+        })
+    );
     let initial_plan = if exact_roundtrip {
         merge_frame_group_states(&mut document)
             .map_err(ConversionError::RoundTripRecoveryRequired)?;
@@ -1559,6 +2103,9 @@ fn build_frame_group_roundtrip_plan(
             candidate_groups: Vec::new(),
             decisions: Vec::new(),
             warnings: Vec::new(),
+            track_merge_diagnostics: Vec::new(),
+            track_merge_rejection_diagnostics: Vec::new(),
+            feature_group_diagnostics: Vec::new(),
         },
     })
 }
@@ -1761,7 +2308,7 @@ fn validate_aseprite_output(
                 != aseprite_writer::opacity_to_u8(source.opacity, &format!("layer {}", source.id))
                     .map_err(|error| ConversionError::OutputValidation(error.to_string()))?
             || output_layer.parent != *expected_parent
-            || output_layer.visible != source.frame_states.iter().any(|state| state.enabled)
+            || output_layer.visible != source.is_visible_in_any_frame()
         {
             return Err(ConversionError::OutputValidation(format!(
                 "layer {layer_index} attributes differ for {}",

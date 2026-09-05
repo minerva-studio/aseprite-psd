@@ -10,7 +10,7 @@ use aseprite_psd_core::{
     write_report_with_active_frame,
 };
 
-const CONVERT_USAGE: &str = "usage: aseprite-psd convert INPUT [-o OUTPUT] [--report PATH] [--overwrite] [--frame-source auto|static|top-level] [--preserve-photoshop-metadata] [--linked-cels off|identical] [--layer-association preserve|auto|roundtrip] [--association-strategy compact|conservative] [--z-order stable|auto] [--stable-order consensus|anchor|strict] [--uncertain-layers group|flat] [--jitter-mode off|report|assist|repair] [--jitter-kind alpha|color|all] [--jitter-profile conservative|balanced] [--jitter-alpha-threshold N] [--jitter-max-speck-area N] [--jitter-max-changed-ratio N] [--jitter-max-channel-delta N]";
+const CONVERT_USAGE: &str = "usage: aseprite-psd convert INPUT [-o OUTPUT] [--report PATH] [--overwrite] [--frame-source auto|static|top-level|timeline|layer-depth:N] [--preserve-photoshop-metadata] [--linked-cels off|identical] [--layer-association preserve|auto|roundtrip] [--association-strategy compact|conservative|feature] [--z-order stable|auto] [--stable-order consensus|anchor|strict] [--uncertain-layers group|flat] [--jitter-mode off|report|assist|repair] [--jitter-kind alpha|color|all] [--jitter-profile conservative|balanced] [--jitter-alpha-threshold N] [--jitter-max-speck-area N] [--jitter-max-changed-ratio N] [--jitter-max-channel-delta N]";
 const EXPORT_USAGE: &str = "usage: aseprite-psd export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite [--active-frame-index N] [--compression raw|rle|zip|zip-prediction] [--empty-layers include|omit] [--report PATH] [--overwrite] [--roundtrip-metadata on|off]; default compression is RLE; ZIP modes are diagnostic only and are not Photoshop-compatible";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -237,6 +237,15 @@ fn run_convert(arguments: &[String]) -> Result<(), CliError> {
         for diagnostic in name_diagnostics {
             println!("layer-association name diagnostic: {diagnostic}");
         }
+        for diagnostic in association.track_merge_diagnostics {
+            println!("layer-association track-merge: {diagnostic}");
+        }
+        for diagnostic in association.track_merge_rejection_diagnostics {
+            println!("layer-association track-merge rejection: {diagnostic}");
+        }
+        for diagnostic in association.feature_group_diagnostics {
+            println!("layer-association feature-group: {diagnostic}");
+        }
         for candidate_group in association.candidate_groups {
             let status = if candidate_group.emitted {
                 "emitted"
@@ -334,6 +343,7 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
     let mut automatic = false;
     let mut roundtrip = false;
     let mut conservative = true;
+    let mut feature = false;
     let mut association_strategy_explicit = false;
     let mut z_order = LayerZOrderMode::Stable;
     let mut stable_order = StableOrderMode::Consensus;
@@ -358,6 +368,13 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
                     "auto" => FrameSource::Auto,
                     "static" => FrameSource::Static,
                     "top-level" => FrameSource::TopLevel,
+                    "timeline" => FrameSource::Timeline,
+                    value if value.starts_with("layer-depth:") => {
+                        let depth = value["layer-depth:".len()..].parse::<u32>().map_err(|_| {
+                            CliError::Usage(format!("invalid --frame-source value: {value:?}"))
+                        })?;
+                        FrameSource::LayerDepth(depth)
+                    }
                     _ => {
                         return Err(CliError::Usage(format!(
                             "invalid --frame-source value: {value:?}"
@@ -426,8 +443,18 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
                     .get(index)
                     .ok_or_else(|| CliError::Usage(CONVERT_USAGE.to_string()))?;
                 conservative = match value.as_str() {
-                    "compact" => false,
-                    "conservative" => true,
+                    "compact" => {
+                        feature = false;
+                        false
+                    }
+                    "conservative" => {
+                        feature = false;
+                        true
+                    }
+                    "feature" => {
+                        feature = true;
+                        true
+                    }
                     _ => {
                         return Err(CliError::Usage(format!(
                             "invalid --association-strategy value: {value:?}"
@@ -631,7 +658,7 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
             "--linked-cels identical requires --layer-association auto".to_string(),
         ));
     }
-    if !conservative && uncertain_layers_explicit {
+    if (!conservative || feature) && uncertain_layers_explicit {
         return Err(CliError::Usage(
             "--uncertain-layers requires --association-strategy conservative".to_string(),
         ));
@@ -676,7 +703,9 @@ fn convert_arguments(arguments: &[String]) -> Result<ConvertCommand, CliError> {
     let layer_association = if roundtrip {
         LayerAssociation::AutoForRoundTrip
     } else if automatic {
-        let strategy = if conservative {
+        let strategy = if feature {
+            AssociationStrategy::Feature
+        } else if conservative {
             AssociationStrategy::Conservative { uncertain_layers }
         } else {
             AssociationStrategy::Compact

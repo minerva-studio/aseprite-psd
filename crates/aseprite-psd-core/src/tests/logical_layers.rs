@@ -1,8 +1,12 @@
 use std::rc::Rc;
 
-use super::association::{decision, new_track, parse_layer_name, record_assignment};
+use super::association::{
+    decision, merge_feature_tracks, new_track, parse_layer_name, record_assignment,
+};
 use super::layout::{CandidateGroupPath, candidate_members_form_complete_interval};
-use super::observation::{FrameContainerInfo, LayerEvidence, Observation, ObservationId};
+use super::observation::{
+    FeatureIdentity, FrameContainerInfo, LayerEvidence, Observation, ObservationId,
+};
 use super::*;
 use crate::{NormalizedLayer, NormalizedLayerKind};
 
@@ -32,6 +36,821 @@ fn default_plan_uses_conservative_strategy() {
         }
     );
     assert!(plan.report.candidate_groups.is_empty());
+}
+
+#[test]
+fn feature_strategy_merges_named_features_across_frame_containers() {
+    let mut first_child = pixel(2, "rear foot", 0, [1, 2, 3, 255]);
+    first_child.frame_states.push(second_frame_state(false));
+    let first = selector_group(1, first_child);
+
+    let mut second_child = pixel(4, "rear foot", 0, [4, 5, 6, 255]);
+    second_child.frame_states[0].enabled = false;
+    second_child.frame_states.push(second_frame_state(true));
+    let second = selector_group(3, second_child);
+
+    let plan = super::build_layer_write_plan_with_context(
+        &two_frame_document(vec![first, second]),
+        AutoAssociationOptions {
+            strategy: AssociationStrategy::Feature,
+            ..AutoAssociationOptions::default()
+        },
+        false,
+        true,
+    )
+    .expect("feature association should preserve both observations");
+
+    assert_eq!(plan.report.observation_count, 2);
+    assert_eq!(plan.report.track_count, 1);
+    assert_eq!(
+        plan.tracks[0]
+            .cels
+            .iter()
+            .filter(|cel| cel.is_some())
+            .count(),
+        2
+    );
+    assert!(matches!(
+        plan.root_nodes.as_slice(),
+        [PlannedNode::Track { .. }]
+    ));
+    assert!(
+        plan.report
+            .feature_group_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("no Feature source identity"))
+    );
+    assert!(
+        plan.report
+            .decisions
+            .iter()
+            .all(|decision| decision.status != AssociationDecisionStatus::Ambiguous)
+    );
+}
+
+#[test]
+fn feature_grouping_wraps_pure_features_without_changing_tracks_or_cels() {
+    fn feature_root(
+        id: u32,
+        name: &str,
+        mut child: NormalizedLayer,
+        second_enabled: bool,
+        third_enabled: bool,
+    ) -> NormalizedLayer {
+        child.frame_states.push(second_frame_state(second_enabled));
+        child.frame_states.push(NormalizedLayerFrameState {
+            frame_index: 2,
+            record_present: true,
+            enabled: third_enabled,
+            explicit_enable: true,
+            offset: None,
+            reference_point: None,
+            opacity: None,
+        });
+        NormalizedLayer {
+            id,
+            name: name.to_string(),
+            kind: NormalizedLayerKind::Group,
+            bounds: child.bounds,
+            opacity: None,
+            blend_mode: Some("pass through".to_string()),
+            hidden: Some(false),
+            pixels: None,
+            children: vec![child],
+            frame_states: vec![
+                NormalizedLayerFrameState {
+                    frame_index: 0,
+                    record_present: true,
+                    enabled: true,
+                    explicit_enable: true,
+                    offset: None,
+                    reference_point: None,
+                    opacity: None,
+                },
+                NormalizedLayerFrameState {
+                    frame_index: 1,
+                    record_present: true,
+                    enabled: true,
+                    explicit_enable: true,
+                    offset: None,
+                    reference_point: None,
+                    opacity: None,
+                },
+                NormalizedLayerFrameState {
+                    frame_index: 2,
+                    record_present: true,
+                    enabled: true,
+                    explicit_enable: true,
+                    offset: None,
+                    reference_point: None,
+                    opacity: None,
+                },
+            ],
+        }
+    }
+
+    let mut first_child = pixel(2, "arm", 0, [1, 2, 3, 255]);
+    first_child.frame_states[0].enabled = true;
+    let mut second_child = pixel(4, "leg", 1, [4, 5, 6, 255]);
+    second_child.frame_states[0].enabled = false;
+    let document = three_frame_document(vec![
+        feature_root(1, "Walk", first_child, false, true),
+        feature_root(3, "Run", second_child, true, true),
+    ]);
+    let plan = super::build_layer_write_plan_with_context(
+        &document,
+        AutoAssociationOptions {
+            strategy: AssociationStrategy::Feature,
+            ..AutoAssociationOptions::default()
+        },
+        false,
+        true,
+    )
+    .expect("pure Feature tracks should be grouped");
+
+    assert_eq!(plan.report.observation_count, 4);
+    assert_eq!(plan.report.track_count, 2);
+    assert_eq!(
+        plan.tracks
+            .iter()
+            .flat_map(|track| track.cels.iter())
+            .filter(|cel| cel.is_some())
+            .count(),
+        4
+    );
+    assert!(matches!(
+        plan.root_nodes.as_slice(),
+        [
+            PlannedNode::Group {
+                name: first_name,
+                source_layer_id: None,
+                children: first_children,
+            },
+            PlannedNode::Group {
+                name: second_name,
+                source_layer_id: None,
+                children: second_children,
+            }
+        ] if first_name == "Walk"
+            && second_name == "Run"
+            && matches!(first_children.as_slice(), [PlannedNode::Track { .. }])
+            && matches!(second_children.as_slice(), [PlannedNode::Track { .. }])
+    ));
+    assert_eq!(
+        plan.report
+            .feature_group_diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.contains("feature-group created"))
+            .count(),
+        2
+    );
+
+    let encoded = crate::aseprite_writer::encode_with_plan_and_linked_cels(
+        &document,
+        &plan,
+        crate::LinkedCelMode::Off,
+    )
+    .expect("Feature groups should be serialized by the writer");
+    let file = aseprite::AsepriteFile::from_reader(&encoded.bytes[..])
+        .expect("grouped Feature output should be readable");
+    assert_eq!(file.layers().len(), 4);
+    assert!(matches!(file.layers()[0].kind, aseprite::LayerKind::Group));
+    assert!(matches!(file.layers()[2].kind, aseprite::LayerKind::Group));
+    assert_eq!(file.layers()[1].parent, Some(0));
+    assert_eq!(file.layers()[3].parent, Some(2));
+}
+
+#[test]
+fn feature_grouping_moves_disjoint_interleaved_nodes_into_one_group() {
+    fn observation(id: u32, feature_id: u32, x: i32, source_order: usize) -> Observation<'static> {
+        Observation {
+            id: ObservationId(id as usize),
+            evidence: Rc::new(LayerEvidence {
+                source_layer_id: id,
+                source_path: format!("feature/{feature_id}/{id}"),
+                name: format!("part {id}"),
+                normalized_name: format!("part {id}"),
+                name_key: format!("part {id}"),
+                generic_name: false,
+                copy_suffixes: Vec::new(),
+                suffix_limit_reached: false,
+                frame_container_ids: Vec::new(),
+                group_path: Vec::new(),
+                width: 1,
+                height: 1,
+                pixels: Box::leak(vec![1, 2, 3, 255].into_boxed_slice()),
+                opacity: None,
+                blend_mode: None,
+                metadata_locked: false,
+                feature_identity: Some(FeatureIdentity {
+                    container_id: feature_id,
+                    member_path: vec![format!("part {id}")],
+                }),
+                feature_display_name: None,
+            }),
+            frame_index: 0,
+            source_order,
+            x,
+            y: 0,
+        }
+    }
+
+    let observations = [
+        observation(1, 10, 0, 0),
+        observation(2, 20, 10, 1),
+        observation(3, 10, 20, 2),
+    ];
+    let mut tracks = observations
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let mut track = new_track(index, item, 1);
+            record_assignment(
+                &mut track,
+                item,
+                PlannedCel {
+                    source_layer_id: item.source_layer_id,
+                    source_frame_index: 0,
+                    z_index: 0,
+                },
+            );
+            track
+        })
+        .collect::<Vec<_>>();
+    let mut nodes = vec![
+        PlannedNode::Track { track_id: 0 },
+        PlannedNode::Track { track_id: 1 },
+        PlannedNode::Track { track_id: 2 },
+    ];
+
+    let diagnostics = super::feature_grouping::organize_feature_nodes(
+        &mut nodes,
+        &mut tracks,
+        &HashMap::from([
+            (10, ("Walk".to_string(), 0)),
+            (20, ("Other".to_string(), 1)),
+        ]),
+    );
+    assert!(matches!(
+        nodes.as_slice(),
+        [
+            PlannedNode::Group { name, children, .. },
+            PlannedNode::Group { name: other_name, children: other_children, .. }
+        ] if name == "Walk"
+            && matches!(children.as_slice(), [
+                PlannedNode::Track { track_id: 0 },
+                PlannedNode::Track { track_id: 2 }
+            ])
+            && other_name == "Other"
+            && matches!(other_children.as_slice(), [PlannedNode::Track { track_id: 1 }])
+    ));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("feature-group created: feature_id=10"))
+    );
+}
+
+#[test]
+fn feature_grouping_rejects_a_real_crossing_overlap_constraint() {
+    fn observation(id: u32, feature_id: u32, source_order: usize) -> Observation<'static> {
+        Observation {
+            id: ObservationId(id as usize),
+            evidence: Rc::new(LayerEvidence {
+                source_layer_id: id,
+                source_path: format!("feature/{feature_id}/{id}"),
+                name: format!("part {id}"),
+                normalized_name: format!("part {id}"),
+                name_key: format!("part {id}"),
+                generic_name: false,
+                copy_suffixes: Vec::new(),
+                suffix_limit_reached: false,
+                frame_container_ids: Vec::new(),
+                group_path: Vec::new(),
+                width: 1,
+                height: 1,
+                pixels: &[1, 2, 3, 255],
+                opacity: None,
+                blend_mode: None,
+                metadata_locked: false,
+                feature_identity: Some(FeatureIdentity {
+                    container_id: feature_id,
+                    member_path: vec![format!("part {id}")],
+                }),
+                feature_display_name: None,
+            }),
+            frame_index: 0,
+            source_order,
+            x: 0,
+            y: 0,
+        }
+    }
+    let observations = [
+        observation(1, 10, 0),
+        observation(2, 20, 1),
+        observation(3, 10, 2),
+    ];
+    let mut tracks = observations
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let mut track = new_track(index, item, 1);
+            record_assignment(
+                &mut track,
+                item,
+                PlannedCel {
+                    source_layer_id: item.source_layer_id,
+                    source_frame_index: 0,
+                    z_index: 0,
+                },
+            );
+            track
+        })
+        .collect::<Vec<_>>();
+    let mut nodes = vec![
+        PlannedNode::Track { track_id: 0 },
+        PlannedNode::Track { track_id: 1 },
+        PlannedNode::Track { track_id: 2 },
+    ];
+
+    let diagnostics = super::feature_grouping::organize_feature_nodes(
+        &mut nodes,
+        &mut tracks,
+        &HashMap::from([
+            (10, ("Walk".to_string(), 0)),
+            (20, ("Other".to_string(), 1)),
+        ]),
+    );
+    assert!(matches!(
+        nodes.as_slice(),
+        [
+            PlannedNode::Track { track_id: 0 },
+            PlannedNode::Group { name, children, .. },
+            PlannedNode::Track { track_id: 2 }
+        ] if name == "Other"
+            && matches!(children.as_slice(), [PlannedNode::Track { track_id: 1 }])
+    ));
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.contains("feature-group not created: feature_id=10")
+            && diagnostic.contains("layout-constraint-cycle")
+    }));
+}
+
+#[test]
+fn feature_strategy_merges_mutually_exclusive_direct_states_into_one_named_track() {
+    let mut states = Vec::new();
+    let mut children = Vec::new();
+    for frame_index in 0..6u32 {
+        let mut child = pixel(
+            10 + frame_index,
+            &frame_index.to_string(),
+            frame_index as i32,
+            [frame_index as u8, 2, 3, 255],
+        );
+        child.frame_states[0].enabled = frame_index == 0;
+        child.frame_states[0].record_present = true;
+        child.frame_states[0].explicit_enable = true;
+        for index in 1..6 {
+            child.frame_states.push(NormalizedLayerFrameState {
+                frame_index: index,
+                record_present: true,
+                enabled: index == frame_index,
+                explicit_enable: true,
+                offset: None,
+                reference_point: None,
+                opacity: None,
+            });
+        }
+        children.push(child);
+        states.push(NormalizedLayerFrameState {
+            frame_index,
+            record_present: true,
+            enabled: true,
+            explicit_enable: true,
+            offset: None,
+            reference_point: None,
+            opacity: None,
+        });
+    }
+    let root = NormalizedLayer {
+        id: 1,
+        name: "书".to_string(),
+        kind: NormalizedLayerKind::Group,
+        bounds: NormalizedBounds {
+            left: 0,
+            top: 0,
+            right: 6,
+            bottom: 1,
+        },
+        opacity: None,
+        blend_mode: Some("pass through".to_string()),
+        hidden: Some(false),
+        pixels: None,
+        children,
+        frame_states: states,
+    };
+    let document = NormalizedDocument {
+        canvas: (8, 8),
+        frames: (0..6)
+            .map(|index| NormalizedFrame {
+                index,
+                source_id: Some(index),
+                duration_ms: Some(200),
+                dispose: None,
+            })
+            .collect(),
+        root_layers: vec![root],
+        ..NormalizedDocument::default()
+    };
+
+    let plan = super::build_layer_write_plan_with_context(
+        &document,
+        AutoAssociationOptions {
+            strategy: AssociationStrategy::Feature,
+            ..AutoAssociationOptions::default()
+        },
+        false,
+        true,
+    )
+    .expect("mutually exclusive states should associate");
+
+    assert_eq!(plan.report.observation_count, 6);
+    assert_eq!(plan.report.track_count, 1);
+    assert_eq!(plan.tracks[0].name, "0 / 1 …");
+    assert_eq!(
+        plan.tracks[0]
+            .cels
+            .iter()
+            .filter(|cel| cel.is_some())
+            .count(),
+        6
+    );
+    assert!(matches!(
+        plan.root_nodes.as_slice(),
+        [PlannedNode::Group { name, children, .. }]
+            if name == "书" && matches!(children.as_slice(), [PlannedNode::Track { .. }])
+    ));
+    assert!(plan.report.decisions.iter().skip(1).all(|decision| {
+        decision
+            .evidence
+            .iter()
+            .any(|item| item == "feature-container-identity")
+    }));
+}
+
+#[test]
+fn feature_strategy_keeps_static_ordinary_editing_groups_in_the_display_path() {
+    let child = pixel(2, "body", 0, [1, 2, 3, 255]);
+    let group = NormalizedLayer {
+        id: 1,
+        name: "Body parts".to_string(),
+        kind: NormalizedLayerKind::Group,
+        bounds: child.bounds,
+        opacity: None,
+        blend_mode: Some("pass through".to_string()),
+        hidden: Some(false),
+        pixels: None,
+        children: vec![child],
+        frame_states: vec![NormalizedLayerFrameState {
+            frame_index: 0,
+            record_present: false,
+            enabled: true,
+            explicit_enable: false,
+            offset: None,
+            reference_point: None,
+            opacity: None,
+        }],
+    };
+    let plan = super::build_layer_write_plan_with_context(
+        &document(vec![group]),
+        AutoAssociationOptions {
+            strategy: AssociationStrategy::Feature,
+            ..AutoAssociationOptions::default()
+        },
+        false,
+        true,
+    )
+    .expect("static ordinary group should remain representable");
+
+    assert!(matches!(
+        plan.root_nodes.as_slice(),
+        [PlannedNode::Group { name, .. }] if name == "Body parts"
+    ));
+}
+
+#[test]
+fn feature_strategy_merges_multipart_states_without_merging_same_frame_parts() {
+    fn state_group(
+        id: u32,
+        active_frame: usize,
+        children: Vec<NormalizedLayer>,
+    ) -> NormalizedLayer {
+        NormalizedLayer {
+            id,
+            name: id.to_string(),
+            kind: NormalizedLayerKind::Group,
+            bounds: NormalizedBounds {
+                left: 0,
+                top: 0,
+                right: 2,
+                bottom: 1,
+            },
+            opacity: None,
+            blend_mode: Some("pass through".to_string()),
+            hidden: Some(false),
+            pixels: None,
+            children,
+            frame_states: (0..2)
+                .map(|frame_index| NormalizedLayerFrameState {
+                    frame_index,
+                    record_present: true,
+                    enabled: frame_index as usize == active_frame,
+                    explicit_enable: true,
+                    offset: None,
+                    reference_point: None,
+                    opacity: None,
+                })
+                .collect(),
+        }
+    }
+
+    let root = NormalizedLayer {
+        id: 1,
+        name: "Character".to_string(),
+        kind: NormalizedLayerKind::Group,
+        bounds: NormalizedBounds {
+            left: 0,
+            top: 0,
+            right: 2,
+            bottom: 1,
+        },
+        opacity: None,
+        blend_mode: Some("pass through".to_string()),
+        hidden: Some(false),
+        pixels: None,
+        children: vec![
+            state_group(2, 0, {
+                let mut body = pixel(3, "body", 0, [1, 2, 3, 255]);
+                body.frame_states.push(second_frame_state(true));
+                let mut wing = pixel(4, "wing", 1, [4, 5, 6, 255]);
+                wing.frame_states.push(second_frame_state(true));
+                vec![body, wing]
+            }),
+            state_group(5, 1, {
+                let mut body = pixel(6, "body", 0, [7, 8, 9, 255]);
+                body.frame_states.push(second_frame_state(true));
+                let mut wing = pixel(7, "wing", 1, [10, 11, 12, 255]);
+                wing.frame_states.push(second_frame_state(true));
+                vec![body, wing]
+            }),
+        ],
+        frame_states: vec![
+            NormalizedLayerFrameState {
+                frame_index: 0,
+                record_present: true,
+                enabled: true,
+                explicit_enable: true,
+                offset: None,
+                reference_point: None,
+                opacity: None,
+            },
+            NormalizedLayerFrameState {
+                frame_index: 1,
+                record_present: true,
+                enabled: true,
+                explicit_enable: true,
+                offset: None,
+                reference_point: None,
+                opacity: None,
+            },
+        ],
+    };
+    let document = NormalizedDocument {
+        canvas: (8, 8),
+        frames: vec![
+            NormalizedFrame {
+                index: 0,
+                source_id: Some(0),
+                duration_ms: Some(200),
+                dispose: None,
+            },
+            NormalizedFrame {
+                index: 1,
+                source_id: Some(1),
+                duration_ms: Some(200),
+                dispose: None,
+            },
+        ],
+        root_layers: vec![root],
+        ..NormalizedDocument::default()
+    };
+
+    let plan = super::build_layer_write_plan_with_context(
+        &document,
+        AutoAssociationOptions {
+            strategy: AssociationStrategy::Feature,
+            ..AutoAssociationOptions::default()
+        },
+        false,
+        true,
+    )
+    .expect("multipart Feature states should associate by component");
+
+    assert_eq!(plan.report.observation_count, 4);
+    assert_eq!(plan.report.track_count, 2);
+    assert!(
+        plan.tracks
+            .iter()
+            .all(|track| { track.cels.iter().filter(|cel| cel.is_some()).count() == 2 })
+    );
+    assert!(plan.report.decisions.iter().skip(2).all(|decision| {
+        decision
+            .evidence
+            .iter()
+            .any(|item| item == "feature-container-identity")
+    }));
+}
+
+#[test]
+fn feature_global_compression_merges_disjoint_tag_tracks_but_keeps_full_track_separate() {
+    fn feature_observation(
+        frame_index: usize,
+        source_layer_id: u32,
+        container_id: u32,
+    ) -> Observation<'static> {
+        Observation {
+            id: ObservationId(source_layer_id as usize),
+            evidence: Rc::new(LayerEvidence {
+                source_layer_id,
+                source_path: format!("{container_id}/{source_layer_id}"),
+                name: "body".to_string(),
+                normalized_name: "body".to_string(),
+                name_key: "body".to_string(),
+                generic_name: false,
+                copy_suffixes: Vec::new(),
+                suffix_limit_reached: false,
+                frame_container_ids: Vec::new(),
+                group_path: Vec::new(),
+                width: 1,
+                height: 1,
+                pixels: &[1, 2, 3, 255],
+                opacity: None,
+                blend_mode: None,
+                metadata_locked: false,
+                feature_identity: Some(FeatureIdentity {
+                    container_id,
+                    member_path: vec!["body".to_string()],
+                }),
+                feature_display_name: None,
+            }),
+            frame_index,
+            source_order: source_layer_id as usize,
+            x: 0,
+            y: 0,
+        }
+    }
+
+    let frame_count = 18;
+    let mut tracks = Vec::new();
+    let mut next_source_id = 1;
+    for (frame, container_id) in [(0, 10), (6, 11), (12, 12)] {
+        let observation = feature_observation(frame, next_source_id, container_id);
+        next_source_id += 1;
+        let mut track = new_track(tracks.len(), &observation, frame_count);
+        record_assignment(
+            &mut track,
+            &observation,
+            PlannedCel {
+                source_layer_id: observation.source_layer_id,
+                source_frame_index: frame as u32,
+                z_index: 0,
+            },
+        );
+        tracks.push(track);
+    }
+    let mut full_track = new_track(
+        tracks.len(),
+        &feature_observation(0, next_source_id, 99),
+        frame_count,
+    );
+    for frame in 0..frame_count {
+        let observation = feature_observation(frame, next_source_id, 99);
+        record_assignment(
+            &mut full_track,
+            &observation,
+            PlannedCel {
+                source_layer_id: observation.source_layer_id,
+                source_frame_index: frame as u32,
+                z_index: 0,
+            },
+        );
+    }
+    tracks.push(full_track);
+
+    let mut decisions = Vec::new();
+    let diagnostics = merge_feature_tracks(&mut tracks, &mut decisions);
+
+    assert_eq!(tracks.len(), 2);
+    assert!(
+        tracks
+            .iter()
+            .any(|track| { track.cels.iter().filter(|cel| cel.is_some()).count() == 3 })
+    );
+    assert!(
+        tracks
+            .iter()
+            .any(|track| { track.cels.iter().filter(|cel| cel.is_some()).count() == frame_count })
+    );
+    assert_eq!(diagnostics.merges.len(), 2);
+    assert!(
+        diagnostics
+            .rejections
+            .iter()
+            .any(|reason| reason.contains("frame-occupancy-conflict"))
+    );
+    let second_pass = merge_feature_tracks(&mut tracks, &mut decisions);
+    assert!(second_pass.merges.is_empty());
+}
+
+#[test]
+fn feature_strategy_keeps_co_visible_same_name_features_separate() {
+    let first = pixel(1, "effect", 0, [1, 2, 3, 255]);
+    let second = pixel(2, "effect", 1, [4, 5, 6, 255]);
+    let plan = super::build_layer_write_plan_with_context(
+        &document(vec![first, second]),
+        AutoAssociationOptions {
+            strategy: AssociationStrategy::Feature,
+            ..AutoAssociationOptions::default()
+        },
+        false,
+        true,
+    )
+    .expect("co-visible features should be retained as separate tracks");
+
+    assert_eq!(plan.report.observation_count, 2);
+    assert_eq!(plan.report.track_count, 2);
+    assert_eq!(
+        plan.tracks
+            .iter()
+            .flat_map(|track| track.cels.iter())
+            .filter(|cel| cel.is_some())
+            .count(),
+        plan.report.observation_count
+    );
+}
+
+#[test]
+fn feature_strategy_does_not_merge_same_name_features_from_different_paths() {
+    let mut first_child = pixel(3, "effect", 0, [1, 2, 3, 255]);
+    first_child.frame_states.push(second_frame_state(false));
+    let first = selector_group(1, persistent_group(2, "Body", first_child));
+    let mut second_child = pixel(6, "effect", 0, [4, 5, 6, 255]);
+    second_child.frame_states[0].enabled = false;
+    second_child.frame_states.push(second_frame_state(true));
+    let second = selector_group(4, persistent_group(5, "Effects", second_child));
+    let plan = super::build_layer_write_plan_with_context(
+        &two_frame_document(vec![first, second]),
+        AutoAssociationOptions {
+            strategy: AssociationStrategy::Feature,
+            ..AutoAssociationOptions::default()
+        },
+        false,
+        true,
+    )
+    .expect("different feature paths should remain representable");
+
+    assert_eq!(plan.report.observation_count, 2);
+    assert_eq!(plan.report.track_count, 2);
+    assert!(
+        plan.report
+            .track_merge_rejection_diagnostics
+            .iter()
+            .any(|reason| reason.contains("ordinary-group-boundary"))
+    );
+}
+
+#[test]
+fn feature_strategy_does_not_merge_generic_names_without_pixel_evidence() {
+    let mut first_child = pixel(2, "图层 1", 0, [1, 2, 3, 255]);
+    first_child.frame_states.push(second_frame_state(false));
+    let first = selector_group(1, first_child);
+    let mut second_child = pixel(4, "图层 1", 0, [4, 5, 6, 255]);
+    second_child.frame_states[0].enabled = false;
+    second_child.frame_states.push(second_frame_state(true));
+    let second = selector_group(3, second_child);
+    let plan = super::build_layer_write_plan_with_context(
+        &two_frame_document(vec![first, second]),
+        AutoAssociationOptions {
+            strategy: AssociationStrategy::Feature,
+            ..AutoAssociationOptions::default()
+        },
+        false,
+        true,
+    )
+    .expect("generic feature names should remain representable");
+
+    assert_eq!(plan.report.observation_count, 2);
+    assert_eq!(plan.report.track_count, 2);
 }
 
 #[test]
@@ -76,6 +895,148 @@ fn metadata_preservation_isolates_only_layers_with_reference_points() {
     )
     .expect("ordinary association should succeed");
     assert_eq!(merged.tracks.len(), 1);
+}
+
+#[test]
+fn automatic_association_keeps_cels_below_hidden_animation_container() {
+    let mut first = pixel(2, "first", 0, [1, 2, 3, 255]);
+    first.frame_states.push(second_frame_state(false));
+
+    let mut second = pixel(3, "second", 1, [4, 5, 6, 255]);
+    second.frame_states[0].enabled = false;
+    second.frame_states.push(second_frame_state(true));
+
+    let container = NormalizedLayer {
+        id: 1,
+        name: "animation container".to_string(),
+        kind: NormalizedLayerKind::Group,
+        bounds: NormalizedBounds {
+            left: 0,
+            top: 0,
+            right: 2,
+            bottom: 1,
+        },
+        opacity: None,
+        blend_mode: Some("pass through".to_string()),
+        hidden: Some(true),
+        pixels: None,
+        children: vec![first, second],
+        frame_states: vec![
+            NormalizedLayerFrameState {
+                frame_index: 0,
+                record_present: true,
+                enabled: false,
+                explicit_enable: true,
+                offset: None,
+                reference_point: None,
+                opacity: None,
+            },
+            NormalizedLayerFrameState {
+                frame_index: 1,
+                record_present: true,
+                enabled: false,
+                explicit_enable: true,
+                offset: None,
+                reference_point: None,
+                opacity: None,
+            },
+        ],
+    };
+
+    let plan = build_layer_write_plan(&two_frame_document(vec![container]))
+        .expect("hidden animation container should not suppress child observations");
+    assert_eq!(plan.report.observation_count, 2);
+    assert_eq!(
+        plan.tracks
+            .iter()
+            .flat_map(|track| track.cels.iter())
+            .filter(|cel| cel.is_some())
+            .count(),
+        plan.report.observation_count
+    );
+    assert!(plan.report.omitted_source_layer_ids.is_empty());
+}
+
+#[test]
+fn automatic_association_keeps_ordinary_hidden_groups_hidden() {
+    let mut child = pixel(2, "hidden child", 0, [1, 2, 3, 255]);
+    child.frame_states[0].enabled = true;
+    let hidden_group = NormalizedLayer {
+        id: 1,
+        name: "ordinary hidden group".to_string(),
+        kind: NormalizedLayerKind::Group,
+        bounds: child.bounds,
+        opacity: None,
+        blend_mode: Some("pass through".to_string()),
+        hidden: Some(true),
+        pixels: None,
+        children: vec![child],
+        frame_states: vec![NormalizedLayerFrameState {
+            frame_index: 0,
+            record_present: false,
+            enabled: false,
+            explicit_enable: false,
+            offset: None,
+            reference_point: None,
+            opacity: None,
+        }],
+    };
+
+    let error = build_layer_write_plan(&document(vec![hidden_group]))
+        .expect_err("ordinary hidden group should suppress its child");
+    assert!(error.contains("no effective visible pixel layers"));
+}
+
+#[test]
+fn selector_detection_uses_hidden_animation_container_activity() {
+    fn hidden_container(id: u32, child_id: u32, active_frames: &[usize]) -> NormalizedLayer {
+        let mut child = pixel(child_id, "frame content", 0, [1, 2, 3, 255]);
+        child.frame_states[0].enabled = active_frames.contains(&0);
+        for frame_index in 1..4 {
+            child.frame_states.push(NormalizedLayerFrameState {
+                frame_index,
+                record_present: true,
+                enabled: active_frames.contains(&(frame_index as usize)),
+                explicit_enable: true,
+                offset: None,
+                reference_point: None,
+                opacity: None,
+            });
+        }
+        NormalizedLayer {
+            id,
+            name: format!("container {id}"),
+            kind: NormalizedLayerKind::Group,
+            bounds: child.bounds,
+            opacity: None,
+            blend_mode: Some("pass through".to_string()),
+            hidden: Some(true),
+            pixels: None,
+            children: vec![child],
+            frame_states: (0..4)
+                .map(|frame_index| NormalizedLayerFrameState {
+                    frame_index,
+                    record_present: true,
+                    enabled: false,
+                    explicit_enable: true,
+                    offset: None,
+                    reference_point: None,
+                    opacity: None,
+                })
+                .collect(),
+        }
+    }
+
+    let selectors = super::observation::find_frame_selector_groups(
+        &[
+            hidden_container(1, 2, &[0, 1]),
+            hidden_container(3, 4, &[2, 3]),
+        ],
+        4,
+    );
+    assert_eq!(selectors.len(), 2);
+    assert_eq!(selectors[&1].active_frames, HashSet::from([0, 1]));
+    assert_eq!(selectors[&3].active_frames, HashSet::from([2, 3]));
 }
 use crate::{NormalizedBounds, NormalizedFrame, NormalizedLayerFrameState, NormalizedPixels};
 
@@ -136,6 +1097,74 @@ fn second_frame_state(enabled: bool) -> NormalizedLayerFrameState {
         offset: None,
         reference_point: None,
         opacity: None,
+    }
+}
+
+fn selector_group(id: u32, child: NormalizedLayer) -> NormalizedLayer {
+    NormalizedLayer {
+        id,
+        name: format!("Frame {id}"),
+        kind: NormalizedLayerKind::Group,
+        bounds: child.bounds,
+        opacity: None,
+        blend_mode: Some("pass through".to_string()),
+        hidden: Some(false),
+        pixels: None,
+        children: vec![child],
+        frame_states: vec![
+            NormalizedLayerFrameState {
+                frame_index: 0,
+                record_present: true,
+                enabled: true,
+                explicit_enable: true,
+                offset: None,
+                reference_point: None,
+                opacity: None,
+            },
+            NormalizedLayerFrameState {
+                frame_index: 1,
+                record_present: true,
+                enabled: true,
+                explicit_enable: true,
+                offset: None,
+                reference_point: None,
+                opacity: None,
+            },
+        ],
+    }
+}
+
+fn persistent_group(id: u32, name: &str, child: NormalizedLayer) -> NormalizedLayer {
+    NormalizedLayer {
+        id,
+        name: name.to_string(),
+        kind: NormalizedLayerKind::Group,
+        bounds: child.bounds,
+        opacity: None,
+        blend_mode: Some("pass through".to_string()),
+        hidden: Some(false),
+        pixels: None,
+        children: vec![child],
+        frame_states: vec![
+            NormalizedLayerFrameState {
+                frame_index: 0,
+                record_present: true,
+                enabled: true,
+                explicit_enable: true,
+                offset: None,
+                reference_point: None,
+                opacity: None,
+            },
+            NormalizedLayerFrameState {
+                frame_index: 1,
+                record_present: true,
+                enabled: true,
+                explicit_enable: true,
+                offset: None,
+                reference_point: None,
+                opacity: None,
+            },
+        ],
     }
 }
 
@@ -1107,7 +2136,11 @@ fn overlapping_observation(
             width: 1,
             height: 1,
             pixels: &[1, 2, 3, 255],
+            opacity: None,
+            blend_mode: None,
             metadata_locked: false,
+            feature_identity: None,
+            feature_display_name: None,
         }),
         frame_index,
         source_order,
@@ -1171,6 +2204,7 @@ fn consensus_prefers_repeated_overlapping_order() {
         &decisions,
         &[0, 1],
         StableOrderMode::Consensus,
+        false,
     )
     .expect("repeated order should be accepted");
     assert_eq!(order, vec![1, 0]);

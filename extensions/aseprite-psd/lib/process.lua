@@ -168,12 +168,16 @@ function Process.new(plugin)
       table.insert(arguments, "--layer-association")
       table.insert(arguments, "auto")
       table.insert(arguments, "--association-strategy")
-      table.insert(arguments, options.association_strategy)
+      local association_strategy = options.association_strategy
+      if association_strategy == "Feature tracks" then
+        association_strategy = "feature"
+      end
+      table.insert(arguments, association_strategy)
       table.insert(arguments, "--z-order")
       table.insert(arguments, options.z_order)
       table.insert(arguments, "--stable-order")
       table.insert(arguments, options.stable_order)
-      if options.association_strategy == "conservative" then
+      if association_strategy == "conservative" then
         table.insert(arguments, "--uncertain-layers")
         table.insert(arguments, options.uncertain_layers)
       end

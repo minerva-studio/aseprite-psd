@@ -1,22 +1,17 @@
 //! PSD/PSB writer and read-back validator for normalized Aseprite exports.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 
-use ag_psd::descriptor::{
-    Descriptor, DescriptorValue, UnitDoubleValue, read_version_and_descriptor,
-    write_version_and_descriptor,
-};
+use ag_psd::frame_animation::{LayerFrameTrack, replace_frame_animation, validate_frame_animation};
 use ag_psd::psd::{
-    AnimationDispose, AnimationFrame, AnimationFrameFlags, AnimationFrameInfo, AnimationInfo,
-    Animations, BlendMode, ColorMode, Compression, ImageResources, Layer, LayerAdditionalInfo,
-    PixelData, PointF, Psd, ReadOptions, SectionDividerType, WriteOptions,
+    AnimationDispose, AnimationFrame, AnimationFrameInfo, AnimationInfo, Animations, BlendMode,
+    ColorMode, Compression, ImageResources, Layer, LayerAdditionalInfo, PixelData, PointF, Psd,
+    ReadOptions, SectionDividerType, WriteOptions,
 };
-use ag_psd::reader::PsdReader;
 use ag_psd::writer::{
-    PsdWriter, create_writer_default, get_writer_buffer, write_bytes, write_section,
-    write_signature, write_uint8, write_uint16, write_uint32, write_zeros,
+    create_writer_default, get_writer_buffer, write_bytes, write_section, write_signature,
 };
 
 use crate::aseprite_reader::{
@@ -155,7 +150,7 @@ pub fn export(
         }
     };
 
-    let source =
+    let mut source =
         read_aseprite_export_with_active_frame(input, composite, options.active_frame_index)?;
     let mut information_loss = source.information_loss;
     if !options.include_empty_layers {
@@ -163,28 +158,33 @@ pub fn export(
             .entries
             .retain(|entry| entry.code != crate::InformationLossCode::EmptyPixelLayer);
     }
-    let (model, metadata, frame_first) = if let Some(snapshots) = source.frame_snapshots.as_deref()
+    let (model, metadata, frame_first) = if let Some(snapshots) = source
+        .frame_snapshots
+        .as_deref()
+        .filter(|snapshots| snapshots.len() > 1)
     {
-        let snapshots = if options.include_empty_layers {
-            snapshots.to_vec()
-        } else {
-            omit_empty_pixel_layers(snapshots)
-        };
-        let (model, metadata) = build_frame_first_psd(
+        build_frame_first_psd(
             &source.document,
-            &snapshots,
+            snapshots,
             &source.composites,
             &mut information_loss,
             options.embed_roundtrip_metadata,
-        )?;
-        (model, metadata, true)
+            options.include_empty_layers,
+        )?
     } else {
-        (
-            build_psd(&source.document, &source.composites, &mut information_loss)?,
-            animation_metadata(&source.document, options.embed_roundtrip_metadata),
-            false,
-        )
+        if !options.include_empty_layers {
+            omit_empty_pixel_layers(&mut source.document.root_layers);
+        }
+        let (model, _frame_ids) =
+            build_psd(&source.document, &source.composites, &mut information_loss)?;
+        let metadata = animation_metadata(&source.document, options.embed_roundtrip_metadata)?;
+        (model, metadata, false)
     };
+    validate_frame_animation(&model).map_err(|error| {
+        ExportError::Writer(format!(
+            "generated frame animation failed validation: {error}"
+        ))
+    })?;
     let compression = options.compression.unwrap_or_default();
     let write_options = WriteOptions {
         no_background: Some(true),
@@ -197,10 +197,7 @@ pub fn export(
         ag_psd::write_psd(&model, &write_options)
     }))
     .map_err(|_| ExportError::Writer("ag-psd panicked while encoding the document".to_string()))?;
-    let mut encoded = inject_animation_metadata(encoded, &metadata, psb)?;
-    if options.active_frame_index.is_none() {
-        encoded = omit_active_frame_descriptor(encoded)?;
-    }
+    let encoded = inject_roundtrip_metadata(encoded, &metadata, psb)?;
     validate_output(
         &encoded,
         &source.document,
@@ -220,70 +217,120 @@ pub fn export(
     })
 }
 
-/// Removes pixel layers that have no cel in any exported frame while preserving frame topology.
-fn omit_empty_pixel_layers(snapshots: &[FrameSnapshot]) -> Vec<FrameSnapshot> {
-    let non_empty_ids = snapshots
-        .iter()
-        .flat_map(|snapshot| snapshot.layers.iter())
-        .flat_map(collect_non_empty_layer_ids)
-        .collect::<HashSet<_>>();
-    snapshots
-        .iter()
-        .map(|snapshot| FrameSnapshot {
-            layers: snapshot
-                .layers
-                .iter()
-                .filter_map(|layer| filter_empty_pixel_layer(layer, &non_empty_ids))
-                .collect(),
-        })
+/// Removes pixel layers with no enabled cel while preserving all groups and populated siblings.
+fn omit_empty_pixel_layers(layers: &mut Vec<NormalizedLayer>) {
+    for layer in layers.iter_mut() {
+        omit_empty_pixel_layers(&mut layer.children);
+    }
+    layers.retain(|layer| {
+        layer.kind != NormalizedLayerKind::Pixel
+            || layer.frame_states.iter().any(|state| state.enabled)
+    });
+}
+
+/// Retains only frame-local layers that have a cel, pruning empty group branches.
+///
+/// Frame snapshots are materialized independently for each playback frame. A pixel layer
+/// without a cel in the current snapshot must not become a synthetic 1x1 PSD layer when the
+/// caller selected the default omit-empty policy.
+fn filter_frame_snapshot_layers(
+    layers: &[FrameSnapshotLayer],
+    include_empty_layers: bool,
+) -> Vec<FrameSnapshotLayer> {
+    if include_empty_layers {
+        return layers.to_vec();
+    }
+
+    struct Node<'a> {
+        source: &'a FrameSnapshotLayer,
+        children: Vec<usize>,
+    }
+
+    let mut nodes = Vec::new();
+    let mut roots = Vec::with_capacity(layers.len());
+    for source in layers {
+        roots.push(nodes.len());
+        nodes.push(Node {
+            source,
+            children: Vec::new(),
+        });
+    }
+
+    let mut pending = roots.clone();
+    while let Some(index) = pending.pop() {
+        if nodes[index].source.kind != NormalizedLayerKind::Group {
+            continue;
+        }
+        let child_sources = nodes[index].source.children.iter().collect::<Vec<_>>();
+        let mut children = Vec::with_capacity(child_sources.len());
+        for source in child_sources {
+            let child = nodes.len();
+            nodes.push(Node {
+                source,
+                children: Vec::new(),
+            });
+            children.push(child);
+        }
+        nodes[index].children = children.clone();
+        pending.extend(children.into_iter().rev());
+    }
+
+    let mut built = (0..nodes.len())
+        .map(|_| None)
+        .collect::<Vec<Option<FrameSnapshotLayer>>>();
+    for index in (0..nodes.len()).rev() {
+        let node = &nodes[index];
+        built[index] = match node.source.kind {
+            NormalizedLayerKind::Pixel => node.source.cel.is_some().then(|| node.source.clone()),
+            NormalizedLayerKind::Group => {
+                let children = node
+                    .children
+                    .iter()
+                    .filter_map(|child| built[*child].take())
+                    .collect::<Vec<_>>();
+                (!children.is_empty()).then(|| {
+                    let mut retained = node.source.clone();
+                    retained.children = children;
+                    retained
+                })
+            }
+        };
+    }
+
+    roots
+        .into_iter()
+        .filter_map(|index| built[index].take())
         .collect()
 }
 
-/// Collects source IDs for pixel layers that contain at least one cel.
-fn collect_non_empty_layer_ids(layer: &FrameSnapshotLayer) -> Vec<u32> {
-    let mut ids = layer
-        .cel
-        .as_ref()
-        .map(|_| vec![layer.source_layer_id])
-        .unwrap_or_default();
-    for child in &layer.children {
-        ids.extend(collect_non_empty_layer_ids(child));
-    }
-    ids
-}
-
-/// Filters one frame snapshot without removing groups or frame-local empty placeholders.
-fn filter_empty_pixel_layer(
-    layer: &FrameSnapshotLayer,
-    non_empty_ids: &HashSet<u32>,
-) -> Option<FrameSnapshotLayer> {
-    if layer.kind == NormalizedLayerKind::Pixel && !non_empty_ids.contains(&layer.source_layer_id) {
-        return None;
-    }
-    Some(FrameSnapshotLayer {
-        children: layer
-            .children
-            .iter()
-            .filter_map(|child| filter_empty_pixel_layer(child, non_empty_ids))
-            .collect(),
-        ..layer.clone()
-    })
-}
-
-/// Builds a PSD whose root layers are one complete snapshot group per playback frame.
+/// Builds a PSD whose top-level groups are the editable Aseprite playback frames.
+///
+/// Frame folders are deliberately retained: they are the user-visible animation model
+/// for ordinary Aseprite documents and must not be replaced with one static hierarchy.
 fn build_frame_first_psd(
     document: &NormalizedDocument,
     snapshots: &[FrameSnapshot],
     composites: &[Vec<u8>],
     report: &mut InformationLossReport,
     embed_roundtrip_metadata: bool,
-) -> Result<(Psd, HashMap<u32, LayerAnimationMetadata>), ExportError> {
+    include_empty_layers: bool,
+) -> Result<(Psd, HashMap<u32, LayerMarker>, bool), ExportError> {
     if snapshots.len() != document.frames.len() || snapshots.is_empty() {
         return Err(ExportError::Writer(
             "frame snapshot count differs from normalized document".to_string(),
         ));
     }
-    let expected = document.canvas.0 as usize * document.canvas.1 as usize * 4;
+    let expected = usize::try_from(document.canvas.0)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(document.canvas.1)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|area| area.checked_mul(4))
+        .ok_or_else(|| {
+            ExportError::Writer("composite dimensions exceed memory limits".to_string())
+        })?;
     if composites
         .iter()
         .any(|composite| composite.len() != expected)
@@ -292,18 +339,39 @@ fn build_frame_first_psd(
             "composite pixel size differs from normalized document".to_string(),
         ));
     }
-    let active_frame = document.active_frame_index.unwrap_or(0) as usize;
+    let active_frame = usize::try_from(document.active_frame_index.unwrap_or(0)).map_err(|_| {
+        ExportError::Writer("active frame index exceeds platform limits".to_string())
+    })?;
     if active_frame >= snapshots.len() {
         return Err(ExportError::Writer(
             "active frame index is outside the frame snapshots".to_string(),
         ));
     }
-    let frame_ids = document
-        .frames
+    let filtered_layers = snapshots
         .iter()
-        .enumerate()
-        .map(|(index, frame)| f64::from(frame.source_id.unwrap_or((index + 1) as u32)))
+        .map(|snapshot| filter_frame_snapshot_layers(&snapshot.layers, include_empty_layers))
         .collect::<Vec<_>>();
+    let mut physical_layer_count = snapshots.len();
+    for layers in &filtered_layers {
+        physical_layer_count = physical_layer_count
+            .checked_add(count_frame_snapshot_layers(layers)?)
+            .ok_or_else(|| ExportError::Writer("PSD layer count exceeds ID limits".to_string()))?;
+    }
+    let first_frame_id = u32::try_from(physical_layer_count)
+        .map_err(|_| ExportError::Writer("PSD layer count exceeds ID limits".to_string()))?
+        .checked_add(1)
+        .ok_or_else(|| ExportError::Writer("frame ID allocation overflow".to_string()))?;
+    let frame_ids = (0..snapshots.len())
+        .map(|index| {
+            let index = u32::try_from(index).map_err(|_| {
+                ExportError::Writer("frame count exceeds PSD ID limits".to_string())
+            })?;
+            first_frame_id
+                .checked_add(index)
+                .map(f64::from)
+                .ok_or_else(|| ExportError::Writer("frame ID allocation overflow".to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let frames = document
         .frames
         .iter()
@@ -317,57 +385,44 @@ fn build_frame_first_psd(
                 _ => AnimationDispose::Auto,
             }),
         })
-        .collect();
+        .collect::<Vec<_>>();
     let repeats = match document.loop_mode {
         Some(NormalizedLoopMode::Infinite) | None => Some(0.0),
         Some(NormalizedLoopMode::Finite(value)) => Some(f64::from(value)),
     };
-    let active_frame_id = document.active_frame_index.map(f64::from);
     let mut next_id = 1_u32;
     let mut metadata = HashMap::new();
+    let mut layer_availability = HashMap::new();
     let mut children = Vec::with_capacity(snapshots.len());
-    for (frame_index, snapshot) in snapshots.iter().enumerate() {
-        let id = take_export_id(&mut next_id);
-        let frame_states = (0..snapshots.len())
-            .map(|index| AnimationFrame {
-                frames: vec![f64::from(index as u32 + 1)],
-                enable: Some(index == frame_index),
-                offset: None,
-                reference_point: None,
-                opacity: None,
-                effects: None,
-            })
-            .collect::<Vec<_>>();
-        metadata.insert(
-            id,
-            LayerAnimationMetadata {
-                frames: frame_states,
-                flags: default_animation_flags(),
-                marker: embed_roundtrip_metadata.then_some(LayerMarker {
+    for (frame_index, _snapshot) in snapshots.iter().enumerate() {
+        let id = take_export_id(&mut next_id)?;
+        layer_availability.insert(id, true);
+        if embed_roundtrip_metadata {
+            metadata.insert(
+                id,
+                LayerMarker {
                     version: 2,
                     role: MarkerRole::FrameGroup,
-                    logical_layer_id: 0xFFFF_FFFF,
-                    variant_index: frame_index as u32 + 1,
-                    variant_count: snapshots.len() as u32,
-                }),
-            },
-        );
-        let layers = snapshot
-            .layers
-            .iter()
-            .map(|layer| {
-                build_frame_snapshot_layer(
-                    layer,
-                    frame_index,
-                    snapshots.len(),
-                    &mut next_id,
-                    report,
-                    &mut metadata,
-                    embed_roundtrip_metadata,
-                    String::new(),
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+                    logical_layer_id: u32::MAX,
+                    variant_index: u32::try_from(frame_index + 1).map_err(|_| {
+                        ExportError::Writer("frame count exceeds PSD ID limits".to_string())
+                    })?,
+                    variant_count: u32::try_from(snapshots.len()).map_err(|_| {
+                        ExportError::Writer("frame count exceeds PSD ID limits".to_string())
+                    })?,
+                },
+            );
+        }
+        let layers = build_frame_snapshot_layers(
+            &filtered_layers[frame_index],
+            frame_index,
+            snapshots.len(),
+            &mut next_id,
+            report,
+            &mut metadata,
+            &mut layer_availability,
+            embed_roundtrip_metadata,
+        )?;
         children.push(Layer {
             additional_info: LayerAdditionalInfo {
                 name: Some(format!("Frame {}", frame_index + 1)),
@@ -376,43 +431,313 @@ fn build_frame_first_psd(
             },
             children: Some(layers),
             opened: Some(true),
-            hidden: Some(frame_index != active_frame),
+            // Frame-folder visibility is static layer presentation, not the per-frame
+            // animation state. Keep every frame folder visible so Photoshop can apply
+            // the corresponding mlst entry when the timeline changes frames.
+            hidden: Some(false),
             blend_mode: Some(BlendMode::Normal),
             ..Default::default()
         });
     }
-    Ok((
-        Psd {
-            width: f64::from(document.canvas.0),
-            height: f64::from(document.canvas.1),
-            channels: Some(4.0),
-            bits_per_channel: Some(8.0),
-            color_mode: Some(ColorMode::Rgb),
-            children: Some(children),
-            image_data: Some(PixelData {
-                width: document.canvas.0,
-                height: document.canvas.1,
-                data: composites[active_frame].clone(),
-            }),
-            image_resources: Some(ImageResources {
-                animations: Some(Animations {
-                    frames,
-                    animations: vec![AnimationInfo {
-                        id: 1.0,
-                        frames: frame_ids,
-                        repeats,
-                        active_frame: active_frame_id,
-                    }],
-                }),
-                ..Default::default()
+    let mut model = Psd {
+        width: f64::from(document.canvas.0),
+        height: f64::from(document.canvas.1),
+        channels: Some(4.0),
+        bits_per_channel: Some(8.0),
+        color_mode: Some(ColorMode::Rgb),
+        children: Some(children),
+        image_data: Some(PixelData {
+            width: document.canvas.0,
+            height: document.canvas.1,
+            data: composites[active_frame].clone(),
+        }),
+        image_resources: Some(ImageResources {
+            ids_seed_number: Some(f64::from(next_id.saturating_sub(1))),
+            animations: Some(Animations {
+                frames,
+                animations: vec![AnimationInfo {
+                    id: 0.0,
+                    frames: frame_ids.clone(),
+                    repeats,
+                    active_frame: document.active_frame_index.map(f64::from),
+                }],
             }),
             ..Default::default()
-        },
-        metadata,
-    ))
+        }),
+        ..Default::default()
+    };
+    let animations = model
+        .image_resources
+        .as_mut()
+        .and_then(|resources| resources.animations.take())
+        .ok_or_else(|| {
+            ExportError::Writer("frame animation directory was not created".to_string())
+        })?;
+    let tracks = collect_generated_frame_tracks(&model, &frame_ids, &layer_availability)?;
+    replace_frame_animation(&mut model, animations, tracks.clone()).map_err(|error| {
+        ExportError::Writer(format!("invalid generated frame animation: {error}"))
+    })?;
+    apply_static_visibility_from_tracks(&mut model, &tracks)?;
+    Ok((model, metadata, true))
 }
 
-/// Builds one frame-local layer while allocating a unique PSD layer id.
+/// Counts physical layer records in a frame snapshot without recursing through user depth.
+fn count_frame_snapshot_layers(roots: &[FrameSnapshotLayer]) -> Result<usize, ExportError> {
+    let mut count = 0_usize;
+    let mut stack = roots.iter().collect::<Vec<_>>();
+    while let Some(layer) = stack.pop() {
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| ExportError::Writer("PSD layer count exceeds ID limits".to_string()))?;
+        stack.extend(layer.children.iter());
+        if layer.kind == NormalizedLayerKind::Group {
+            count = count.checked_add(1).ok_or_else(|| {
+                ExportError::Writer("PSD layer count exceeds ID limits".to_string())
+            })?;
+        }
+    }
+    Ok(count)
+}
+
+/// Creates one typed Photoshop frame track for every generated physical record.
+fn collect_generated_frame_tracks(
+    psd: &Psd,
+    frame_ids: &[f64],
+    layer_availability: &HashMap<u32, bool>,
+) -> Result<Vec<LayerFrameTrack>, ExportError> {
+    let mut tracks = Vec::new();
+    let mut stack = psd
+        .children
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .map(|(index, layer)| (layer, index))
+        .collect::<Vec<_>>();
+    while let Some((layer, owner_frame)) = stack.pop() {
+        let layer_id = layer
+            .additional_info
+            .id
+            .and_then(exact_export_id)
+            .ok_or_else(|| ExportError::Writer("generated layer has no valid id".to_string()))?;
+        let enabled = *layer_availability.get(&layer_id).ok_or_else(|| {
+            ExportError::Writer(format!(
+                "generated layer {layer_id} has no availability state"
+            ))
+        })?;
+        let states = frame_ids
+            .iter()
+            .enumerate()
+            .map(|(index, frame_id)| AnimationFrame {
+                frames: vec![*frame_id],
+                enable: Some(enabled && index == owner_frame),
+                offset: None,
+                reference_point: None,
+                opacity: None,
+                effects: None,
+            })
+            .collect();
+        tracks.push(LayerFrameTrack {
+            layer_id,
+            states,
+            flags: None,
+        });
+        if let Some(divider) = layer.bounding_divider_additional_info.as_ref() {
+            let divider_id = divider.id.and_then(exact_export_id).ok_or_else(|| {
+                ExportError::Writer("generated divider has no valid id".to_string())
+            })?;
+            let divider_enabled = *layer_availability.get(&divider_id).ok_or_else(|| {
+                ExportError::Writer(format!(
+                    "generated divider {divider_id} has no availability state"
+                ))
+            })?;
+            tracks.push(LayerFrameTrack {
+                layer_id: divider_id,
+                states: frame_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(index, frame_id)| AnimationFrame {
+                        frames: vec![*frame_id],
+                        enable: Some(divider_enabled && index == owner_frame),
+                        offset: None,
+                        reference_point: None,
+                        opacity: None,
+                        effects: None,
+                    })
+                    .collect(),
+                flags: None,
+            });
+        }
+        stack.extend(
+            layer
+                .children
+                .iter()
+                .flatten()
+                .map(|child| (child, owner_frame)),
+        );
+    }
+    Ok(tracks)
+}
+
+/// Applies the first typed frame state as Photoshop's static visibility baseline.
+fn apply_static_visibility_from_tracks(
+    psd: &mut Psd,
+    tracks: &[LayerFrameTrack],
+) -> Result<(), ExportError> {
+    let initial_visibility = tracks
+        .iter()
+        .map(|track| {
+            let enabled = track
+                .states
+                .first()
+                .and_then(|state| state.enable)
+                .ok_or_else(|| {
+                    ExportError::Writer(format!(
+                        "generated animation track {} has no explicit first-frame state",
+                        track.layer_id
+                    ))
+                })?;
+            Ok::<_, ExportError>((track.layer_id, enabled))
+        })
+        .collect::<Result<HashMap<_, _>, _>>()?;
+
+    let mut paths = Vec::new();
+    if let Some(children) = psd.children.as_deref() {
+        paths.extend((0..children.len()).map(|index| vec![index]));
+    }
+    while let Some(path) = paths.pop() {
+        let layer = layer_at_path_mut(psd.children.as_mut(), &path)?;
+        let layer_id = layer
+            .additional_info
+            .id
+            .and_then(exact_export_id)
+            .ok_or_else(|| ExportError::Writer("generated layer has no valid id".to_string()))?;
+        let enabled = initial_visibility.get(&layer_id).copied().ok_or_else(|| {
+            ExportError::Writer(format!("generated layer {layer_id} has no animation track"))
+        })?;
+        layer.hidden = Some(!enabled);
+        let child_count = layer.children.as_ref().map_or(0, Vec::len);
+        paths.extend((0..child_count).map(|index| {
+            let mut child_path = path.clone();
+            child_path.push(index);
+            child_path
+        }));
+    }
+    Ok(())
+}
+
+/// Resolves one generated layer by an index path without recursive traversal.
+fn layer_at_path_mut<'a>(
+    roots: Option<&'a mut Vec<Layer>>,
+    path: &[usize],
+) -> Result<&'a mut Layer, ExportError> {
+    let layers = roots.ok_or_else(|| ExportError::Writer("PSD has no layer roots".to_string()))?;
+    let first = *path
+        .first()
+        .ok_or_else(|| ExportError::Writer("generated layer path is empty".to_string()))?;
+    let mut layer = layers
+        .get_mut(first)
+        .ok_or_else(|| ExportError::Writer("generated layer path is invalid".to_string()))?;
+    for index in &path[1..] {
+        layer = layer
+            .children
+            .as_mut()
+            .and_then(|children| children.get_mut(*index))
+            .ok_or_else(|| ExportError::Writer("generated layer path is invalid".to_string()))?;
+    }
+    Ok(layer)
+}
+
+fn exact_export_id(value: f64) -> Option<u32> {
+    (value.is_finite() && value > 0.0 && value.fract() == 0.0 && value <= u32::MAX as f64)
+        .then_some(value as u32)
+}
+
+/// Builds each frame folder's nested layers bottom-up without recursing through user depth.
+#[allow(clippy::too_many_arguments)]
+fn build_frame_snapshot_layers(
+    roots: &[FrameSnapshotLayer],
+    frame_index: usize,
+    frame_count: usize,
+    next_id: &mut u32,
+    report: &mut InformationLossReport,
+    metadata: &mut HashMap<u32, LayerMarker>,
+    layer_availability: &mut HashMap<u32, bool>,
+    embed_roundtrip_metadata: bool,
+) -> Result<Vec<Layer>, ExportError> {
+    struct Node<'a> {
+        source: &'a FrameSnapshotLayer,
+        path: String,
+        children: Vec<usize>,
+    }
+
+    let mut nodes = Vec::new();
+    let mut root_nodes = Vec::new();
+    for source in roots {
+        root_nodes.push(nodes.len());
+        nodes.push(Node {
+            source,
+            path: source.name.clone(),
+            children: Vec::new(),
+        });
+    }
+    let mut pending = root_nodes.clone();
+    while let Some(parent) = pending.pop() {
+        let parent_path = nodes[parent].path.clone();
+        let mut children = Vec::with_capacity(nodes[parent].source.children.len());
+        for source in &nodes[parent].source.children {
+            let child = nodes.len();
+            nodes.push(Node {
+                source,
+                path: format!("{parent_path}/{}", source.name),
+                children: Vec::new(),
+            });
+            children.push(child);
+        }
+        nodes[parent].children = children.clone();
+        pending.extend(children.into_iter().rev());
+    }
+
+    let mut built = (0..nodes.len())
+        .map(|_| None)
+        .collect::<Vec<Option<Layer>>>();
+    for index in (0..nodes.len()).rev() {
+        let node = &nodes[index];
+        let children = node
+            .children
+            .iter()
+            .map(|child| {
+                built[*child].take().ok_or_else(|| {
+                    ExportError::Writer(
+                        "frame-folder PSD post-order construction failed".to_string(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        built[index] = Some(build_frame_snapshot_layer(
+            node.source,
+            frame_index,
+            frame_count,
+            next_id,
+            report,
+            metadata,
+            layer_availability,
+            embed_roundtrip_metadata,
+            &node.path,
+            children,
+        )?);
+    }
+    root_nodes
+        .into_iter()
+        .map(|index| {
+            built[index].take().ok_or_else(|| {
+                ExportError::Writer("frame-folder PSD root construction failed".to_string())
+            })
+        })
+        .collect()
+}
+
+/// Converts one original Aseprite layer for a specific editable frame folder.
 #[allow(clippy::too_many_arguments)]
 fn build_frame_snapshot_layer(
     source: &FrameSnapshotLayer,
@@ -420,11 +745,13 @@ fn build_frame_snapshot_layer(
     frame_count: usize,
     next_id: &mut u32,
     report: &mut InformationLossReport,
-    metadata: &mut HashMap<u32, LayerAnimationMetadata>,
+    metadata: &mut HashMap<u32, LayerMarker>,
+    layer_availability: &mut HashMap<u32, bool>,
     embed_roundtrip_metadata: bool,
-    parent_path: String,
+    parent_path: &str,
+    children: Vec<Layer>,
 ) -> Result<Layer, ExportError> {
-    let id = take_export_id(next_id);
+    let id = take_export_id(next_id)?;
     let path = if parent_path.is_empty() {
         source.name.clone()
     } else {
@@ -438,14 +765,15 @@ fn build_frame_snapshot_layer(
             crate::InformationLocation {
                 layer_id: Some(source.source_layer_id),
                 path: path.clone(),
-                frame_index: Some(frame_index as u32),
+                frame_index: Some(u32::try_from(frame_index).map_err(|_| {
+                    ExportError::Writer("frame index exceeds PSD limits".to_string())
+                })?),
             },
             "A blend mode that is not supported by the PSD writer was written as Normal",
             true,
             true,
         );
     }
-    let base_opacity = source.opacity.map(|value| f64::from(value) / 255.0);
     let mut layer = Layer {
         additional_info: LayerAdditionalInfo {
             name: Some(source.name.clone()),
@@ -453,35 +781,36 @@ fn build_frame_snapshot_layer(
             ..Default::default()
         },
         blend_mode: Some(blend_mode),
-        opacity: base_opacity,
-        hidden: Some(!source.visible),
+        opacity: source.opacity.map(|value| f64::from(value) / 255.0),
+        hidden: Some(false),
         ..Default::default()
     };
+    let available = match source.kind {
+        NormalizedLayerKind::Group => source.visible,
+        NormalizedLayerKind::Pixel => source.visible && source.cel.is_some(),
+    };
+    layer_availability.insert(id, available);
     match source.kind {
         NormalizedLayerKind::Group => {
             layer.opened = Some(true);
-            layer.children = Some(
-                source
-                    .children
-                    .iter()
-                    .map(|child| {
-                        build_frame_snapshot_layer(
-                            child,
-                            frame_index,
-                            frame_count,
-                            next_id,
-                            report,
-                            metadata,
-                            embed_roundtrip_metadata,
-                            path.clone(),
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
+            layer.children = Some(children);
+            layer.bounding_divider_additional_info = Some(LayerAdditionalInfo {
+                name: Some("</Layer group>".to_string()),
+                id: Some(f64::from(take_export_id(next_id)?)),
+                ..Default::default()
+            });
+            let divider_id = layer
+                .bounding_divider_additional_info
+                .as_ref()
+                .and_then(|info| info.id)
+                .and_then(exact_export_id)
+                .ok_or_else(|| {
+                    ExportError::Writer("generated divider has no valid id".to_string())
+                })?;
+            layer_availability.insert(divider_id, source.visible);
         }
         NormalizedLayerKind::Pixel => {
             let Some(cel) = source.cel.as_ref() else {
-                layer.hidden = Some(true);
                 layer.top = Some(0.0);
                 layer.left = Some(0.0);
                 layer.bottom = Some(1.0);
@@ -491,29 +820,21 @@ fn build_frame_snapshot_layer(
                     height: 1,
                     data: vec![0, 0, 0, 0],
                 });
-                if embed_roundtrip_metadata {
-                    metadata.insert(
-                        id,
-                        LayerAnimationMetadata {
-                            frames: Vec::new(),
-                            flags: default_animation_flags(),
-                            marker: Some(LayerMarker {
-                                version: 2,
-                                role: MarkerRole::LayerCopy,
-                                logical_layer_id: source.source_layer_id,
-                                variant_index: frame_index as u32 + 1,
-                                variant_count: frame_count as u32,
-                            }),
-                        },
-                    );
-                }
+                insert_frame_snapshot_marker(
+                    metadata,
+                    id,
+                    source.source_layer_id,
+                    frame_index,
+                    frame_count,
+                    embed_roundtrip_metadata,
+                )?;
                 return Ok(layer);
             };
             layer.opacity = Some(f64::from(cel.opacity) / 255.0);
             layer.top = Some(f64::from(cel.y));
             layer.left = Some(f64::from(cel.x));
-            layer.bottom = Some(f64::from(cel.y + cel.height as i32));
-            layer.right = Some(f64::from(cel.x + cel.width as i32));
+            layer.bottom = Some(f64::from(cel.y) + f64::from(cel.height));
+            layer.right = Some(f64::from(cel.x) + f64::from(cel.width));
             layer.image_data = Some(PixelData {
                 width: cel.width,
                 height: cel.height,
@@ -521,40 +842,54 @@ fn build_frame_snapshot_layer(
             });
         }
     }
-    if embed_roundtrip_metadata {
-        metadata.insert(
-            id,
-            LayerAnimationMetadata {
-                frames: Vec::new(),
-                flags: default_animation_flags(),
-                marker: Some(LayerMarker {
-                    version: 2,
-                    role: MarkerRole::LayerCopy,
-                    logical_layer_id: source.source_layer_id,
-                    variant_index: frame_index as u32 + 1,
-                    variant_count: frame_count as u32,
-                }),
-            },
-        );
-    }
+    insert_frame_snapshot_marker(
+        metadata,
+        id,
+        source.source_layer_id,
+        frame_index,
+        frame_count,
+        embed_roundtrip_metadata,
+    )?;
     Ok(layer)
 }
 
-/// Allocates a non-zero PSD layer identifier for one exported record.
-fn take_export_id(next_id: &mut u32) -> u32 {
-    let id = *next_id;
-    *next_id = next_id.saturating_add(1);
-    id
+/// Associates one physical frame-local layer with its original Aseprite layer when enabled.
+fn insert_frame_snapshot_marker(
+    metadata: &mut HashMap<u32, LayerMarker>,
+    id: u32,
+    logical_layer_id: u32,
+    frame_index: usize,
+    frame_count: usize,
+    embed_roundtrip_metadata: bool,
+) -> Result<(), ExportError> {
+    let marker = embed_roundtrip_metadata
+        .then(|| {
+            Ok(LayerMarker {
+                version: 2,
+                role: MarkerRole::LayerCopy,
+                logical_layer_id,
+                variant_index: u32::try_from(frame_index + 1).map_err(|_| {
+                    ExportError::Writer("frame count exceeds PSD ID limits".to_string())
+                })?,
+                variant_count: u32::try_from(frame_count).map_err(|_| {
+                    ExportError::Writer("frame count exceeds PSD ID limits".to_string())
+                })?,
+            })
+        })
+        .transpose()?;
+    if let Some(marker) = marker {
+        metadata.insert(id, marker);
+    }
+    Ok(())
 }
 
-/// Returns the animation flag defaults used by frame-group metadata.
-fn default_animation_flags() -> AnimationFrameFlags {
-    AnimationFrameFlags {
-        propagate_frame_one: Some(false),
-        unify_layer_position: Some(false),
-        unify_layer_style: Some(false),
-        unify_layer_visibility: Some(false),
-    }
+/// Allocates a non-zero PSD layer identifier without wrapping.
+fn take_export_id(next_id: &mut u32) -> Result<u32, ExportError> {
+    let id = *next_id;
+    *next_id = next_id
+        .checked_add(1)
+        .ok_or_else(|| ExportError::Writer("PSD layer ID allocation overflow".to_string()))?;
+    Ok(id)
 }
 
 /// Builds the ag-psd document while keeping NormalizedDocument as the sole domain model.
@@ -562,108 +897,238 @@ fn build_psd(
     document: &NormalizedDocument,
     composites: &[Vec<u8>],
     report: &mut InformationLossReport,
-) -> Result<Psd, ExportError> {
-    let composite = composites.first().ok_or_else(|| {
-        ExportError::Writer("normalized export has no composite frames".to_string())
+) -> Result<(Psd, Option<Vec<f64>>), ExportError> {
+    let active_frame = usize::try_from(document.active_frame_index.unwrap_or(0)).map_err(|_| {
+        ExportError::Writer("active frame index exceeds platform limits".to_string())
     })?;
-    let expected = document.canvas.0 as usize * document.canvas.1 as usize * 4;
+    let composite = composites
+        .get(active_frame)
+        .or_else(|| composites.first())
+        .ok_or_else(|| {
+            ExportError::Writer("normalized export has no composite frames".to_string())
+        })?;
+    let expected = usize::try_from(document.canvas.0)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(document.canvas.1)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|area| area.checked_mul(4))
+        .ok_or_else(|| {
+            ExportError::Writer("composite dimensions exceed memory limits".to_string())
+        })?;
     if composite.len() != expected {
         return Err(ExportError::Writer(format!(
             "composite pixel size differs: expected {expected}, got {}",
             composite.len()
         )));
     }
-    let frame_ids = document
-        .frames
-        .iter()
-        .enumerate()
-        .map(|(index, frame)| f64::from(frame.source_id.unwrap_or((index + 1) as u32)))
-        .collect::<Vec<_>>();
-    let frames = document
-        .frames
-        .iter()
-        .enumerate()
-        .map(|(index, frame)| AnimationFrameInfo {
-            id: frame_ids[index],
-            delay: f64::from(frame.duration_ms.unwrap_or(100)) / 1000.0,
-            dispose: Some(match frame.dispose.as_deref() {
-                Some("none") => AnimationDispose::None,
-                Some("dispose") => AnimationDispose::Dispose,
-                _ => AnimationDispose::Auto,
-            }),
+    let max_layer_id = max_normalized_layer_id(&document.root_layers)?;
+    let timeline = document.frames.len() > 1;
+    let frame_ids = timeline
+        .then(|| {
+            let first = max_layer_id
+                .checked_add(1)
+                .ok_or_else(|| ExportError::Writer("frame ID allocation overflow".to_string()))?;
+            document
+                .frames
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    let index = u32::try_from(index).map_err(|_| {
+                        ExportError::Writer("frame count exceeds PSD ID limits".to_string())
+                    })?;
+                    first.checked_add(index).map(f64::from).ok_or_else(|| {
+                        ExportError::Writer("frame ID allocation overflow".to_string())
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
         })
-        .collect();
+        .transpose()?;
+    let frames = frame_ids.as_ref().map(|frame_ids| {
+        document
+            .frames
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| AnimationFrameInfo {
+                id: frame_ids[index],
+                delay: f64::from(frame.duration_ms.unwrap_or(100)) / 1000.0,
+                dispose: Some(match frame.dispose.as_deref() {
+                    Some("none") => AnimationDispose::None,
+                    Some("dispose") => AnimationDispose::Dispose,
+                    _ => AnimationDispose::Auto,
+                }),
+            })
+            .collect::<Vec<_>>()
+    });
     let repeats = match document.loop_mode {
         Some(NormalizedLoopMode::Infinite) | None => Some(0.0),
         Some(NormalizedLoopMode::Finite(value)) => Some(f64::from(value)),
     };
-    Ok(Psd {
-        width: f64::from(document.canvas.0),
-        height: f64::from(document.canvas.1),
-        channels: Some(4.0),
-        bits_per_channel: Some(8.0),
-        color_mode: Some(ColorMode::Rgb),
-        children: Some(
-            document
-                .root_layers
-                .iter()
-                .map(|layer| {
-                    let path = export_layer_path(None, layer);
-                    build_psd_layer(layer, &path, report)
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
-        image_data: Some(PixelData {
-            width: document.canvas.0,
-            height: document.canvas.1,
-            data: composite.clone(),
-        }),
-        image_resources: Some(ImageResources {
-            animations: Some(Animations {
-                frames,
-                animations: vec![AnimationInfo {
-                    id: 1.0,
-                    frames: frame_ids,
-                    repeats,
-                    active_frame: document.active_frame_index.map(f64::from),
-                }],
+    Ok((
+        Psd {
+            width: f64::from(document.canvas.0),
+            height: f64::from(document.canvas.1),
+            channels: Some(4.0),
+            bits_per_channel: Some(8.0),
+            color_mode: Some(ColorMode::Rgb),
+            children: Some(build_psd_layers(
+                &document.root_layers,
+                report,
+                frame_ids.as_deref(),
+            )?),
+            image_data: Some(PixelData {
+                width: document.canvas.0,
+                height: document.canvas.1,
+                data: composite.clone(),
+            }),
+            image_resources: Some(ImageResources {
+                ids_seed_number: Some(f64::from(max_layer_id)),
+                animations: frame_ids.as_ref().map(|frame_ids| Animations {
+                    frames: frames.expect("timeline frames were built with frame IDs"),
+                    animations: vec![AnimationInfo {
+                        id: 0.0,
+                        frames: frame_ids.clone(),
+                        repeats,
+                        active_frame: document.active_frame_index.map(f64::from),
+                    }],
+                }),
+                ..Default::default()
             }),
             ..Default::default()
-        }),
-        ..Default::default()
-    })
+        },
+        frame_ids,
+    ))
 }
 
-/// Converts one normalized group or static cel layer into the ag-psd tree.
+/// Finds the highest concrete layer ID before allocating a disjoint Photoshop frame range.
+fn max_normalized_layer_id(layers: &[NormalizedLayer]) -> Result<u32, ExportError> {
+    let mut maximum = 0_u32;
+    let mut stack = layers.iter().collect::<Vec<_>>();
+    while let Some(layer) = stack.pop() {
+        if layer.id == 0 {
+            return Err(ExportError::Writer(
+                "PSD layer ID zero is not valid for animation".to_string(),
+            ));
+        }
+        maximum = maximum.max(layer.id);
+        stack.extend(layer.children.iter());
+    }
+    Ok(maximum)
+}
+
+/// One normalized layer staged for iterative PSD tree construction.
+struct PsdLayerNode<'a> {
+    source: &'a NormalizedLayer,
+    path: String,
+    children: Vec<usize>,
+}
+
+/// Builds the PSD layer tree bottom-up so user-controlled hierarchy depth cannot exhaust the stack.
+fn build_psd_layers(
+    roots: &[NormalizedLayer],
+    report: &mut InformationLossReport,
+    frame_ids: Option<&[f64]>,
+) -> Result<Vec<Layer>, ExportError> {
+    let mut nodes = Vec::new();
+    let mut root_indices = Vec::new();
+    for layer in roots {
+        root_indices.push(nodes.len());
+        nodes.push(PsdLayerNode {
+            source: layer,
+            path: export_layer_path(None, layer),
+            children: Vec::new(),
+        });
+    }
+    let mut pending = root_indices.clone();
+    while let Some(parent_index) = pending.pop() {
+        let parent_path = nodes[parent_index].path.clone();
+        let children = &nodes[parent_index].source.children;
+        let mut child_indices = Vec::with_capacity(children.len());
+        for child in children {
+            let index = nodes.len();
+            nodes.push(PsdLayerNode {
+                source: child,
+                path: export_layer_path(Some(&parent_path), child),
+                children: Vec::new(),
+            });
+            child_indices.push(index);
+        }
+        nodes[parent_index].children = child_indices.clone();
+        pending.extend(child_indices.into_iter().rev());
+    }
+
+    let mut built = (0..nodes.len())
+        .map(|_| None)
+        .collect::<Vec<Option<Layer>>>();
+    for index in (0..nodes.len()).rev() {
+        let node = &nodes[index];
+        let children = node
+            .children
+            .iter()
+            .map(|child| {
+                built[*child].take().ok_or_else(|| {
+                    ExportError::Writer("PSD layer tree post-order construction failed".to_string())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        built[index] = Some(build_psd_layer(
+            node.source,
+            &node.path,
+            report,
+            frame_ids,
+            children,
+        )?);
+    }
+    root_indices
+        .into_iter()
+        .map(|index| {
+            built[index].take().ok_or_else(|| {
+                ExportError::Writer("PSD root layer construction failed".to_string())
+            })
+        })
+        .collect()
+}
+
+/// Converts one normalized layer after its child PSD layers have already been constructed.
 fn build_psd_layer(
     source: &NormalizedLayer,
     path: &str,
     report: &mut InformationLossReport,
+    frame_ids: Option<&[f64]>,
+    children: Vec<Layer>,
 ) -> Result<Layer, ExportError> {
-    let animation_frames = source
-        .frame_states
-        .iter()
-        .map(|state| AnimationFrame {
-            frames: vec![f64::from(state.frame_index + 1)],
-            enable: Some(state.enabled),
-            offset: state.offset.map(|point| PointF {
-                x: point.x,
-                y: point.y,
-            }),
-            reference_point: state.reference_point.map(|point| PointF {
-                x: point.x,
-                y: point.y,
-            }),
-            opacity: state.opacity,
-            effects: None,
+    let animation_frames = frame_ids
+        .map(|frame_ids| {
+            source
+                .frame_states
+                .iter()
+                .map(|state| {
+                    let frame_id = frame_ids.get(state.frame_index as usize).ok_or_else(|| {
+                        ExportError::Writer(format!(
+                            "layer {} refers to missing frame {}",
+                            source.id, state.frame_index
+                        ))
+                    })?;
+                    Ok(AnimationFrame {
+                        frames: vec![*frame_id],
+                        enable: Some(state.enabled),
+                        offset: state.offset.map(|point| PointF {
+                            x: point.x,
+                            y: point.y,
+                        }),
+                        reference_point: state.reference_point.map(|point| PointF {
+                            x: point.x,
+                            y: point.y,
+                        }),
+                        opacity: state.opacity,
+                        effects: None,
+                    })
+                })
+                .collect::<Result<Vec<_>, ExportError>>()
         })
-        .collect::<Vec<_>>();
-    let flags = AnimationFrameFlags {
-        propagate_frame_one: Some(false),
-        unify_layer_position: Some(false),
-        unify_layer_style: Some(false),
-        unify_layer_visibility: Some(false),
-    };
+        .transpose()?;
     let blend_mode = psd_blend_mode(source.blend_mode.as_deref());
     if blend_mode.1 {
         report.add(
@@ -683,8 +1148,8 @@ fn build_psd_layer(
         additional_info: LayerAdditionalInfo {
             name: Some(source.name.clone()),
             id: Some(f64::from(source.id)),
-            animation_frames: Some(animation_frames),
-            animation_frame_flags: Some(flags),
+            animation_frames,
+            animation_frame_flags: None,
             ..Default::default()
         },
         blend_mode: Some(blend_mode.0),
@@ -695,16 +1160,7 @@ fn build_psd_layer(
     match source.kind {
         NormalizedLayerKind::Group => {
             layer.opened = Some(true);
-            layer.children = Some(
-                source
-                    .children
-                    .iter()
-                    .map(|child| {
-                        let child_path = export_layer_path(Some(path), child);
-                        build_psd_layer(child, &child_path, report)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
+            layer.children = Some(children);
         }
         NormalizedLayerKind::Pixel => {
             let pixels = source.pixels.as_ref().ok_or_else(|| {
@@ -789,12 +1245,15 @@ fn export_layer_path(parent: Option<&str>, layer: &NormalizedLayer) -> String {
     }
 }
 
-/// Injects the shmd records missing from ag-psd 0.2.0 into its encoded layer records.
-fn inject_animation_metadata(
+/// Injects private converter markers after the public PSD writer completes.
+fn inject_roundtrip_metadata(
     mut bytes: Vec<u8>,
-    metadata: &HashMap<u32, LayerAnimationMetadata>,
+    metadata: &HashMap<u32, LayerMarker>,
     psb: bool,
 ) -> Result<Vec<u8>, ExportError> {
+    if metadata.is_empty() {
+        return Ok(bytes);
+    }
     let layout = layer_record_layout(&bytes, psb)?;
     let mut insertions = Vec::new();
     for record in layout.records {
@@ -804,19 +1263,18 @@ fn inject_animation_metadata(
         let Some(payload) = metadata.get(&id) else {
             continue;
         };
-        let mut block = if payload.frames.is_empty() {
-            Vec::new()
-        } else {
-            shmd_block(id, payload)
-        };
-        if let Some(marker) = payload.marker {
-            block.extend(roundtrip_block(marker));
-        }
+        let block = roundtrip_block(*payload);
         let new_extra = record
             .extra_length
             .checked_add(block.len())
             .ok_or_else(|| ExportError::Writer("layer extra-data length overflow".to_string()))?;
-        write_be_u32(&mut bytes, record.extra_length_offset, new_extra as u32)?;
+        write_be_u32(
+            &mut bytes,
+            record.extra_length_offset,
+            u32::try_from(new_extra).map_err(|_| {
+                ExportError::Writer("layer extra-data length exceeds PSD limits".to_string())
+            })?,
+        )?;
         insertions.push((record.extra_end, block));
     }
     let added = insertions
@@ -842,262 +1300,17 @@ fn inject_animation_metadata(
     Ok(bytes)
 }
 
-/// Removes ag-psd's implicit AFrm=0 when the caller did not request an active frame.
-fn omit_active_frame_descriptor(mut bytes: Vec<u8>) -> Result<Vec<u8>, ExportError> {
-    let color_data_length = read_be_u32(&bytes, 26)? as usize;
-    let resources_length_offset = 30;
-    let resources_start = 34usize
-        .checked_add(color_data_length)
-        .ok_or_else(|| ExportError::Writer("PSD resource offset overflow".to_string()))?;
-    let resources_length = read_be_u32(&bytes, resources_length_offset)? as usize;
-    let resources_end = resources_start
-        .checked_add(resources_length)
-        .ok_or_else(|| ExportError::Writer("PSD resource length overflow".to_string()))?;
-    if resources_end > bytes.len() {
-        return Err(ExportError::Writer(
-            "PSD image resources are truncated".to_string(),
-        ));
-    }
-
-    let resources = &bytes[resources_start..resources_end];
-    let rewritten = rewrite_image_resources_without_active_frame(resources)?;
-    if rewritten.len() == resources.len() {
-        return Ok(bytes);
-    }
-
-    bytes.splice(resources_start..resources_end, rewritten.iter().copied());
-    write_be_u32(
-        &mut bytes,
-        resources_length_offset,
-        u32::try_from(rewritten.len())
-            .map_err(|_| ExportError::Writer("PSD image resources exceed 4 GiB".to_string()))?,
-    )?;
-    Ok(bytes)
-}
-
-/// Rewrites animation image resources after removing the optional active-frame field.
-fn rewrite_image_resources_without_active_frame(resources: &[u8]) -> Result<Vec<u8>, ExportError> {
-    let mut cursor = 0usize;
-    let mut rewritten = Vec::with_capacity(resources.len());
-    let mut changed = false;
-
-    while cursor < resources.len() {
-        let entry_start = cursor;
-        if resources.get(cursor..cursor + 4) != Some(b"8BIM") {
-            return Err(ExportError::Writer(
-                "invalid image resource signature while removing AFrm".to_string(),
-            ));
-        }
-        cursor += 4;
-        let id = read_be_u16(resources, cursor)?;
-        cursor += 2;
-        let name_length = *resources.get(cursor).ok_or_else(|| {
-            ExportError::Writer("truncated image resource name length".to_string())
-        })? as usize;
-        cursor += 1;
-        cursor = cursor
-            .checked_add(name_length)
-            .ok_or_else(|| ExportError::Writer("image resource name overflow".to_string()))?;
-        if !(1 + name_length).is_multiple_of(2) {
-            cursor = cursor
-                .checked_add(1)
-                .ok_or_else(|| ExportError::Writer("image resource name overflow".to_string()))?;
-        }
-        let data_length_offset = cursor;
-        let data_length = read_be_u32(resources, cursor)? as usize;
-        cursor += 4;
-        let data_start = cursor;
-        let data_end = data_start
-            .checked_add(data_length)
-            .ok_or_else(|| ExportError::Writer("image resource data overflow".to_string()))?;
-        let data = resources
-            .get(data_start..data_end)
-            .ok_or_else(|| ExportError::Writer("truncated image resource data".to_string()))?;
-        cursor = data_end;
-        if !data_length.is_multiple_of(2) {
-            cursor = cursor.checked_add(1).ok_or_else(|| {
-                ExportError::Writer("image resource padding overflow".to_string())
-            })?;
-        }
-        if cursor > resources.len() {
-            return Err(ExportError::Writer(
-                "truncated image resource padding".to_string(),
-            ));
-        }
-        let entry_end = cursor;
-
-        let replacement = if id == 4000 || id == 4003 {
-            rewrite_animation_resource_without_active_frame(data)?
-        } else {
-            None
-        };
-        let Some(data) = replacement else {
-            rewritten.extend_from_slice(&resources[entry_start..entry_end]);
-            continue;
-        };
-
-        changed = true;
-        rewritten.extend_from_slice(&resources[entry_start..data_length_offset]);
-        rewritten.extend_from_slice(
-            &u32::try_from(data.len())
-                .map_err(|_| ExportError::Writer("animation resource exceeds 4 GiB".to_string()))?
-                .to_be_bytes(),
-        );
-        rewritten.extend_from_slice(&data);
-        if !data.len().is_multiple_of(2) {
-            rewritten.push(0);
-        }
-    }
-
-    if changed {
-        Ok(rewritten)
-    } else {
-        Ok(resources.to_vec())
-    }
-}
-
-/// Removes AFrm from every animation set in one `mani` image resource.
-fn rewrite_animation_resource_without_active_frame(
-    data: &[u8],
-) -> Result<Option<Vec<u8>>, ExportError> {
-    if data.len() < 12 || &data[..8] != b"maniIRFR" {
-        return Ok(None);
-    }
-    let section_length = read_be_u32(data, 8)? as usize;
-    let section_start = 12usize;
-    let section_end = section_start
-        .checked_add(section_length)
-        .ok_or_else(|| ExportError::Writer("animation resource section overflow".to_string()))?;
-    let section = data.get(section_start..section_end).ok_or_else(|| {
-        ExportError::Writer("animation resource section is truncated".to_string())
-    })?;
-
-    let mut cursor = 0usize;
-    let mut rewritten_section = Vec::with_capacity(section.len());
-    let mut changed = false;
-    while cursor < section.len() {
-        let entry_start = cursor;
-        if section.get(cursor..cursor + 4) != Some(b"8BIM") {
-            return Err(ExportError::Writer(
-                "invalid animation subresource signature".to_string(),
-            ));
-        }
-        cursor += 4;
-        let key = section.get(cursor..cursor + 4).ok_or_else(|| {
-            ExportError::Writer("truncated animation subresource key".to_string())
-        })?;
-        cursor += 4;
-        let payload_length_offset = cursor;
-        let payload_length = read_be_u32(section, cursor)? as usize;
-        cursor += 4;
-        let payload_start = cursor;
-        let payload_end = payload_start
-            .checked_add(payload_length)
-            .ok_or_else(|| ExportError::Writer("animation descriptor overflow".to_string()))?;
-        let payload = section
-            .get(payload_start..payload_end)
-            .ok_or_else(|| ExportError::Writer("animation descriptor is truncated".to_string()))?;
-        cursor = payload_end;
-        if !payload_length.is_multiple_of(2) {
-            cursor = cursor.checked_add(1).ok_or_else(|| {
-                ExportError::Writer("animation descriptor padding overflow".to_string())
-            })?;
-        }
-        if cursor > section.len() {
-            return Err(ExportError::Writer(
-                "truncated animation descriptor padding".to_string(),
-            ));
-        }
-        let entry_end = cursor;
-
-        let replacement = if key == b"AnDs" {
-            rewrite_animation_descriptor_without_active_frame(payload)?
-        } else {
-            None
-        };
-        let Some(payload) = replacement else {
-            rewritten_section.extend_from_slice(&section[entry_start..entry_end]);
-            continue;
-        };
-
-        changed = true;
-        rewritten_section.extend_from_slice(&section[entry_start..payload_length_offset]);
-        rewritten_section.extend_from_slice(
-            &u32::try_from(payload.len())
-                .map_err(|_| ExportError::Writer("animation descriptor exceeds 4 GiB".to_string()))?
-                .to_be_bytes(),
-        );
-        rewritten_section.extend_from_slice(&payload);
-        if !payload.len().is_multiple_of(2) {
-            rewritten_section.push(0);
-        }
-    }
-
-    if !changed {
-        return Ok(None);
-    }
-    let mut rewritten = Vec::with_capacity(data.len());
-    rewritten.extend_from_slice(b"maniIRFR");
-    rewritten.extend_from_slice(
-        &u32::try_from(rewritten_section.len())
-            .map_err(|_| ExportError::Writer("animation resource exceeds 4 GiB".to_string()))?
-            .to_be_bytes(),
-    );
-    rewritten.extend_from_slice(&rewritten_section);
-    rewritten.extend_from_slice(&data[section_end..]);
-    Ok(Some(rewritten))
-}
-
-/// Removes AFrm fields from an encoded animation descriptor.
-fn rewrite_animation_descriptor_without_active_frame(
-    payload: &[u8],
-) -> Result<Option<Vec<u8>>, ExportError> {
-    let mut reader = PsdReader::new(payload, None, None);
-    let mut descriptor = read_version_and_descriptor(&mut reader).map_err(|error| {
-        ExportError::Writer(format!("cannot read animation descriptor: {error}"))
-    })?;
-    let mut changed = false;
-    if let Some(DescriptorValue::List(sets)) = descriptor
-        .items
-        .iter_mut()
-        .find_map(|(key, value)| (key == "FSts").then_some(value))
-    {
-        for value in sets {
-            let DescriptorValue::Descriptor(set) = value else {
-                continue;
-            };
-            let before = set.items.len();
-            set.items.retain(|(key, _)| key != "AFrm");
-            changed |= set.items.len() != before;
-        }
-    }
-    if !changed {
-        return Ok(None);
-    }
-
-    let mut writer = create_writer_default();
-    write_version_and_descriptor(&mut writer, &descriptor);
-    Ok(Some(get_writer_buffer(&writer)))
-}
-
-#[derive(Debug)]
-struct LayerAnimationMetadata {
-    frames: Vec<AnimationFrame>,
-    flags: AnimationFrameFlags,
-    marker: Option<LayerMarker>,
-}
-
 /// Indexes normalized per-layer animation records by the PSD layer ID.
 fn animation_metadata(
     document: &NormalizedDocument,
     embed_roundtrip_metadata: bool,
-) -> HashMap<u32, LayerAnimationMetadata> {
+) -> Result<HashMap<u32, LayerMarker>, ExportError> {
     fn collect(
         layer: &NormalizedLayer,
         parent: Option<&NormalizedLayer>,
-        output: &mut HashMap<u32, LayerAnimationMetadata>,
+        output: &mut HashMap<u32, LayerMarker>,
         embed_roundtrip_metadata: bool,
-    ) {
+    ) -> Result<(), ExportError> {
         let marker = if embed_roundtrip_metadata {
             parent
                 .filter(|parent| is_materialized_cel_wrapper(parent))
@@ -1124,45 +1337,19 @@ fn animation_metadata(
         } else {
             None
         };
-        output.insert(
-            layer.id,
-            LayerAnimationMetadata {
-                frames: layer
-                    .frame_states
-                    .iter()
-                    .map(|state| AnimationFrame {
-                        frames: vec![f64::from(state.frame_index + 1)],
-                        enable: Some(state.enabled),
-                        offset: state.offset.map(|point| PointF {
-                            x: point.x,
-                            y: point.y,
-                        }),
-                        reference_point: state.reference_point.map(|point| PointF {
-                            x: point.x,
-                            y: point.y,
-                        }),
-                        opacity: state.opacity,
-                        effects: None,
-                    })
-                    .collect(),
-                flags: AnimationFrameFlags {
-                    propagate_frame_one: Some(false),
-                    unify_layer_position: Some(false),
-                    unify_layer_style: Some(false),
-                    unify_layer_visibility: Some(false),
-                },
-                marker,
-            },
-        );
-        for child in &layer.children {
-            collect(child, Some(layer), output, embed_roundtrip_metadata);
+        if let Some(marker) = marker {
+            output.insert(layer.id, marker);
         }
+        for child in &layer.children {
+            collect(child, Some(layer), output, embed_roundtrip_metadata)?;
+        }
+        Ok(())
     }
     let mut output = HashMap::new();
     for layer in &document.root_layers {
-        collect(layer, None, &mut output, embed_roundtrip_metadata);
+        collect(layer, None, &mut output, embed_roundtrip_metadata)?;
     }
-    output
+    Ok(output)
 }
 
 /// Recognizes the wrapper shape created when one Aseprite layer has multiple cel variants.
@@ -1212,63 +1399,6 @@ fn is_materialized_cel_wrapper(layer: &NormalizedLayer) -> bool {
         })
 }
 
-/// Serializes one shmd additional-info block using ag-psd descriptor primitives.
-fn shmd_block(id: u32, metadata: &LayerAnimationMetadata) -> Vec<u8> {
-    let mut payload = create_writer_default();
-    write_uint32(&mut payload, 2);
-    write_signature(&mut payload, "8BIM");
-    write_signature(&mut payload, "mlst");
-    write_uint8(&mut payload, 0);
-    write_zeros(&mut payload, 3);
-    write_section(
-        &mut payload,
-        2,
-        |writer| write_mlst(writer, id, &metadata.frames),
-        true,
-        false,
-    );
-    write_signature(&mut payload, "8BIM");
-    write_signature(&mut payload, "mdyn");
-    write_uint8(&mut payload, 0);
-    write_zeros(&mut payload, 3);
-    write_section(
-        &mut payload,
-        2,
-        |writer| {
-            write_uint16(writer, 0);
-            write_uint8(
-                writer,
-                if metadata.flags.propagate_frame_one == Some(true) {
-                    0
-                } else {
-                    0x0f
-                },
-            );
-            write_uint8(
-                writer,
-                u8::from(metadata.flags.unify_layer_position == Some(true))
-                    | (u8::from(metadata.flags.unify_layer_style == Some(true)) << 1)
-                    | (u8::from(metadata.flags.unify_layer_visibility == Some(true)) << 2),
-            );
-        },
-        false,
-        false,
-    );
-    let payload = get_writer_buffer(&payload);
-
-    let mut block = create_writer_default();
-    write_signature(&mut block, "8BIM");
-    write_signature(&mut block, "shmd");
-    write_section(
-        &mut block,
-        2,
-        |writer| write_bytes(writer, Some(&payload)),
-        false,
-        false,
-    );
-    get_writer_buffer(&block)
-}
-
 /// Serializes one private round-trip marker as a layer additional-info block.
 fn roundtrip_block(marker: LayerMarker) -> Vec<u8> {
     let mut block = create_writer_default();
@@ -1282,66 +1412,6 @@ fn roundtrip_block(marker: LayerMarker) -> Vec<u8> {
         false,
     );
     get_writer_buffer(&block)
-}
-
-/// Writes the upstream FrameListDescriptor shape consumed by Photoshop and this importer.
-fn write_mlst(writer: &mut PsdWriter, id: u32, frames: &[AnimationFrame]) {
-    let mut descriptor = Descriptor::new("", "null");
-    descriptor.set("LaID", DescriptorValue::Integer(id as i32));
-    descriptor.set(
-        "LaSt",
-        DescriptorValue::List(
-            frames
-                .iter()
-                .map(|frame| DescriptorValue::Descriptor(frame_descriptor(frame)))
-                .collect(),
-        ),
-    );
-    write_version_and_descriptor(writer, &descriptor);
-}
-
-/// Builds one frame-state action descriptor.
-fn frame_descriptor(frame: &AnimationFrame) -> Descriptor {
-    let mut descriptor = Descriptor::new("", "null");
-    if let Some(enable) = frame.enable {
-        descriptor.set("enab", DescriptorValue::Boolean(enable));
-    }
-    descriptor.set(
-        "FrLs",
-        DescriptorValue::List(
-            frame
-                .frames
-                .iter()
-                .map(|value| DescriptorValue::Integer(*value as i32))
-                .collect(),
-        ),
-    );
-    if let Some(point) = frame.offset {
-        descriptor.set("Ofst", DescriptorValue::Descriptor(point_descriptor(point)));
-    }
-    if let Some(point) = frame.reference_point {
-        descriptor.set("FXRf", DescriptorValue::Descriptor(point_descriptor(point)));
-    }
-    if let Some(opacity) = frame.opacity {
-        let mut blend = Descriptor::new("", "null");
-        blend.set(
-            "Opct",
-            DescriptorValue::UnitDouble(UnitDoubleValue {
-                units: "Percent".to_string(),
-                value: opacity * 100.0,
-            }),
-        );
-        descriptor.set("blendOptions", DescriptorValue::Descriptor(blend));
-    }
-    descriptor
-}
-
-/// Builds one Photoshop horizontal/vertical point descriptor.
-fn point_descriptor(point: PointF) -> Descriptor {
-    let mut descriptor = Descriptor::new("", "Pnt ");
-    descriptor.set("Hrzn", DescriptorValue::Double(point.x));
-    descriptor.set("Vrtc", DescriptorValue::Double(point.y));
-    descriptor
 }
 
 #[derive(Debug)]
@@ -1699,7 +1769,7 @@ fn validate_export_semantics(
     frame_first: bool,
 ) -> Result<(), ExportError> {
     if frame_first {
-        validate_frame_group_roots(bytes, expected)?;
+        validate_frame_group_roots(parsed, expected)?;
     } else {
         let (normalized, _) = crate::normalize_bytes(bytes)
             .map_err(|error| ExportError::OutputValidation(error.to_string()))?;
@@ -1748,36 +1818,74 @@ fn validate_export_semantics(
     Ok(())
 }
 
-/// Validates the frame-group root contract without flattening the duplicated snapshots.
+/// Verifies that the editable export retains one root folder for each Aseprite frame.
 fn validate_frame_group_roots(
-    bytes: &[u8],
+    parsed: &Psd,
     expected: &NormalizedDocument,
 ) -> Result<(), ExportError> {
-    let parsed = ag_psd::read_psd(
-        bytes,
-        &ReadOptions {
-            use_image_data: Some(false),
-            skip_thumbnail: Some(true),
-            ..Default::default()
-        },
-    )
-    .map_err(|error| ExportError::OutputValidation(error.to_string()))?;
-    let roots = parsed.children.as_ref().ok_or_else(|| {
-        ExportError::OutputValidation("frame-group PSD has no root layers".to_string())
+    let roots = parsed.children.as_deref().ok_or_else(|| {
+        ExportError::OutputValidation("frame-folder export has no root layers".to_string())
     })?;
     if roots.len() != expected.frames.len() {
         return Err(ExportError::OutputValidation(format!(
-            "frame-group root count differs: expected {}, got {}",
-            expected.frames.len(),
-            roots.len()
+            "frame-folder export has {} root layers for {} frames",
+            roots.len(),
+            expected.frames.len()
         )));
     }
     for (index, root) in roots.iter().enumerate() {
-        if root.additional_info.name.as_deref() != Some(format!("Frame {}", index + 1).as_str()) {
+        let expected_name = format!("Frame {}", index + 1);
+        if root.additional_info.name.as_deref() != Some(expected_name.as_str())
+            || root.children.as_ref().is_none_or(Vec::is_empty)
+        {
             return Err(ExportError::OutputValidation(format!(
-                "frame-group root {index} has an unexpected name"
+                "frame-folder export is missing populated root {expected_name}"
             )));
         }
+        let first_enable = root
+            .additional_info
+            .animation_frames
+            .as_ref()
+            .and_then(|states| states.first())
+            .and_then(|state| state.enable)
+            .ok_or_else(|| {
+                ExportError::OutputValidation(format!(
+                    "frame-folder root {expected_name} is missing an explicit first-frame state"
+                ))
+            })?;
+        if root.hidden != Some(!first_enable) {
+            return Err(ExportError::OutputValidation(format!(
+                "frame-folder root {expected_name} static visibility disagrees with its first mlst state"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validates the frame-group root contract without flattening the duplicated snapshots.
+/// Verifies that every emitted frame-group layer has one state for every global frame.
+#[cfg(test)]
+fn validate_frame_layer_states(
+    layers: &[NormalizedLayer],
+    frame_count: usize,
+) -> Result<(), ExportError> {
+    for layer in layers {
+        if layer.frame_states.len() != frame_count {
+            return Err(ExportError::OutputValidation(format!(
+                "layer {} has {} animation states for {frame_count} global frames",
+                layer.id,
+                layer.frame_states.len()
+            )));
+        }
+        for (index, state) in layer.frame_states.iter().enumerate() {
+            if state.frame_index != index as u32 {
+                return Err(ExportError::OutputValidation(format!(
+                    "layer {} animation state order differs at frame {index}",
+                    layer.id
+                )));
+            }
+        }
+        validate_frame_layer_states(&layer.children, frame_count)?;
     }
     Ok(())
 }
@@ -1843,8 +1951,6 @@ fn validate_composite_payload(
     psb: bool,
     layout: &LayerRecordLayout,
 ) -> Result<(), ExportError> {
-    use flate2::{Decompress, FlushDecompress, Status};
-
     let channels = read_be_u16(bytes, 12)? as usize;
     let height = read_be_u32(bytes, 14)? as usize;
     let width = read_be_u32(bytes, 18)? as usize;
@@ -1900,37 +2006,10 @@ fn validate_composite_payload(
             if value == Compression::ZipWithoutPrediction as u16
                 || value == Compression::ZipWithPrediction as u16 =>
         {
-            let mut cursor = 0usize;
-            for _ in 0..channels {
-                let mut decompressor = Decompress::new(true);
-                let mut decoded = vec![0; channel_size.saturating_add(1)];
-                let status = decompressor
-                    .decompress(&payload[cursor..], &mut decoded, FlushDecompress::Finish)
-                    .map_err(|error| {
-                        ExportError::OutputValidation(format!(
-                            "composite channel has invalid ZIP data: {error}"
-                        ))
-                    })?;
-                if status != Status::StreamEnd || decompressor.total_out() as usize != channel_size
-                {
-                    return Err(ExportError::OutputValidation(
-                        "composite ZIP channel did not decode to the canvas size".to_string(),
-                    ));
-                }
-                cursor = cursor
-                    .checked_add(decompressor.total_in() as usize)
-                    .filter(|cursor| *cursor <= payload.len())
-                    .ok_or_else(|| {
-                        ExportError::OutputValidation(
-                            "composite ZIP channel exceeds the payload".to_string(),
-                        )
-                    })?;
-            }
-            if cursor != payload.len() {
-                return Err(ExportError::OutputValidation(
-                    "composite image contains bytes after its ZIP channels".to_string(),
-                ));
-            }
+            let expected = channel_size.checked_mul(channels).ok_or_else(|| {
+                ExportError::OutputValidation("composite ZIP length overflows memory".to_string())
+            })?;
+            validate_zlib_payload(payload, Some(expected), "composite image")?;
         }
         _ => unreachable!("compression code was checked while parsing the layout"),
     }
@@ -1942,11 +2021,25 @@ fn compare_normalized(
     expected: &NormalizedDocument,
     actual: &NormalizedDocument,
 ) -> Result<(), ExportError> {
-    if expected.canvas != actual.canvas
-        || expected.frames != actual.frames
-        || expected.loop_mode != actual.loop_mode
-        || expected.active_frame_index != actual.active_frame_index
-    {
+    let static_equivalent = expected.frames.len() == 1
+        && actual.frames.len() == 1
+        && actual.frames[0].source_id.is_none()
+        && actual.frames[0].duration_ms.is_none();
+    let same_frames = static_equivalent
+        || (expected.frames.len() == actual.frames.len()
+            && expected
+                .frames
+                .iter()
+                .zip(&actual.frames)
+                .all(|(left, right)| {
+                    left.index == right.index
+                        && left.duration_ms == right.duration_ms
+                        && left.dispose == right.dispose
+                }));
+    let same_loop_mode = static_equivalent || expected.loop_mode == actual.loop_mode;
+    let same_active_frame =
+        static_equivalent || expected.active_frame_index == actual.active_frame_index;
+    if expected.canvas != actual.canvas || !same_frames || !same_loop_mode || !same_active_frame {
         return Err(ExportError::OutputValidation(format!(
             "canvas, frames, loop mode, or active frame differ: expected {:?} {:?} {:?} {:?}, got {:?} {:?} {:?} {:?}",
             expected.canvas,
@@ -1959,13 +2052,18 @@ fn compare_normalized(
             actual.active_frame_index,
         )));
     }
-    compare_layers(&expected.root_layers, &actual.root_layers)
+    compare_layers(
+        &expected.root_layers,
+        &actual.root_layers,
+        static_equivalent,
+    )
 }
 
 /// Recursively compares layer tree, pixels, visibility, offsets, and opacity.
 fn compare_layers(
     expected: &[NormalizedLayer],
     actual: &[NormalizedLayer],
+    ignore_static_frame_states: bool,
 ) -> Result<(), ExportError> {
     if expected.len() != actual.len() {
         return Err(ExportError::OutputValidation(
@@ -1981,31 +2079,39 @@ fn compare_layers(
             || !same_base_blend_mode(expected.blend_mode.as_deref(), actual.blend_mode.as_deref())
             || expected.hidden != actual.hidden
             || expected.pixels != actual.pixels
-            || expected.frame_states.len() != actual.frame_states.len()
+            || (!ignore_static_frame_states
+                && expected.frame_states.len() != actual.frame_states.len())
         {
             return Err(ExportError::OutputValidation(format!(
                 "layer {} structure or pixel dimensions differ",
                 expected.id
             )));
         }
-        for (expected_state, actual_state) in expected.frame_states.iter().zip(&actual.frame_states)
-        {
-            if expected_state.frame_index != actual_state.frame_index
-                || expected_state.enabled != actual_state.enabled
-                || expected_state.offset != actual_state.offset
-                || !same_optional_point(
-                    expected_state.reference_point,
-                    actual_state.reference_point,
-                )
-                || !same_optional_float(expected_state.opacity, actual_state.opacity)
+        if !ignore_static_frame_states {
+            for (expected_state, actual_state) in
+                expected.frame_states.iter().zip(&actual.frame_states)
             {
-                return Err(ExportError::OutputValidation(format!(
-                    "layer {} frame {} visibility, position, or opacity differs",
-                    expected.id, expected_state.frame_index
-                )));
+                if expected_state.frame_index != actual_state.frame_index
+                    || expected_state.enabled != actual_state.enabled
+                    || expected_state.offset != actual_state.offset
+                    || !same_optional_point(
+                        expected_state.reference_point,
+                        actual_state.reference_point,
+                    )
+                    || !same_optional_float(expected_state.opacity, actual_state.opacity)
+                {
+                    return Err(ExportError::OutputValidation(format!(
+                        "layer {} frame {} visibility, position, or opacity differs",
+                        expected.id, expected_state.frame_index
+                    )));
+                }
             }
         }
-        compare_layers(&expected.children, &actual.children)?;
+        compare_layers(
+            &expected.children,
+            &actual.children,
+            ignore_static_frame_states,
+        )?;
     }
     Ok(())
 }
@@ -2144,7 +2250,6 @@ fn write_be_length(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aseprite_reader::FrameSnapshotCel;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2156,6 +2261,32 @@ mod tests {
         AsepriteFile, BlendMode as AseBlendMode, ColorMode as AseColorMode, LayerOptions, Pixels,
         Tileset, TilesetData, TilesetFlags,
     };
+
+    fn assert_physical_tracks(layers: &[ag_psd::psd::Layer], frame_count: usize) -> usize {
+        let mut physical_count = 0;
+        for layer in layers {
+            assert!(layer.additional_info.id.is_some());
+            let states = layer
+                .additional_info
+                .animation_frames
+                .as_ref()
+                .expect("ordinary layer frame track");
+            assert_eq!(states.len(), frame_count);
+            let first_enable = states
+                .first()
+                .and_then(|state| state.enable)
+                .expect("explicit first-frame state");
+            assert_eq!(layer.hidden, Some(!first_enable));
+            physical_count += 1;
+            if layer.bounding_divider_additional_info.is_some() {
+                physical_count += 1;
+            }
+            if let Some(children) = layer.children.as_deref() {
+                physical_count += assert_physical_tracks(children, frame_count);
+            }
+        }
+        physical_count
+    }
 
     /// Builds the mandatory prefix of one layer extra-data payload.
     fn empty_layer_extra() -> Vec<u8> {
@@ -2250,6 +2381,17 @@ mod tests {
         raw.write_all(&source).expect("deflate write");
         let raw = raw.finish().expect("deflate finish");
         assert!(validate_zlib_payload(&raw, Some(source.len()), "test channel").is_err());
+
+        let mut concatenated = encoded.clone();
+        concatenated.extend_from_slice(&encoded);
+        assert!(
+            validate_zlib_payload(&concatenated, Some(source.len() * 2), "test channel").is_err()
+        );
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(validate_zlib_payload(&trailing, Some(source.len()), "test channel").is_err());
+        assert!(validate_zlib_payload(&encoded, Some(source.len() + 1), "test channel").is_err());
 
         let mut corrupted = encoded;
         let last = corrupted.len() - 1;
@@ -2356,6 +2498,21 @@ mod tests {
         export(&input, &composite, &output, &ExportOptions::default()).expect("export PSD");
         let bytes = fs::read(&output).expect("read PSD");
         assert_eq!(&bytes[..6], b"8BPS\0\x01");
+        let parsed = ag_psd::read_psd(&bytes, &ag_psd::psd::ReadOptions::default())
+            .expect("read typed frame animation from exported PSD");
+        let parsed_animations = parsed
+            .image_resources
+            .as_ref()
+            .and_then(|resources| resources.animations.as_ref())
+            .expect("global typed animation directory");
+        assert_eq!(parsed_animations.frames.len(), 3);
+        assert_eq!(parsed_animations.animations[0].frames.len(), 3);
+        assert_eq!(parsed_animations.animations[0].active_frame, Some(0.0));
+        assert_eq!(
+            assert_physical_tracks(parsed.children.as_deref().unwrap_or_default(), 3),
+            9,
+            "every generated non-empty layer and divider must have a complete typed track"
+        );
         let default_layout = layer_record_layout(&bytes, false).expect("inspect default PSD");
         validate_channel_compression(&default_layout, ExportCompression::Rle.ag_psd() as u16)
             .expect("default export should use RLE");
@@ -2394,11 +2551,26 @@ mod tests {
             Err(crate::ConversionError::RoundTripRecoveryRequired(_))
         ));
         let normalized = crate::normalize(&output).expect("normalize written PSD");
+        assert_eq!(normalized.animation_resource_ids, vec![4000]);
         assert_eq!(normalized.frames.len(), 3);
         assert_eq!(normalized.frames[0].duration_ms, Some(120));
         assert_eq!(normalized.frames[1].duration_ms, Some(80));
         assert_eq!(normalized.frames[2].duration_ms, Some(60));
-        assert_eq!(normalized.active_frame_index, None);
+        assert_eq!(normalized.active_frame_index, Some(0));
+        let max_layer_id = default_layout
+            .records
+            .iter()
+            .filter_map(|record| record.layer_id)
+            .max()
+            .expect("export should contain layer IDs");
+        let frame_ids = normalized
+            .frames
+            .iter()
+            .map(|frame| frame.source_id.expect("exported frame ID"))
+            .collect::<Vec<_>>();
+        assert!(frame_ids.iter().all(|id| *id > max_layer_id));
+        assert!(frame_ids.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(!bytes.windows(4).any(|window| window == b"mdyn"));
         assert_eq!(normalized.root_layers.len(), 3);
         assert_eq!(
             normalized
@@ -2408,6 +2580,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["Frame 1", "Frame 2", "Frame 3"]
         );
+        assert!(
+            normalized
+                .root_layers
+                .iter()
+                .enumerate()
+                .all(|(index, layer)| layer.hidden == Some(index != 0)),
+            "static visibility must initialize the first frame; mlst controls later playback"
+        );
+        assert_eq!(
+            normalized.root_layers[1].frame_states[1].enabled, true,
+            "a statically hidden later frame must be enabled by its mlst state"
+        );
+        validate_frame_layer_states(&normalized.root_layers, 3)
+            .expect("every frame-local layer should have complete animation states");
 
         let omit_empty_output = directory.join("omit-empty.psd");
         let omit_report = export(
@@ -2429,11 +2615,35 @@ mod tests {
         );
         let normalized_without_empty =
             crate::normalize(&omit_empty_output).expect("normalize PSD without empty layers");
+        assert_eq!(normalized_without_empty.root_layers.len(), 3);
         assert!(
             normalized_without_empty
                 .root_layers
                 .iter()
-                .all(|layer| layer.children.len() == 1)
+                .all(|layer| layer.children.len() == 1),
+            "omit policy must not materialize a frame-local empty pixel layer"
+        );
+
+        let include_empty_output = directory.join("include-empty.psd");
+        export(
+            &input,
+            &composite,
+            &include_empty_output,
+            &ExportOptions {
+                include_empty_layers: true,
+                ..Default::default()
+            },
+        )
+        .expect("export PSD with empty layers");
+        let included = ag_psd::read_psd(
+            &fs::read(&include_empty_output).expect("read PSD with empty layers"),
+            &ag_psd::psd::ReadOptions::default(),
+        )
+        .expect("read PSD with included empty layers");
+        assert_eq!(
+            assert_physical_tracks(included.children.as_deref().unwrap_or_default(), 3),
+            12,
+            "include policy must retain frame-local empty pixel layers"
         );
 
         crate::convert(
@@ -2476,6 +2686,25 @@ mod tests {
                 valid: true,
             }
         );
+        let unmarked_bytes = fs::read(&unmarked_output).expect("read unmarked PSD bytes");
+        let unmarked_normalized =
+            crate::normalize(&unmarked_output).expect("normalize unmarked PSD");
+        assert_eq!(unmarked_normalized.frames, normalized.frames);
+        assert_eq!(unmarked_normalized.loop_mode, normalized.loop_mode);
+        assert_eq!(
+            unmarked_normalized.active_frame_index,
+            normalized.active_frame_index
+        );
+        assert!(bytes.windows(8).any(|window| window == b"maniIRFR"));
+        assert!(
+            unmarked_bytes
+                .windows(8)
+                .any(|window| window == b"maniIRFR")
+        );
+        assert!(bytes.windows(4).any(|window| window == b"shmd"));
+        assert!(unmarked_bytes.windows(4).any(|window| window == b"shmd"));
+        assert!(bytes.windows(4).any(|window| window == b"p2rt"));
+        assert!(!unmarked_bytes.windows(4).any(|window| window == b"p2rt"));
 
         export(&input, &composite, &psb_output, &ExportOptions::default()).expect("export PSB");
         let psb_bytes = fs::read(&psb_output).expect("read PSB");
@@ -2672,12 +2901,9 @@ mod tests {
         let normalized = crate::normalize(&psd).expect("normalize Unicode layer-name PSD");
         assert_eq!(normalized.canvas, (layer_specs.len() as u32, 1));
         assert_eq!(normalized.frames.len(), 1);
-        assert_eq!(normalized.frames[0].duration_ms, Some(100));
+        assert_eq!(normalized.frames[0].duration_ms, None);
 
-        let frame_root = normalized.root_layers.first().expect("frame-group root");
-        assert_eq!(frame_root.name, "Frame 1");
-        assert_eq!(frame_root.children.len(), 1);
-        let normalized_group = &frame_root.children[0];
+        let normalized_group = normalized.root_layers.first().expect("root group");
         assert_eq!(normalized_group.name, "组😀");
         assert_eq!(normalized_group.kind, NormalizedLayerKind::Group);
         assert_eq!(normalized_group.children.len(), layer_specs.len());
@@ -2738,44 +2964,68 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             reimported_names,
-            vec!["组😀", "中文", "é", "e\u{301}", "", "相同", "相同"]
+            vec!["中文", "é", "e\u{301}", "", "相同", "相同"]
         );
-        let reimported_group_index = reimported_file
-            .layers()
-            .iter()
-            .position(|layer| layer.name == "组😀")
-            .expect("reimported Unicode group");
-        for layer_index in 1..reimported_file.layers().len() {
-            assert_eq!(
-                reimported_file.layers()[layer_index].parent,
-                Some(reimported_group_index)
-            );
-        }
+        assert!(
+            reimported_file
+                .layers()
+                .iter()
+                .all(|layer| layer.parent.is_none())
+        );
         fs::remove_dir_all(directory).expect("remove Unicode fixture directory");
     }
 
     #[test]
     fn empty_pixel_layer_policy_omits_only_layers_without_any_cel() {
         assert!(!ExportOptions::default().include_empty_layers);
-
-        let empty = |id: u32| FrameSnapshotLayer {
-            source_layer_id: id,
-            name: format!("empty-{id}"),
-            kind: NormalizedLayerKind::Pixel,
+        let state = |enabled| crate::NormalizedLayerFrameState {
+            frame_index: 0,
+            record_present: true,
+            enabled,
+            explicit_enable: true,
+            offset: None,
+            reference_point: None,
             opacity: None,
-            blend_mode: None,
-            visible: true,
-            cel: None,
-            children: Vec::new(),
         };
-        let populated = |id: u32, has_cel: bool| FrameSnapshotLayer {
+        let pixel = |id, enabled| NormalizedLayer {
+            id,
+            name: format!("layer-{id}"),
+            kind: NormalizedLayerKind::Pixel,
+            bounds: crate::NormalizedBounds {
+                left: 0,
+                top: 0,
+                right: 1,
+                bottom: 1,
+            },
+            opacity: None,
+            blend_mode: None,
+            hidden: None,
+            pixels: Some(crate::NormalizedPixels {
+                width: 1,
+                height: 1,
+                left: 0,
+                top: 0,
+                data: vec![0; 4],
+            }),
+            children: Vec::new(),
+            frame_states: vec![state(enabled)],
+        };
+        let mut layers = vec![pixel(1, false), pixel(2, true)];
+        omit_empty_pixel_layers(&mut layers);
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].id, 2);
+    }
+
+    #[test]
+    fn frame_snapshot_empty_policy_is_sparse_per_frame() {
+        let pixel = |id: u32, has_cel: bool| FrameSnapshotLayer {
             source_layer_id: id,
-            name: format!("populated-{id}"),
+            name: format!("layer-{id}"),
             kind: NormalizedLayerKind::Pixel,
             opacity: None,
             blend_mode: None,
             visible: true,
-            cel: has_cel.then_some(FrameSnapshotCel {
+            cel: has_cel.then_some(crate::aseprite_reader::FrameSnapshotCel {
                 width: 1,
                 height: 1,
                 x: 0,
@@ -2785,21 +3035,36 @@ mod tests {
             }),
             children: Vec::new(),
         };
-        let snapshots = vec![
-            FrameSnapshot {
-                layers: vec![empty(1), populated(2, true)],
-            },
-            FrameSnapshot {
-                layers: vec![empty(1), populated(2, false)],
-            },
+        let snapshots = [
+            vec![pixel(1, true), pixel(2, false), pixel(3, false)],
+            vec![pixel(1, false), pixel(2, true), pixel(3, false)],
+            vec![pixel(1, false), pixel(2, false), pixel(3, true)],
         ];
 
-        let filtered = omit_empty_pixel_layers(&snapshots);
-        assert_eq!(filtered.len(), 2);
-        assert_eq!(filtered[0].layers.len(), 1);
-        assert_eq!(filtered[1].layers.len(), 1);
-        assert_eq!(filtered[0].layers[0].source_layer_id, 2);
-        assert_eq!(filtered[1].layers[0].source_layer_id, 2);
+        let omitted = snapshots
+            .iter()
+            .map(|layers| filter_frame_snapshot_layers(layers, false))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            omitted
+                .iter()
+                .map(|layers| layers.len())
+                .collect::<Vec<_>>(),
+            vec![1, 1, 1]
+        );
+        assert_eq!(
+            omitted
+                .iter()
+                .map(|layers| layers[0].source_layer_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        let included = snapshots
+            .iter()
+            .map(|layers| filter_frame_snapshot_layers(layers, true))
+            .collect::<Vec<_>>();
+        assert!(included.iter().all(|layers| layers.len() == 3));
     }
 
     /// Generates a deterministic PSD fixture and verifies the complete Jitter import path.
@@ -3065,9 +3330,10 @@ mod tests {
             animation_resource_ids: vec![4000],
             animation_frame_flags: None,
             slices: Vec::new(),
+            animation_tags: Vec::new(),
         };
         let mut report = InformationLossReport::default();
-        let psd = build_psd(&document, &[vec![255, 0, 0, 255]], &mut report)
+        let (psd, _) = build_psd(&document, &[vec![255, 0, 0, 255]], &mut report)
             .expect("future blend mode should fall back safely");
 
         assert_eq!(

@@ -8,7 +8,7 @@ use super::{
     AssociationDecision, AssociationDecisionStatus, CandidateGroupReport, CandidateTrackRelation,
     CandidateTrackRelationReport, GroupKey, GroupSegment, PlannedNode, UncertainLayerMode,
 };
-use crate::{NormalizedDocument, NormalizedLayerKind};
+use crate::{NormalizedDocument, NormalizedLayer, NormalizedLayerKind};
 
 pub(super) struct CandidateGroupPath {
     pub(super) name: String,
@@ -714,13 +714,18 @@ pub(super) fn flatten_redundant_common_root(
             .children
             .iter()
             .all(|child| child.kind == NormalizedLayerKind::Pixel);
+    let timeline_bound = layer_has_timeline_variation(layer);
     let all_tracks_cover_children = tracks.iter().all(|track| {
         track.group_paths.iter().any(|path| {
             path.first()
                 .is_some_and(|segment| segment.key == common_key)
         })
     });
-    if transparent && opaque && all_tracks_cover_children && (only_selectors || only_pixels) {
+    if transparent
+        && opaque
+        && all_tracks_cover_children
+        && (only_selectors || (only_pixels && timeline_bound))
+    {
         for path in group_paths.iter_mut() {
             path.remove(0);
         }
@@ -729,4 +734,14 @@ pub(super) fn flatten_redundant_common_root(
             common_name
         ));
     }
+}
+
+/// Returns whether a group or one of its descendants changes across frames.
+fn layer_has_timeline_variation(layer: &NormalizedLayer) -> bool {
+    layer.frame_states.windows(2).any(|pair| {
+        pair[0].enabled != pair[1].enabled
+            || pair[0].offset != pair[1].offset
+            || pair[0].reference_point != pair[1].reference_point
+            || pair[0].opacity != pair[1].opacity
+    }) || layer.children.iter().any(layer_has_timeline_variation)
 }

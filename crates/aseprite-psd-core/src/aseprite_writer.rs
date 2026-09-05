@@ -168,7 +168,28 @@ fn initialize_file(
             .unwrap_or(u32::from(DEFAULT_FRAME_DURATION_MS));
         file.add_frame(u16_value("frame duration", duration)?);
     }
-    if let Some(loop_mode) = &document.loop_mode {
+    if !document.animation_tags.is_empty() {
+        for tag in &document.animation_tags {
+            let start = usize::try_from(tag.from_frame).map_err(|_| WriterError::FormatLimit {
+                field: "tag start".to_string(),
+                value: i64::from(tag.from_frame),
+                max: i64::MAX,
+            })?;
+            let end = usize::try_from(tag.to_frame).map_err(|_| WriterError::FormatLimit {
+                field: "tag end".to_string(),
+                value: i64::from(tag.to_frame),
+                max: i64::MAX,
+            })?;
+            if start > end || end >= document.frames.len() {
+                return Err(WriterError::InvalidFrameIndex {
+                    expected: document.frames.len().saturating_sub(1),
+                    actual: tag.to_frame,
+                });
+            }
+            file.add_tag_with(&tag.name, start..=end, LoopDirection::Forward, 0)
+                .map_err(|error| WriterError::Aseprite(error.to_string()))?;
+        }
+    } else if let Some(loop_mode) = &document.loop_mode {
         let repeat = match loop_mode {
             NormalizedLoopMode::Infinite => 0,
             NormalizedLoopMode::Finite(count) => u16_value("loop repeat count", *count)?,
@@ -729,9 +750,7 @@ fn create_planned_tree<'a>(
                 .map(|(layer, location)| layer_options(layer, location, warnings))
                 .transpose()?
                 .unwrap_or_default();
-            options.visible = source.map_or(true, |layer| {
-                layer.frame_states.iter().any(|state| state.enabled)
-            });
+            options.visible = source.map_or(true, NormalizedLayer::is_visible_in_any_frame);
             let group = match parent {
                 Some(parent) => file.add_group_in_with(name, parent, options),
                 None => file.add_group_with(name, options),
@@ -804,7 +823,7 @@ fn layer_options(
             warnings,
         )?,
         blend_mode: blend_mode(layer.blend_mode.as_deref(), location.clone(), warnings),
-        visible: layer.frame_states.iter().any(|state| state.enabled),
+        visible: layer.is_visible_in_any_frame(),
         ..LayerOptions::default()
     })
 }

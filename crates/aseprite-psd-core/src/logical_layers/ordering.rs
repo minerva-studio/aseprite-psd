@@ -12,6 +12,7 @@ pub(super) fn stable_track_order(
     decisions: &[AssociationDecision],
     anchor_order: &[usize],
     mode: StableOrderMode,
+    prefer_observed_order: bool,
 ) -> Result<(Vec<usize>, Vec<String>), String> {
     if mode == StableOrderMode::Anchor {
         return Ok((anchor_order.to_vec(), Vec::new()));
@@ -88,8 +89,27 @@ pub(super) fn stable_track_order(
         let loser = forward.min(reverse);
         let total = winner + loser;
         let unanimous = winner > 0 && loser == 0;
-        let confident =
-            unanimous || (winner >= 2 && winner >= loser + 2 && winner * 3 >= total * 2);
+        let first_direct_state_containers = tracks[first]
+            .observations
+            .iter()
+            .filter_map(|observation| observation.feature_identity.as_ref())
+            .filter(|identity| identity.member_path.is_empty())
+            .map(|identity| identity.container_id)
+            .collect::<HashSet<_>>();
+        let second_direct_state_containers = tracks[second]
+            .observations
+            .iter()
+            .filter_map(|observation| observation.feature_identity.as_ref())
+            .filter(|identity| identity.member_path.is_empty())
+            .map(|identity| identity.container_id)
+            .collect::<HashSet<_>>();
+        let feature_container_boundary = prefer_observed_order
+            && !first_direct_state_containers.is_empty()
+            && first_direct_state_containers == second_direct_state_containers
+            && !second_direct_state_containers.is_empty();
+        let confident = feature_container_boundary
+            || unanimous
+            || (winner >= 2 && winner >= loser + 2 && winner * 3 >= total * 2);
         if !confident {
             let message = format!(
                 "stable order unresolved for tracks {} ({}) and {} ({}): support {}-{}; anchor order retained",
@@ -116,7 +136,7 @@ pub(super) fn stable_track_order(
             .get(&before)
             .zip(anchor_positions.get(&after))
             .map_or(usize::MAX, |(before, after)| before.abs_diff(*after));
-        if anchor_distance > 1 && !unanimous {
+        if anchor_distance > 1 && !unanimous && !feature_container_boundary {
             let message = format!(
                 "stable order retained anchor barrier between tracks {} ({}) and {} ({}): support {}-{}",
                 before,

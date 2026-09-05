@@ -1380,6 +1380,74 @@ fn recursive_visibility_applies_ancestor_state_without_storing_a_list() {
 }
 
 #[test]
+fn structural_animation_container_uses_animated_descendants() {
+    let mut first = layer(
+        2,
+        NormalizedLayerKind::Pixel,
+        Some(true),
+        Vec::new(),
+        vec![
+            NormalizedLayerFrameState {
+                record_present: true,
+                ..state(0, true)
+            },
+            NormalizedLayerFrameState {
+                frame_index: 1,
+                record_present: true,
+                enabled: false,
+                ..state(1, false)
+            },
+        ],
+    );
+    first.name = "Frame 1".to_string();
+    let mut second = layer(
+        3,
+        NormalizedLayerKind::Pixel,
+        Some(true),
+        Vec::new(),
+        vec![
+            NormalizedLayerFrameState {
+                record_present: true,
+                enabled: false,
+                ..state(0, false)
+            },
+            NormalizedLayerFrameState {
+                frame_index: 1,
+                record_present: true,
+                ..state(1, true)
+            },
+        ],
+    );
+    second.name = "Frame 2".to_string();
+    let container = layer(
+        1,
+        NormalizedLayerKind::Group,
+        Some(true),
+        vec![first, second],
+        vec![
+            NormalizedLayerFrameState {
+                record_present: true,
+                enabled: false,
+                ..state(0, false)
+            },
+            NormalizedLayerFrameState {
+                frame_index: 1,
+                record_present: true,
+                enabled: false,
+                ..state(1, false)
+            },
+        ],
+    );
+    let mut visible_frame_zero = Vec::new();
+    container.collect_visible_pixel_layer_ids(0, true, &mut visible_frame_zero);
+    let mut visible_frame_one = Vec::new();
+    container.collect_visible_pixel_layer_ids(1, true, &mut visible_frame_one);
+    assert_eq!(visible_frame_zero, vec![2]);
+    assert_eq!(visible_frame_one, vec![3]);
+    assert!(container.is_effectively_visible(0, true));
+}
+
+#[test]
 fn static_frame_has_no_serialization_duration() {
     let frame = NormalizedFrame {
         index: 0,
@@ -1446,7 +1514,7 @@ fn top_level_frame_source_keeps_background_shared() {
             .iter()
             .map(|state| state.enabled)
             .collect::<Vec<_>>(),
-        vec![false, false]
+        vec![true, true]
     );
     assert_eq!(
         document.root_layers[1]
@@ -1470,10 +1538,375 @@ fn top_level_frame_source_keeps_background_shared() {
             .iter()
             .map(|state| state.enabled)
             .collect::<Vec<_>>(),
-        vec![false, false]
+        vec![false, true]
     );
-    assert!(warnings[0].contains("2 top-level frames"));
-    assert!(warnings[0].contains("Background"));
+    assert!(warnings[0].contains("layer-depth:0"));
+    assert!(warnings[0].contains("2 frames"));
+}
+
+#[test]
+fn layer_depth_one_creates_tag_ranges_and_preserves_root_background() {
+    let frame = |id: u32, name: &str| {
+        let mut layer = layer(
+            id,
+            NormalizedLayerKind::Pixel,
+            Some(false),
+            Vec::new(),
+            vec![state(0, true)],
+        );
+        layer.name = name.to_string();
+        layer
+    };
+    let mut idle = layer(
+        10,
+        NormalizedLayerKind::Group,
+        Some(false),
+        vec![frame(11, "Idle 1"), frame(12, "Idle 2")],
+        vec![state(0, true)],
+    );
+    idle.name = "Idle".to_string();
+    let mut walk = layer(
+        20,
+        NormalizedLayerKind::Group,
+        Some(false),
+        vec![frame(21, "Walk 1"), frame(22, "Walk 2")],
+        vec![state(0, true)],
+    );
+    walk.name = "Walk".to_string();
+    let mut background = frame(1, "Background");
+    background.hidden = Some(false);
+    let mut document = NormalizedDocument {
+        root_layers: vec![background, idle, walk],
+        frames: vec![NormalizedFrame {
+            index: 0,
+            source_id: None,
+            duration_ms: None,
+            dispose: None,
+        }],
+        ..Default::default()
+    };
+
+    let warnings = apply_frame_source(&mut document, FrameSource::LayerDepth(1))
+        .expect("depth-one frames should be constructed");
+
+    assert_eq!(document.frames.len(), 4);
+    assert!(
+        document
+            .frames
+            .iter()
+            .all(|frame| frame.duration_ms == Some(100))
+    );
+    assert_eq!(
+        document.animation_tags,
+        vec![
+            crate::NormalizedTag {
+                name: "Idle".to_string(),
+                from_frame: 0,
+                to_frame: 1
+            },
+            crate::NormalizedTag {
+                name: "Walk".to_string(),
+                from_frame: 2,
+                to_frame: 3
+            },
+        ]
+    );
+    assert!(
+        document.root_layers[0]
+            .frame_states
+            .iter()
+            .all(|state| state.enabled)
+    );
+    assert!(warnings[0].contains("layer-depth:1"));
+    assert!(warnings[0].contains("100 ms fallback"));
+}
+
+#[test]
+fn layer_depth_frame_enables_the_selected_hidden_subtree_only() {
+    let mut hidden_pixel = layer(
+        12,
+        NormalizedLayerKind::Pixel,
+        Some(true),
+        Vec::new(),
+        vec![state(0, false)],
+    );
+    hidden_pixel.name = "Hidden pixels".to_string();
+    let mut hidden_group = layer(
+        11,
+        NormalizedLayerKind::Group,
+        Some(true),
+        vec![hidden_pixel],
+        vec![state(0, false)],
+    );
+    hidden_group.name = "Hidden group".to_string();
+    let mut selected = layer(
+        10,
+        NormalizedLayerKind::Group,
+        Some(true),
+        vec![hidden_group],
+        vec![state(0, false)],
+    );
+    selected.name = "Frame 1".to_string();
+
+    let mut other_pixel = layer(
+        22,
+        NormalizedLayerKind::Pixel,
+        Some(false),
+        Vec::new(),
+        vec![state(0, true)],
+    );
+    other_pixel.name = "Other pixels".to_string();
+    let mut other = layer(
+        20,
+        NormalizedLayerKind::Group,
+        Some(false),
+        vec![other_pixel],
+        vec![state(0, true)],
+    );
+    other.name = "Frame 2".to_string();
+
+    let mut animation = layer(
+        1,
+        NormalizedLayerKind::Group,
+        Some(true),
+        vec![selected, other],
+        vec![state(0, false)],
+    );
+    animation.name = "Animation".to_string();
+    let mut document = NormalizedDocument {
+        root_layers: vec![animation],
+        frames: vec![NormalizedFrame {
+            index: 0,
+            source_id: None,
+            duration_ms: None,
+            dispose: None,
+        }],
+        ..Default::default()
+    };
+
+    apply_frame_source(&mut document, FrameSource::LayerDepth(1))
+        .expect("hidden frame subtrees should be interpreted as authored pictures");
+
+    let animation = &document.root_layers[0];
+    assert_eq!(
+        animation
+            .frame_states
+            .iter()
+            .map(|state| state.enabled)
+            .collect::<Vec<_>>(),
+        vec![true, true]
+    );
+    let selected = &animation.children[0];
+    assert!(selected.frame_states[0].enabled);
+    assert!(selected.children[0].frame_states[0].enabled);
+    assert!(selected.children[0].children[0].frame_states[0].enabled);
+    assert!(!selected.frame_states[1].enabled);
+    let other = &animation.children[1];
+    assert!(!other.frame_states[0].enabled);
+    assert!(!other.children[0].frame_states[0].enabled);
+    assert!(other.frame_states[1].enabled);
+    assert!(other.children[0].frame_states[1].enabled);
+}
+
+#[test]
+fn feature_layer_depth_replays_pixel_children_on_the_source_timeline() {
+    let source_frames = (0..6)
+        .map(|index| NormalizedFrame {
+            index,
+            source_id: Some(100 + index),
+            duration_ms: Some(200),
+            dispose: None,
+        })
+        .collect::<Vec<_>>();
+    let pixel = |id: u32, name: &str, enabled: Vec<bool>| {
+        let mut value = layer(
+            id,
+            NormalizedLayerKind::Pixel,
+            Some(false),
+            Vec::new(),
+            enabled
+                .into_iter()
+                .enumerate()
+                .map(|(index, enabled)| state(index as u32, enabled))
+                .collect(),
+        );
+        for state in &mut value.frame_states {
+            state.record_present = true;
+        }
+        value.name = name.to_string();
+        value
+    };
+    let timeline_state = |frame_index: u32, enabled: bool| {
+        let mut value = state(frame_index, enabled);
+        value.record_present = true;
+        value
+    };
+    let mut body_frame_one = layer(
+        11,
+        NormalizedLayerKind::Group,
+        Some(false),
+        vec![pixel(
+            12,
+            "Body pixel",
+            vec![true, true, true, true, true, true],
+        )],
+        vec![
+            timeline_state(0, true),
+            timeline_state(1, false),
+            timeline_state(2, false),
+            timeline_state(3, false),
+            timeline_state(4, false),
+            timeline_state(5, false),
+        ],
+    );
+    body_frame_one.name = "1".to_string();
+    let mut body_frame_two = layer(
+        13,
+        NormalizedLayerKind::Group,
+        Some(false),
+        vec![pixel(
+            14,
+            "Body pixel",
+            vec![false, true, true, true, true, true],
+        )],
+        vec![
+            timeline_state(0, false),
+            timeline_state(1, true),
+            timeline_state(2, false),
+            timeline_state(3, false),
+            timeline_state(4, false),
+            timeline_state(5, false),
+        ],
+    );
+    body_frame_two.name = "2".to_string();
+    let mut body = layer(
+        10,
+        NormalizedLayerKind::Group,
+        Some(true),
+        vec![body_frame_one, body_frame_two],
+        vec![
+            timeline_state(0, true),
+            timeline_state(1, true),
+            timeline_state(2, true),
+            timeline_state(3, true),
+            timeline_state(4, true),
+            timeline_state(5, true),
+        ],
+    );
+    body.name = "Body".to_string();
+
+    let mut feature = layer(
+        20,
+        NormalizedLayerKind::Group,
+        Some(true),
+        vec![
+            pixel(21, "Base", vec![true, true, true, true, true, true]),
+            pixel(22, "Variant", vec![true, false, true, false, false, false]),
+        ],
+        vec![
+            timeline_state(0, false),
+            timeline_state(1, false),
+            timeline_state(2, false),
+            timeline_state(3, false),
+            timeline_state(4, false),
+            timeline_state(5, false),
+        ],
+    );
+    feature.name = "Dizzy".to_string();
+    let mut sibling_feature = layer(
+        30,
+        NormalizedLayerKind::Group,
+        Some(true),
+        vec![pixel(
+            31,
+            "Other",
+            vec![false, true, false, false, false, false],
+        )],
+        vec![
+            timeline_state(0, false),
+            timeline_state(1, false),
+            timeline_state(2, false),
+            timeline_state(3, false),
+            timeline_state(4, false),
+            timeline_state(5, false),
+        ],
+    );
+    sibling_feature.name = "Other feature".to_string();
+
+    let mut document = NormalizedDocument {
+        root_layers: vec![body, feature, sibling_feature],
+        frames: source_frames,
+        animation_resource_ids: vec![4000],
+        ..Default::default()
+    };
+
+    let warnings =
+        apply_frame_source_with_feature_mode(&mut document, FrameSource::LayerDepth(1), true)
+            .expect("feature-aware layer depth should be constructed");
+
+    assert_eq!(document.frames.len(), 18);
+    assert!(
+        document
+            .frames
+            .iter()
+            .all(|frame| frame.duration_ms == Some(200))
+    );
+    assert_eq!(
+        document.animation_tags,
+        vec![
+            crate::NormalizedTag {
+                name: "Body".to_string(),
+                from_frame: 0,
+                to_frame: 5,
+            },
+            crate::NormalizedTag {
+                name: "Dizzy".to_string(),
+                from_frame: 6,
+                to_frame: 11,
+            },
+            crate::NormalizedTag {
+                name: "Other feature".to_string(),
+                from_frame: 12,
+                to_frame: 17,
+            },
+        ]
+    );
+    assert!(warnings[0].contains("timeline-bound frames: 18"));
+    assert!(warnings[0].contains("timeline-bound containers: 3"));
+    assert!(warnings[0].contains("exclusive feature containers: 2"));
+    assert_eq!(
+        document.root_layers[1]
+            .frame_states
+            .iter()
+            .map(|state| state.enabled)
+            .collect::<Vec<_>>(),
+        vec![
+            false, false, false, false, false, false, true, true, true, true, true, true, false,
+            false, false, false, false, false,
+        ]
+    );
+    assert_eq!(
+        document.root_layers[2]
+            .frame_states
+            .iter()
+            .map(|state| state.enabled)
+            .collect::<Vec<_>>(),
+        vec![
+            false, false, false, false, false, false, false, false, false, false, false, false,
+            true, true, true, true, true, true,
+        ]
+    );
+    assert_eq!(
+        document.root_layers[1].children[1]
+            .frame_states
+            .iter()
+            .map(|state| state.enabled)
+            .collect::<Vec<_>>(),
+        vec![
+            false, false, false, false, false, false, true, false, true, false, false, false,
+            false, false, false, false, false, false,
+        ]
+    );
 }
 
 #[test]
@@ -1517,14 +1950,14 @@ fn automatic_frame_source_does_not_infer_top_level_animation() {
 }
 
 #[test]
-fn top_level_frame_source_rejects_photoshop_timeline() {
+fn explicit_layer_depth_can_replace_photoshop_timeline() {
     let mut document = NormalizedDocument {
         animation_resource_ids: vec![4000],
         ..Default::default()
     };
     let error = apply_frame_source(&mut document, FrameSource::TopLevel)
-        .expect_err("timeline input must not be reinterpreted");
-    assert!(error.contains("cannot replace a Photoshop timeline"));
+        .expect_err("an empty hierarchy cannot provide layer-derived frames");
+    assert!(error.contains("found no non-background layers"));
 }
 
 #[test]

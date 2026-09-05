@@ -51,7 +51,7 @@ fn automatic_association_defaults_to_conservative() {
 }
 
 #[test]
-fn frame_source_defaults_to_auto_and_accepts_top_level() {
+fn frame_source_defaults_to_auto_and_accepts_explicit_sources() {
     let default =
         convert_arguments(&arguments(&["input.psd"])).expect("default conversion should parse");
     assert_eq!(default.frame_source, FrameSource::Auto);
@@ -59,6 +59,18 @@ fn frame_source_defaults_to_auto_and_accepts_top_level() {
     let top_level = convert_arguments(&arguments(&["input.psd", "--frame-source", "top-level"]))
         .expect("top-level frame source should parse");
     assert_eq!(top_level.frame_source, FrameSource::TopLevel);
+
+    let timeline = convert_arguments(&arguments(&["input.psd", "--frame-source", "timeline"]))
+        .expect("timeline frame source should parse");
+    assert_eq!(timeline.frame_source, FrameSource::Timeline);
+
+    let layer_depth = convert_arguments(&arguments(&[
+        "input.psd",
+        "--frame-source",
+        "layer-depth:1",
+    ]))
+    .expect("layer-depth frame source should parse");
+    assert_eq!(layer_depth.frame_source, FrameSource::LayerDepth(1));
 }
 
 #[test]
@@ -150,6 +162,49 @@ fn extension_compact_arguments_use_the_requested_ordering() {
             z_order: LayerZOrderMode::Auto,
             stable_order: StableOrderMode::Anchor,
         })
+    );
+}
+
+#[test]
+fn extension_feature_arguments_are_explicit_and_keep_defaults_for_other_options() {
+    let command = convert_arguments(&arguments(&[
+        "input.psd",
+        "--frame-source",
+        "layer-depth:1",
+        "--layer-association",
+        "auto",
+        "--association-strategy",
+        "feature",
+    ]))
+    .expect("feature association should parse");
+
+    assert_eq!(
+        command.layer_association,
+        LayerAssociation::Auto(AutoAssociationOptions {
+            strategy: AssociationStrategy::Feature,
+            z_order: LayerZOrderMode::Stable,
+            stable_order: StableOrderMode::Consensus,
+        })
+    );
+    assert_eq!(command.frame_source, FrameSource::LayerDepth(1));
+}
+
+#[test]
+fn feature_association_rejects_uncertain_layer_presentation() {
+    let error = convert_arguments(&arguments(&[
+        "input.psd",
+        "--layer-association",
+        "auto",
+        "--association-strategy",
+        "feature",
+        "--uncertain-layers",
+        "flat",
+    ]))
+    .expect_err("feature association has no candidate-folder uncertainty policy");
+
+    assert_eq!(
+        error.to_string(),
+        "--uncertain-layers requires --association-strategy conservative"
     );
 }
 

@@ -1,6 +1,7 @@
 //! Experimental cross-frame layer association and Aseprite write planning.
 
 mod association;
+mod feature_grouping;
 mod layout;
 mod matching;
 mod observation;
@@ -10,13 +11,15 @@ mod report;
 use std::collections::{HashMap, HashSet};
 
 use self::association::AssociationEngine;
+use self::association::merge_feature_tracks;
+use self::feature_grouping::organize_feature_nodes;
 use self::layout::{
     build_nodes, choose_group_paths, flatten_redundant_common_root, plan_candidate_groups,
     validate_candidate_group_topology,
 };
 use self::observation::{
     ObservationCollectionState, ObservationStore, collect_observations, collect_pixel_layer_ids,
-    find_frame_selector_groups,
+    find_feature_containers, find_frame_selector_groups,
 };
 use self::ordering::{anchor_track_order, assign_z_indices, stable_track_order};
 use self::report::{
@@ -25,6 +28,14 @@ use self::report::{
 
 use crate::NormalizedDocument;
 use crate::layer_names::{COPY_SUFFIX_CATALOG_VERSION, CopySuffixMatch};
+
+/// Selects which evidence policy an association pass may use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssociationEvidencePolicy {
+    SourceIdentityOnly,
+    ExistingAuto,
+    Feature,
+}
 
 /// Selects whether the writer should preserve the PSD source tree or infer
 /// long-lived logical layer tracks across animation frames.
@@ -60,6 +71,8 @@ pub enum AssociationStrategy {
         /// Selects whether uncertain tracks are grouped for review.
         uncertain_layers: UncertainLayerMode,
     },
+    /// Organize observations into explainable feature tracks across animation containers.
+    Feature,
 }
 
 impl Default for AssociationStrategy {
@@ -76,6 +89,7 @@ impl AssociationStrategy {
         match self {
             Self::Compact => "Compact",
             Self::Conservative { .. } => "Conservative",
+            Self::Feature => "Feature",
         }
     }
 
@@ -84,6 +98,7 @@ impl AssociationStrategy {
         match self {
             Self::Compact => UncertainLayerMode::Group,
             Self::Conservative { uncertain_layers } => uncertain_layers,
+            Self::Feature => UncertainLayerMode::Flat,
         }
     }
 }
@@ -236,6 +251,12 @@ pub struct AssociationReport {
     pub decisions: Vec<AssociationDecision>,
     /// Non-fatal limitations and conservative fallbacks.
     pub warnings: Vec<String>,
+    /// Deterministic whole-track merges performed by Feature compression.
+    pub track_merge_diagnostics: Vec<String>,
+    /// Candidate track pairs rejected with an explainable constraint.
+    pub track_merge_rejection_diagnostics: Vec<String>,
+    /// Feature organization groups created or rejected after final ordering.
+    pub feature_group_diagnostics: Vec<String>,
 }
 
 /// Describes one presentation-only candidate folder.
@@ -414,6 +435,11 @@ pub(crate) fn build_layer_write_plan_with_context(
     let stable_order_mode = options.stable_order;
     let uncertain_layer_mode = strategy.uncertain_layers();
     let selectors = find_frame_selector_groups(&document.root_layers, document.frames.len());
+    let feature_containers = if matches!(strategy, AssociationStrategy::Feature) {
+        find_feature_containers(&document.root_layers, &selectors)
+    } else {
+        HashMap::new()
+    };
     let mut observation_store = ObservationStore::new(document.frames.len());
     let mut source_order = 0;
     let mut next_observation_id = 0;
@@ -424,6 +450,7 @@ pub(crate) fn build_layer_write_plan_with_context(
             next_observation_id: &mut next_observation_id,
             store: &mut observation_store,
             preserve_photoshop_metadata,
+            feature_containers: &feature_containers,
         };
         for (root_index, layer) in document.root_layers.iter().enumerate() {
             collect_observations(
@@ -431,6 +458,9 @@ pub(crate) fn build_layer_write_plan_with_context(
                 &[root_index.to_string()],
                 &[],
                 &[],
+                &[],
+                false,
+                None,
                 &[],
                 false,
                 &mut collection,
@@ -468,6 +498,9 @@ pub(crate) fn build_layer_write_plan_with_context(
                         "automatic layer association found no source layers; emitted an empty layer plan"
                             .to_string(),
                     ],
+                    track_merge_diagnostics: Vec::new(),
+                    track_merge_rejection_diagnostics: Vec::new(),
+                    feature_group_diagnostics: Vec::new(),
                 },
             });
         }
@@ -502,17 +535,41 @@ pub(crate) fn build_layer_write_plan_with_context(
         document.frames.len(),
     );
     engine.seed_anchor();
-    engine.associate(strategy, z_order_mode, allow_inferred_cross_source_matches);
+    let evidence_policy = if matches!(strategy, AssociationStrategy::Feature) {
+        AssociationEvidencePolicy::Feature
+    } else if allow_inferred_cross_source_matches {
+        AssociationEvidencePolicy::ExistingAuto
+    } else {
+        AssociationEvidencePolicy::SourceIdentityOnly
+    };
+    engine.associate(strategy, z_order_mode, evidence_policy);
     let mut association = engine.into_output();
     let frames = &association.observations.frames;
     let tracks = &mut association.tracks;
     let decisions = &mut association.decisions;
     let selectors = &association.selectors;
 
+    let merge_diagnostics = if evidence_policy == AssociationEvidencePolicy::Feature {
+        merge_feature_tracks(tracks, decisions)
+    } else {
+        association::FeatureTrackMergeDiagnostics::default()
+    };
+
+    if evidence_policy == AssociationEvidencePolicy::Feature {
+        validate_feature_conservation(frames, tracks, decisions)?;
+    }
+
     let mut warnings = Vec::new();
     let anchor_order = anchor_track_order(tracks);
     let (track_order, mut stable_order_diagnostics) = if z_order_mode == LayerZOrderMode::Stable {
-        stable_track_order(tracks, frames, decisions, &anchor_order, stable_order_mode)?
+        stable_track_order(
+            tracks,
+            frames,
+            decisions,
+            &anchor_order,
+            stable_order_mode,
+            matches!(strategy, AssociationStrategy::Feature),
+        )?
     } else {
         (anchor_order, Vec::new())
     };
@@ -545,7 +602,8 @@ pub(crate) fn build_layer_write_plan_with_context(
     });
     let mut group_paths = choose_group_paths(tracks, document, &mut warnings);
     flatten_redundant_common_root(&mut group_paths, tracks, document, selectors, &mut warnings);
-    let (candidate_groups, candidate_group_paths) = if allow_inferred_cross_source_matches
+    let (candidate_groups, candidate_group_paths) = if evidence_policy
+        == AssociationEvidencePolicy::ExistingAuto
         && matches!(strategy, AssociationStrategy::Conservative { .. })
     {
         plan_candidate_groups(
@@ -559,7 +617,23 @@ pub(crate) fn build_layer_write_plan_with_context(
     } else {
         (Vec::new(), HashMap::new())
     };
-    let root_nodes = build_nodes(&group_paths, &track_order, &candidate_group_paths);
+    let mut root_nodes = build_nodes(&group_paths, &track_order, &candidate_group_paths);
+    let feature_group_diagnostics = if evidence_policy == AssociationEvidencePolicy::Feature {
+        let feature_meta = feature_containers
+            .iter()
+            .map(|(id, container)| {
+                let order = document
+                    .root_layers
+                    .iter()
+                    .position(|layer| layer.id == *id)
+                    .unwrap_or(usize::MAX);
+                (*id, (container.name.clone(), order))
+            })
+            .collect::<HashMap<_, _>>();
+        organize_feature_nodes(&mut root_nodes, tracks, &feature_meta)
+    } else {
+        Vec::new()
+    };
     validate_candidate_group_topology(&root_nodes, &candidate_groups)?;
     let mut plan = LayerWritePlan {
         root_nodes,
@@ -590,10 +664,51 @@ pub(crate) fn build_layer_write_plan_with_context(
             candidate_groups,
             decisions: std::mem::take(decisions),
             warnings,
+            track_merge_diagnostics: merge_diagnostics.merges,
+            track_merge_rejection_diagnostics: merge_diagnostics.rejections,
+            feature_group_diagnostics,
         },
     };
     plan.report.z_order_diagnostics = assign_z_indices(&mut plan, frames, z_order_mode)?;
     Ok(plan)
+}
+
+/// Verifies that Feature association preserves every visible observation exactly once.
+fn validate_feature_conservation(
+    frames: &[Vec<observation::Observation<'_>>],
+    tracks: &[association::TrackBuilder<'_>],
+    decisions: &[AssociationDecision],
+) -> Result<(), String> {
+    let expected = frames
+        .iter()
+        .flat_map(|frame| frame.iter().map(|item| item.id))
+        .collect::<HashSet<_>>();
+    let assigned = tracks
+        .iter()
+        .flat_map(|track| track.observation_ids.iter().copied())
+        .collect::<Vec<_>>();
+    let unique_assigned = assigned.iter().copied().collect::<HashSet<_>>();
+    let cel_count = tracks
+        .iter()
+        .flat_map(|track| track.cels.iter())
+        .filter(|cel| cel.is_some())
+        .count();
+    if assigned.len() != expected.len()
+        || unique_assigned.len() != assigned.len()
+        || unique_assigned != expected
+        || cel_count != expected.len()
+        || decisions.len() != expected.len()
+    {
+        return Err(format!(
+            "feature association lost observation ownership: input={}, assigned={}, unique={}, cels={}, decisions={}",
+            expected.len(),
+            assigned.len(),
+            unique_assigned.len(),
+            cel_count,
+            decisions.len()
+        ));
+    }
+    Ok(())
 }
 #[cfg(test)]
 #[path = "tests/logical_layers.rs"]

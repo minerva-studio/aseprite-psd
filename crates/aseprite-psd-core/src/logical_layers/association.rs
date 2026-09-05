@@ -4,12 +4,14 @@ use std::rc::Rc;
 
 use super::matching::find_best_weighted_matching;
 use super::observation::{
-    FrameContainerInfo, LayerEvidence, Observation, ObservationId, ObservationStore,
+    FeatureIdentity, FrameContainerInfo, LayerEvidence, Observation, ObservationId,
+    ObservationStore,
 };
 use super::ordering::alpha_overlap;
 use super::{
-    AssociationDecision, AssociationDecisionStatus, AssociationExclusionKind, AssociationPhase,
-    AssociationStrategy, CopySuffixMatch, GroupSegment, LayerZOrderMode, PlannedCel,
+    AssociationDecision, AssociationDecisionStatus, AssociationEvidencePolicy,
+    AssociationExclusionKind, AssociationPhase, AssociationStrategy, CopySuffixMatch, GroupSegment,
+    LayerZOrderMode, PlannedCel,
 };
 use crate::layer_names::{CopySuffixCatalog, ParsedLayerName};
 
@@ -75,6 +77,13 @@ pub(super) struct AssociationOutput<'doc> {
     pub(super) decisions: Vec<AssociationDecision>,
 }
 
+/// Diagnostics emitted by the Feature-only global track compression pass.
+#[derive(Debug, Default)]
+pub(super) struct FeatureTrackMergeDiagnostics {
+    pub(super) merges: Vec<String>,
+    pub(super) rejections: Vec<String>,
+}
+
 impl<'doc> AssociationEngine<'doc> {
     /// Creates the single owner of mutable association state.
     pub(super) fn new(
@@ -132,7 +141,7 @@ impl<'doc> AssociationEngine<'doc> {
         &mut self,
         strategy: AssociationStrategy,
         z_order_mode: LayerZOrderMode,
-        allow_inferred_cross_source_matches: bool,
+        evidence_policy: AssociationEvidencePolicy,
     ) {
         let mut frame_order = (0..self.observations.frames.len()).collect::<Vec<_>>();
         frame_order.sort_by_key(|frame_index| {
@@ -147,24 +156,36 @@ impl<'doc> AssociationEngine<'doc> {
             if frame_index == self.anchor_frame {
                 continue;
             }
-            if !allow_inferred_cross_source_matches {
-                associate_frame_by_source_identity(
-                    &self.observations.frames[frame_index],
-                    &mut self.tracks,
-                    self.frame_count,
-                    &mut self.decisions,
-                );
-                continue;
+            match evidence_policy {
+                AssociationEvidencePolicy::SourceIdentityOnly => {
+                    associate_frame_by_source_identity(
+                        &self.observations.frames[frame_index],
+                        &mut self.tracks,
+                        self.frame_count,
+                        &mut self.decisions,
+                    );
+                }
+                AssociationEvidencePolicy::ExistingAuto => {
+                    associate_frame_compact(
+                        &self.observations.frames[frame_index],
+                        &mut self.tracks,
+                        self.frame_count,
+                        &self.selectors,
+                        matches!(strategy, AssociationStrategy::Conservative { .. }),
+                        z_order_mode == LayerZOrderMode::Auto,
+                        &mut self.decisions,
+                    );
+                }
+                AssociationEvidencePolicy::Feature => {
+                    associate_frame_features(
+                        &self.observations.frames[frame_index],
+                        &mut self.tracks,
+                        self.frame_count,
+                        &self.selectors,
+                        &mut self.decisions,
+                    );
+                }
             }
-            associate_frame_compact(
-                &self.observations.frames[frame_index],
-                &mut self.tracks,
-                self.frame_count,
-                &self.selectors,
-                matches!(strategy, AssociationStrategy::Conservative { .. }),
-                z_order_mode == LayerZOrderMode::Auto,
-                &mut self.decisions,
-            );
         }
     }
 
@@ -177,6 +198,495 @@ impl<'doc> AssociationEngine<'doc> {
             decisions: self.decisions,
         }
     }
+}
+
+/// Associates observations into stable feature tracks using only explicit identity evidence.
+fn associate_frame_features<'doc>(
+    observations: &[Observation<'doc>],
+    tracks: &mut Vec<TrackBuilder<'doc>>,
+    frame_count: usize,
+    selectors: &HashMap<u32, FrameContainerInfo>,
+    decisions: &mut Vec<AssociationDecision>,
+) {
+    for observation in observations {
+        let available = |track: &&mut TrackBuilder<'doc>| {
+            track.cels[observation.frame_index].is_none() && identity_allowed(observation, track)
+        };
+
+        let exact_source = tracks
+            .iter_mut()
+            .filter(available)
+            .filter(|track| {
+                track
+                    .observations
+                    .iter()
+                    .all(|previous| previous.source_layer_id == observation.source_layer_id)
+            })
+            .map(|track| track.id)
+            .collect::<Vec<_>>();
+        let feature = tracks
+            .iter_mut()
+            .filter(available)
+            .filter(|track| {
+                observation.feature_identity.is_some()
+                    && track.observations.iter().all(|previous| {
+                        previous.feature_identity.as_ref() == observation.feature_identity.as_ref()
+                    })
+            })
+            .map(|track| track.id)
+            .collect::<Vec<_>>();
+        let named = if observation.feature_identity.is_some()
+            || exact_source.len() == 1
+            || feature.len() == 1
+        {
+            Vec::new()
+        } else {
+            tracks
+                .iter_mut()
+                .filter(available)
+                .filter(|track| {
+                    !observation.generic_name
+                        && !track.generic_name
+                        && track.normalized_name == observation.normalized_name
+                        && stable_feature_path_match(observation, track)
+                })
+                .map(|track| track.id)
+                .collect::<Vec<_>>()
+        };
+        let named_pixel = if named.len() > 1 {
+            named
+                .iter()
+                .copied()
+                .filter(|track_id| exact_pixel_match(observation, &tracks[*track_id]))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let pixel = if observation.feature_identity.is_some()
+            || exact_source.len() == 1
+            || feature.len() == 1
+            || named.len() == 1
+            || named_pixel.len() == 1
+        {
+            Vec::new()
+        } else {
+            tracks
+                .iter_mut()
+                .filter(available)
+                .filter(|track| {
+                    stable_feature_path_match(observation, track)
+                        && exact_pixel_match(observation, track)
+                })
+                .map(|track| track.id)
+                .collect::<Vec<_>>()
+        };
+
+        let (track_id, status, phase, score, evidence) = if exact_source.len() == 1 {
+            (
+                exact_source[0],
+                AssociationDecisionStatus::Strong,
+                AssociationPhase::Family,
+                100,
+                vec!["exact-source-id".to_string()],
+            )
+        } else if feature.len() == 1 {
+            (
+                feature[0],
+                AssociationDecisionStatus::Strong,
+                AssociationPhase::Family,
+                100,
+                vec![
+                    "feature-container-identity".to_string(),
+                    "feature-relative-path".to_string(),
+                ],
+            )
+        } else if named.len() == 1 {
+            (
+                named[0],
+                AssociationDecisionStatus::Strong,
+                AssociationPhase::Family,
+                100,
+                vec![
+                    "feature-name".to_string(),
+                    "stable-feature-path".to_string(),
+                ],
+            )
+        } else if named_pixel.len() == 1 {
+            (
+                named_pixel[0],
+                AssociationDecisionStatus::Inferred,
+                AssociationPhase::ExactPixels,
+                100,
+                vec![
+                    "feature-name".to_string(),
+                    "stable-feature-path".to_string(),
+                    "exact-RGBA-pixels".to_string(),
+                ],
+            )
+        } else if pixel.len() == 1 {
+            (
+                pixel[0],
+                AssociationDecisionStatus::Inferred,
+                AssociationPhase::ExactPixels,
+                100,
+                vec![
+                    "stable-feature-path".to_string(),
+                    "exact-RGBA-pixels".to_string(),
+                ],
+            )
+        } else {
+            let track_id = tracks.len();
+            tracks.push(new_track(track_id, observation, frame_count));
+            (
+                track_id,
+                AssociationDecisionStatus::NewTrack,
+                AssociationPhase::NewTrack,
+                0,
+                vec![
+                    if exact_source.len() > 1
+                        || feature.len() > 1
+                        || named.len() > 1
+                        || named_pixel.len() > 1
+                        || pixel.len() > 1
+                    {
+                        "ambiguous-feature-identity"
+                    } else {
+                        "no-feature-identity"
+                    }
+                    .to_string(),
+                ],
+            )
+        };
+        let mut association_decision = decision(
+            observation,
+            track_id,
+            status,
+            score,
+            if status == AssociationDecisionStatus::NewTrack {
+                0
+            } else {
+                100
+            },
+            evidence,
+            Vec::new(),
+        );
+        association_decision.association_phase = phase;
+        association_decision.exclusion_evidence =
+            exclusion_evidence(observation, &tracks[track_id], selectors);
+        decisions.push(association_decision);
+        record_assignment(
+            &mut tracks[track_id],
+            observation,
+            PlannedCel {
+                source_layer_id: observation.source_layer_id,
+                source_frame_index: observation.frame_index as u32,
+                z_index: 0,
+            },
+        );
+    }
+}
+
+fn stable_feature_path_match(observation: &Observation, track: &TrackBuilder) -> bool {
+    track.group_paths.iter().any(|path| {
+        path.len() == observation.group_path.len()
+            && path
+                .iter()
+                .zip(&observation.group_path)
+                .all(|(left, right)| left.name == right.name && left.key == right.key)
+    })
+}
+
+/// Compresses compatible Feature tracks after frame-local association is complete.
+pub(super) fn merge_feature_tracks(
+    tracks: &mut Vec<TrackBuilder<'_>>,
+    decisions: &mut [AssociationDecision],
+) -> FeatureTrackMergeDiagnostics {
+    let mut diagnostics = FeatureTrackMergeDiagnostics::default();
+    let mut lineages = tracks
+        .iter()
+        .map(|track| vec![track.id])
+        .collect::<Vec<_>>();
+    let mut events = Vec::<(Vec<usize>, Vec<usize>, Vec<usize>, String)>::new();
+
+    loop {
+        let mut candidates = Vec::new();
+        for left in 0..tracks.len() {
+            for right in left + 1..tracks.len() {
+                let Some((priority, reason)) = merge_candidate_kind(&tracks[left], &tracks[right])
+                else {
+                    continue;
+                };
+                let rejection = merge_rejection_reason(left, right, tracks);
+                candidates.push((
+                    priority,
+                    track_sort_key(&tracks[left]),
+                    track_sort_key(&tracks[right]),
+                    left,
+                    right,
+                    reason,
+                    rejection,
+                ));
+            }
+        }
+        candidates.sort_by(|left, right| {
+            (left.0, &left.1, &left.2, left.3, left.4)
+                .cmp(&(right.0, &right.1, &right.2, right.3, right.4))
+        });
+
+        let mut merged = false;
+        for (_, _, _, left, right, reason, rejection) in candidates {
+            if let Some(rejection) = rejection {
+                diagnostics.rejections.push(format!(
+                    "tracks {} and {} rejected: {}",
+                    tracks[left].id, tracks[right].id, rejection
+                ));
+                continue;
+            }
+            let left_lineage = lineages[left].clone();
+            let right_lineage = lineages[right].clone();
+            let right_track = tracks[right].clone();
+            merge_track_into(&mut tracks[left], &right_track);
+            let mut merged_frames = occupied_frames(&tracks[left])
+                .into_iter()
+                .collect::<Vec<_>>();
+            merged_frames.sort_unstable();
+            lineages[left].extend(right_lineage.iter().copied());
+            tracks.remove(right);
+            lineages.remove(right);
+            for track in tracks.iter_mut().skip(left) {
+                track.id -= usize::from(track.id > right);
+            }
+            for decision in decisions.iter_mut() {
+                if decision.track_id == right {
+                    decision.track_id = left;
+                } else if decision.track_id > right {
+                    decision.track_id -= 1;
+                }
+            }
+            events.push((left_lineage, right_lineage, merged_frames, reason));
+            merged = true;
+            break;
+        }
+        if !merged {
+            break;
+        }
+    }
+
+    for (left, right, frames, reason) in events {
+        let lineage = left.iter().chain(&right).copied().collect::<HashSet<_>>();
+        let final_track = lineages
+            .iter()
+            .position(|candidate| candidate.iter().any(|id| lineage.contains(id)))
+            .unwrap_or_default();
+        diagnostics.merges.push(format!(
+            "merged tracks {:?} + {:?} -> {} frames={:?} evidence={}",
+            left, right, final_track, frames, reason
+        ));
+    }
+    diagnostics
+}
+
+/// Returns a stable candidate key based on the first occupied frame and source path.
+fn track_sort_key(track: &TrackBuilder<'_>) -> (usize, String, u32) {
+    track
+        .observations
+        .iter()
+        .min_by_key(|observation| {
+            (
+                observation.frame_index,
+                observation.source_path.clone(),
+                observation.source_layer_id,
+            )
+        })
+        .map(|observation| {
+            (
+                observation.frame_index,
+                observation.source_path.clone(),
+                observation.source_layer_id,
+            )
+        })
+        .unwrap_or((usize::MAX, String::new(), u32::MAX))
+}
+
+/// Classifies a pair using Feature identity first and path/name evidence second.
+fn merge_candidate_kind(left: &TrackBuilder<'_>, right: &TrackBuilder<'_>) -> Option<(u8, String)> {
+    let left_features = track_feature_identities(left);
+    let right_features = track_feature_identities(right);
+    if !left_features.is_empty() && left_features == right_features {
+        return Some((0, "same-feature-identity".to_string()));
+    }
+    if left.generic_name || right.generic_name || left.normalized_name != right.normalized_name {
+        return None;
+    }
+    Some((1, "cross-tag-name-and-relative-path".to_string()))
+}
+
+/// Explains why a candidate cannot be merged without changing its semantics.
+fn merge_rejection_reason(
+    left_id: usize,
+    right_id: usize,
+    tracks: &[TrackBuilder<'_>],
+) -> Option<String> {
+    let left = &tracks[left_id];
+    let right = &tracks[right_id];
+    let overlap = occupied_frames(left)
+        .intersection(&occupied_frames(right))
+        .copied()
+        .collect::<Vec<_>>();
+    if !overlap.is_empty() {
+        return Some(format!("frame-occupancy-conflict frames={overlap:?}"));
+    }
+    if left.metadata_locked || right.metadata_locked {
+        return Some("metadata-identity-lock".to_string());
+    }
+    let left_attributes = layer_attribute_profile(left);
+    let right_attributes = layer_attribute_profile(right);
+    if left_attributes != right_attributes {
+        return Some("layer-attributes-incompatible".to_string());
+    }
+    if !track_paths_match(left, right) {
+        return Some("ordinary-group-boundary".to_string());
+    }
+    z_order_conflict(left_id, right_id, tracks)
+}
+
+/// Returns the stable layer-level compositing attributes observed by a track.
+fn layer_attribute_profile(track: &TrackBuilder<'_>) -> Vec<(Option<u64>, String)> {
+    let mut profile = track
+        .observations
+        .iter()
+        .map(|observation| {
+            (
+                observation.opacity.map(f64::to_bits),
+                observation
+                    .blend_mode
+                    .as_deref()
+                    .unwrap_or("normal")
+                    .to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    profile.sort();
+    profile.dedup();
+    profile
+}
+
+/// Returns every occupied normalized frame in a track.
+fn occupied_frames(track: &TrackBuilder<'_>) -> HashSet<usize> {
+    track
+        .cels
+        .iter()
+        .enumerate()
+        .filter_map(|(frame, cel)| cel.as_ref().map(|_| frame))
+        .collect()
+}
+
+/// Returns Feature identities observed by one track.
+fn track_feature_identities(track: &TrackBuilder<'_>) -> HashSet<FeatureIdentity> {
+    track
+        .observations
+        .iter()
+        .filter_map(|observation| observation.feature_identity.clone())
+        .collect()
+}
+
+/// Checks that ordinary group paths remain identical for a merge candidate.
+fn track_paths_match(left: &TrackBuilder<'_>, right: &TrackBuilder<'_>) -> bool {
+    let left_paths = left
+        .group_paths
+        .iter()
+        .map(|path| {
+            path.iter()
+                .map(|segment| segment.key.clone())
+                .collect::<Vec<_>>()
+        })
+        .collect::<HashSet<_>>();
+    let right_paths = right
+        .group_paths
+        .iter()
+        .map(|path| {
+            path.iter()
+                .map(|segment| segment.key.clone())
+                .collect::<Vec<_>>()
+        })
+        .collect::<HashSet<_>>();
+    left_paths == right_paths
+}
+
+/// Detects a third-track ordering reversal that a single merged Layer cannot represent.
+fn z_order_conflict(
+    left_id: usize,
+    right_id: usize,
+    tracks: &[TrackBuilder<'_>],
+) -> Option<String> {
+    for (third_id, third) in tracks.iter().enumerate() {
+        if third_id == left_id || third_id == right_id {
+            continue;
+        }
+        let mut directions = HashSet::new();
+        for candidate in [&tracks[left_id], &tracks[right_id]] {
+            for observation in &candidate.observations {
+                for other in &third.observations {
+                    if observation.frame_index != other.frame_index
+                        || !summary_alpha_overlap(observation, other)
+                    {
+                        continue;
+                    }
+                    directions.insert(observation.source_order.cmp(&other.source_order));
+                }
+            }
+        }
+        if directions.len() > 1 {
+            return Some(format!("z-order-conflict with track {third_id}"));
+        }
+    }
+    None
+}
+
+/// Tests alpha overlap for the compact observation summaries used by merging.
+fn summary_alpha_overlap(left: &ObservationSummary<'_>, right: &ObservationSummary<'_>) -> bool {
+    for index in 0..left.pixels.len() / 4 {
+        if left.pixels[index * 4 + 3] == 0 {
+            continue;
+        }
+        let x = left.x + (index as i32 % left.width as i32);
+        let y = left.y + (index as i32 / left.width as i32);
+        let right_x = x - right.x;
+        let right_y = y - right.y;
+        if right_x < 0
+            || right_y < 0
+            || right_x >= right.width as i32
+            || right_y >= right.height as i32
+        {
+            continue;
+        }
+        let right_index = (right_y as usize * right.width as usize + right_x as usize) * 4 + 3;
+        if right.pixels[right_index] != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Moves all observations and cels from one compatible track into another.
+fn merge_track_into<'doc>(left: &mut TrackBuilder<'doc>, right: &TrackBuilder<'doc>) {
+    for (frame, cel) in right.cels.iter().enumerate() {
+        if let Some(cel) = cel {
+            left.cels[frame] = Some(*cel);
+        }
+    }
+    left.observation_ids
+        .extend(right.observation_ids.iter().copied());
+    left.observations.extend(right.observations.iter().cloned());
+    left.group_paths.extend(right.group_paths.iter().cloned());
+}
+
+fn exact_pixel_match(observation: &Observation, track: &TrackBuilder) -> bool {
+    track.observations.iter().any(|previous| {
+        previous.width == observation.width
+            && previous.height == observation.height
+            && previous.pixels == observation.pixels
+    })
 }
 
 /// Associates only observations carrying the exact same PSD source-layer identity.
@@ -813,7 +1323,10 @@ pub(super) fn new_track<'doc>(
 ) -> TrackBuilder<'doc> {
     TrackBuilder {
         id: TrackId(track_id).index(),
-        name: observation.name.clone(),
+        name: observation
+            .feature_display_name
+            .clone()
+            .unwrap_or_else(|| observation.name.clone()),
         normalized_name: observation.normalized_name.clone(),
         name_key: observation.name_key.clone(),
         generic_name: observation.generic_name,

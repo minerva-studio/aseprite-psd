@@ -21,7 +21,7 @@ pub struct AsepriteExportSource {
     pub composites: Vec<Vec<u8>>,
     /// Compatibility losses discovered while reading the source snapshots.
     pub information_loss: InformationLossReport,
-    /// Frame-local layer snapshots used by the frame-first PSD exporter.
+    /// Frame-local layer snapshots used to preserve Aseprite's frame-folder workflow.
     pub(crate) frame_snapshots: Option<Vec<FrameSnapshot>>,
 }
 
@@ -159,68 +159,121 @@ fn build_frame_snapshot(
     file: &AsepriteFile,
     source_frame: usize,
 ) -> Result<FrameSnapshot, ExportError> {
-    let mut layers = Vec::new();
-    for layer_index in 0..file.layers().len() {
-        if file.layers()[layer_index].parent.is_none() {
-            layers.push(build_frame_snapshot_layer(file, layer_index, source_frame)?);
-        }
+    struct SnapshotNode {
+        layer_index: usize,
+        children: Vec<usize>,
     }
-    Ok(FrameSnapshot { layers })
-}
 
-/// Recursively materializes one source layer for a playback frame.
-fn build_frame_snapshot_layer(
-    file: &AsepriteFile,
-    layer_index: usize,
-    source_frame: usize,
-) -> Result<FrameSnapshotLayer, ExportError> {
-    let layer = &file.layers()[layer_index];
-    let (opacity, blend_mode) = layer_properties(file, layer);
-    let (kind, cel) = match layer.kind {
-        LayerKind::Group => (NormalizedLayerKind::Group, None),
-        LayerKind::Normal => {
-            let layer_ref = file.layer_ref(layer_index).ok_or_else(|| {
-                ExportError::AsepriteRead("normal layer has no layer handle".to_string())
+    let mut children_by_parent = vec![Vec::new(); file.layers().len()];
+    let mut root_layer_indices = Vec::new();
+    for (index, layer) in file.layers().iter().enumerate() {
+        if let Some(parent) = layer.parent {
+            let children = children_by_parent.get_mut(parent).ok_or_else(|| {
+                ExportError::AsepriteRead(format!(
+                    "layer {:?} has an out-of-range parent {parent}",
+                    layer.name
+                ))
             })?;
-            let cel = cel_sample(file, layer_ref, source_frame)?.map(|sample| FrameSnapshotCel {
-                width: sample.width,
-                height: sample.height,
-                x: sample.x,
-                y: sample.y,
-                opacity: sample.opacity,
-                pixels: sample.pixels,
-            });
-            (NormalizedLayerKind::Pixel, cel)
-        }
-        LayerKind::Tilemap { .. } => {
-            return Err(ExportError::AsepriteRead(
-                "tilemap cannot be materialized as an editable frame snapshot".to_string(),
-            ));
-        }
-        _ => {
-            return Err(ExportError::AsepriteRead(format!(
-                "layer {:?} uses an unsupported kind",
-                layer.name
-            )));
-        }
-    };
-    let mut children = Vec::new();
-    if kind == NormalizedLayerKind::Group {
-        for child_index in 0..file.layers().len() {
-            if file.layers()[child_index].parent == Some(layer_index) {
-                children.push(build_frame_snapshot_layer(file, child_index, source_frame)?);
-            }
+            children.push(index);
+        } else {
+            root_layer_indices.push(index);
         }
     }
-    Ok(FrameSnapshotLayer {
-        source_layer_id: (layer_index + 1) as u32,
-        name: layer.name.clone(),
-        kind,
-        opacity,
-        blend_mode,
-        visible: layer.visible,
-        cel,
-        children,
+
+    let mut nodes = Vec::new();
+    let mut root_nodes = Vec::new();
+    for layer_index in root_layer_indices {
+        root_nodes.push(nodes.len());
+        nodes.push(SnapshotNode {
+            layer_index,
+            children: Vec::new(),
+        });
+    }
+    let mut pending = root_nodes.clone();
+    while let Some(node_index) = pending.pop() {
+        let layer_index = nodes[node_index].layer_index;
+        let mut children = Vec::with_capacity(children_by_parent[layer_index].len());
+        for child_index in &children_by_parent[layer_index] {
+            let child_node = nodes.len();
+            nodes.push(SnapshotNode {
+                layer_index: *child_index,
+                children: Vec::new(),
+            });
+            children.push(child_node);
+        }
+        nodes[node_index].children = children.clone();
+        pending.extend(children.into_iter().rev());
+    }
+
+    let mut built = (0..nodes.len())
+        .map(|_| None)
+        .collect::<Vec<Option<FrameSnapshotLayer>>>();
+    for node_index in (0..nodes.len()).rev() {
+        let node = &nodes[node_index];
+        let children = node
+            .children
+            .iter()
+            .map(|child| {
+                built[*child].take().ok_or_else(|| {
+                    ExportError::AsepriteRead(
+                        "frame snapshot post-order construction failed".to_string(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let layer = &file.layers()[node.layer_index];
+        let (opacity, blend_mode) = layer_properties(file, layer);
+        let (kind, cel) = match layer.kind {
+            LayerKind::Group => (NormalizedLayerKind::Group, None),
+            LayerKind::Normal => {
+                let layer_ref = file.layer_ref(node.layer_index).ok_or_else(|| {
+                    ExportError::AsepriteRead("normal layer has no layer handle".to_string())
+                })?;
+                let cel =
+                    cel_sample(file, layer_ref, source_frame)?.map(|sample| FrameSnapshotCel {
+                        width: sample.width,
+                        height: sample.height,
+                        x: sample.x,
+                        y: sample.y,
+                        opacity: sample.opacity,
+                        pixels: sample.pixels,
+                    });
+                (NormalizedLayerKind::Pixel, cel)
+            }
+            LayerKind::Tilemap { .. } => {
+                return Err(ExportError::AsepriteRead(
+                    "tilemap cannot be materialized as an editable frame snapshot".to_string(),
+                ));
+            }
+            _ => {
+                return Err(ExportError::AsepriteRead(format!(
+                    "layer {:?} uses an unsupported kind",
+                    layer.name
+                )));
+            }
+        };
+        built[node_index] = Some(FrameSnapshotLayer {
+            source_layer_id: u32::try_from(node.layer_index + 1).map_err(|_| {
+                ExportError::AsepriteRead("Aseprite layer index exceeds PSD ID limits".to_string())
+            })?,
+            name: layer.name.clone(),
+            kind,
+            opacity,
+            blend_mode,
+            visible: layer.visible,
+            cel,
+            children,
+        });
+    }
+    Ok(FrameSnapshot {
+        layers: root_nodes
+            .into_iter()
+            .map(|node| {
+                built[node].take().ok_or_else(|| {
+                    ExportError::AsepriteRead("frame snapshot root construction failed".to_string())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
     })
 }
 
@@ -900,13 +953,9 @@ fn document_header(
         loop_mode: Some(loop_mode),
         active_frame_index: None,
         animation_resource_ids: vec![4000],
-        animation_frame_flags: Some(crate::AnimationFlags {
-            propagate_frame_one: false,
-            unify_layer_position: false,
-            unify_layer_style: false,
-            unify_layer_visibility: false,
-        }),
+        animation_frame_flags: None,
         slices: Vec::new(),
+        animation_tags: Vec::new(),
     }
 }
 

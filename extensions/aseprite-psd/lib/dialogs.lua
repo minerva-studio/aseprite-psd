@@ -209,6 +209,7 @@ function Dialogs.new(process)
     return {
       overwrite = true,
       frame_source = "auto",
+      frame_layer_depth = 1,
       layer_association = "auto",
       use_roundtrip_metadata = not preferences or preferences.use_roundtrip_metadata ~= false,
       link_identical_cels = false,
@@ -248,12 +249,6 @@ function Dialogs.new(process)
         filetypes={"psd", "psb"},
       }
     end
-    dialog:combobox{
-      id="frame_source",
-      label="Frame source",
-      option="Automatic",
-      options={"Automatic", "Static document", "Top-level layers as frames"},
-    }
     --- Keeps advanced association controls aligned with the selected mode.
     local function update_option_controls()
       local current = dialog.data
@@ -264,6 +259,10 @@ function Dialogs.new(process)
       dialog:modify{ id="z_order", enabled=advanced }
       dialog:modify{ id="stable_order", enabled=advanced }
       dialog:modify{ id="link_identical_cels", enabled=advanced }
+      dialog:modify{
+        id="frame_layer_depth",
+        enabled=current.frame_source == "Layer hierarchy",
+      }
       if not automatic and current.link_identical_cels then
         dialog:modify{ id="link_identical_cels", selected=false }
       end
@@ -277,6 +276,19 @@ function Dialogs.new(process)
       end
     end
     dialog:combobox{
+      id="frame_source",
+      label="Frame source",
+      option="Automatic",
+      options={"Automatic", "Photoshop timeline", "Layer hierarchy", "Static document"},
+      onchange=update_option_controls,
+    }
+    dialog:entry{
+      id="frame_layer_depth",
+      label="Frame layer depth",
+      text=tostring(defaults.frame_layer_depth),
+    }
+    dialog:separator{ text="Layer association" }
+    dialog:combobox{
       id="layer_association",
       label="Layer association",
       option=defaults.layer_association == "preserve" and "Preserve layers" or "Automatic association",
@@ -289,7 +301,6 @@ function Dialogs.new(process)
       text="Preserve Photoshop metadata",
       selected=defaults.preserve_photoshop_metadata,
     }
-    dialog:separator{ text="Layer association" }
     dialog:check{
       id="use_roundtrip_metadata",
       label="Metadata",
@@ -301,7 +312,7 @@ function Dialogs.new(process)
       id="association_strategy",
       label="Association strategy",
       option=defaults.association_strategy,
-      options={"compact", "conservative"},
+      options={"compact", "conservative", "Feature tracks"},
       enabled=false,
       onchange=update_option_controls,
     }
@@ -364,8 +375,9 @@ function Dialogs.new(process)
     data.layer_association = data.layer_association == "Preserve layers" and "preserve" or "auto"
     data.frame_source = ({
       ["Automatic"] = "auto",
+      ["Photoshop timeline"] = "timeline",
       ["Static document"] = "static",
-      ["Top-level layers as frames"] = "top-level",
+      ["Layer hierarchy"] = "layer-depth:" .. tostring(math.max(0, math.floor(tonumber(data.frame_layer_depth) or 1))),
     })[data.frame_source] or "auto"
     data.use_roundtrip_metadata = data.use_roundtrip_metadata == true
     data.overwrite = true
@@ -488,7 +500,7 @@ function Dialogs.new(process)
     dialog:separator{ text="Metadata" }
     dialog:check{
       id="embed_roundtrip_metadata",
-      text="Write metadata on export",
+      text="Write private round-trip metadata",
       selected=plugin.preferences.embed_roundtrip_metadata ~= false,
       hexpand=false,
     }
@@ -500,7 +512,7 @@ function Dialogs.new(process)
       hexpand=false,
     }
     dialog:newrow()
-    dialog:label{ text="Restores layer/frame relationships." }
+    dialog:label{ text="Restores converter layer/frame relationships; Photoshop timeline data is always written for animations." }
     dialog:label{ text="Stores no paths or personal data." }
     dialog:newrow()
     dialog:button{ id="apply", text="Apply", focus=true, hexpand=false }
