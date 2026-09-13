@@ -1,5 +1,8 @@
 local Dialogs = {}
 
+local PROJECT_URL = "https://github.com/minerva-studio/aseprite-psd"
+local RELEASES_URL = "https://github.com/minerva-studio/aseprite-psd/releases/latest"
+
 --- Creates the UI boundary for one initialized Aseprite extension instance.
 function Dialogs.new(process)
   local state = {}
@@ -25,6 +28,44 @@ function Dialogs.new(process)
       print(line)
     end
     app.alert{ title=title, text=lines }
+  end
+
+  --- Opens a project URL through Aseprite's desktop browser launcher.
+  local function open_url(url)
+    local ok, result = pcall(function()
+      return app.command.Launch{ type="url", path=url }
+    end)
+    if not ok or result == false then
+      show_error("PSD/PSB Support", "Could not open the project link.")
+    end
+  end
+
+  --- Shows project identity, version, license, and links for the extension.
+  local function show_about(plugin)
+    local dialog = Dialog{ title="PSD/PSB Support Info" }
+    if not dialog then
+      show_error("PSD/PSB Support", "Aseprite does not have an available UI.")
+      return
+    end
+    dialog:label{ id="name", text="PSD/PSB Support" }
+    dialog:newrow()
+    dialog:label{ id="version", label="Version", text=tostring(plugin and plugin.version or "unknown") }
+    dialog:newrow()
+    dialog:label{ id="author", label="Developed by", text="Minerva Game Studio" }
+    dialog:newrow()
+    dialog:label{ id="license", label="License", text="MIT OR Apache-2.0" }
+    dialog:newrow()
+    dialog:label{ id="project", label="Project", text=PROJECT_URL }
+    dialog:newrow()
+    dialog:button{ id="project_link", text="Open Project Page", hexpand=false }
+    dialog:button{ id="updates", text="Check for Updates...", hexpand=false }
+    dialog:button{ id="close", text="Close", focus=true, hexpand=false }
+    dialog:show()
+    if dialog.data.project_link then
+      open_url(PROJECT_URL)
+    elseif dialog.data.updates then
+      open_url(RELEASES_URL)
+    end
   end
 
   --- Saves one structured compatibility report after an explicit export choice.
@@ -575,6 +616,9 @@ function Dialogs.new(process)
     default_import_options = default_import_options,
     show_information_loss = show_information_loss,
     show_roundtrip_settings = show_roundtrip_settings,
+    show_about = show_about,
+    project_url = PROJECT_URL,
+    releases_url = RELEASES_URL,
   }
 end
 

@@ -13,7 +13,9 @@ Choose a workflow by PSD structure, then expand the setup instructions. Automati
 | Each layer or folder represents a frame | [Layer or folder animation](#hierarchy) |
 | Extension-exported PSD with Aseprite relationships to restore | [Reimport](#roundtrip) |
 
-Not installed yet? Start with the [README quick start](../README.md).
+Not installed yet? Start with the [README quick start](../README.md). After
+installation, use **Help > PSD/PSB Support Info...** for project information and
+the latest release link.
 
 <a id="illustration"></a>
 

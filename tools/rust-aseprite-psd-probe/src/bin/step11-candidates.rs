@@ -3,9 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use ag_psd::psd::{
-    AdditionalInfoRecord, Compression, Layer, PluginResource, Psd, ReadOptions, WriteOptions,
-};
+use ag_psd::psd::{AdditionalInfoRecord, Layer, PluginResource, Psd, ReadOptions, WriteOptions};
 
 /// Generates the controlled Step 11 Photoshop timeline candidates.
 fn main() -> ExitCode {
@@ -85,7 +83,7 @@ fn write_document(document: &Psd) -> Vec<u8> {
     ag_psd::write_psd(
         document,
         &WriteOptions {
-            compression: Some(Compression::RleCompressed),
+            compress: Some(false),
             ..Default::default()
         },
     )

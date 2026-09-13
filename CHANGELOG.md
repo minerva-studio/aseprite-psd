@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-09-12
+
+### Added
+
+- Add a PSD/PSB Support information page under the Aseprite Help menu, with
+  project details and a link to the latest GitHub Release.
+
+### Changed
+
+- Update the Minerva `ag-psd` runtime dependency to the reviewed `d7c1236`
+  revision.
+- Document the actual top-level `File > Import PSD/PSB...` menu location.
+- Remove the obsolete `raw` and `zip-prediction` export compression modes.
+  The CLI now accepts only `rle` and diagnostic `zip`, matching the updated
+  runtime writer.
+
+### Fixed
+
+- Correct Photoshop frame-state inheritance so default timeline imports keep
+  one authored pose per frame without inflating tracks or layering poses.
+
 ## [0.3.2] - 2026-09-05
 
 ### Added
@@ -47,5 +68,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Export produces a static layered PSD/PSB document. Aseprite timelines cannot
   yet be recreated as Photoshop timelines.
 
+[0.3.3]: https://github.com/minerva-studio/aseprite-psd/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/minerva-studio/aseprite-psd/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/minerva-studio/aseprite-psd/compare/v0.3.0...v0.3.1

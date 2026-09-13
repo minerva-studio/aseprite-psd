@@ -7,8 +7,8 @@ use ag_psd::descriptor::{
     DescriptorValue, read_version_and_descriptor, write_version_and_descriptor,
 };
 use ag_psd::psd::{
-    AdditionalInfoRecord, Compression, Layer, LayerAdditionalInfo, PluginResource, Psd,
-    ReadOptions, WriteOptions,
+    AdditionalInfoRecord, Layer, LayerAdditionalInfo, PluginResource, Psd, ReadOptions,
+    WriteOptions,
 };
 use ag_psd::reader::PsdReader;
 use ag_psd::writer::{
@@ -79,7 +79,7 @@ fn write_candidate(path: &Path, document: &Psd) -> Result<(), String> {
     let bytes = ag_psd::write_psd(
         document,
         &WriteOptions {
-            compression: Some(Compression::RleCompressed),
+            compress: Some(false),
             ..Default::default()
         },
     );

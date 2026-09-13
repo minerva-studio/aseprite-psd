@@ -33,16 +33,18 @@ We also look forward to [native PSD support in Aseprite](https://github.com/asep
    - `aseprite-psd-macos-x64.aseprite-extension` for Intel macOS.
 3. Open the downloaded package to install it in Aseprite, then restart Aseprite
    if the command is not immediately visible.
-4. Select **File > Import > Import PSD/PSB...** and choose a Photoshop document.
+4. Select **File > Import PSD/PSB...** and choose a Photoshop document.
 5. Allow the extension to launch its bundled converter when Aseprite asks for
    external-program permission for the first time.
+6. Open **Help > PSD/PSB Support Info...** to view project information or open
+   the latest release page.
 
 The macOS packages are not code-signed or notarized yet, so Gatekeeper may
 restrict them after download.
 
 Native PSD/PSB integration through `File > Open` and `File > Save As...` is
 expected to require Aseprite 1.3.18.4. Until that version is available, use
-**File > Import > Import PSD/PSB...** and **File > Export > Export PSD/PSB...**
+**File > Import PSD/PSB...** and **File > Export > Export PSD/PSB...**
 instead.
 
 ## Documentation

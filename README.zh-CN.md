@@ -33,14 +33,15 @@
    - Intel macOS 使用 `aseprite-psd-macos-x64.aseprite-extension`。
 3. 打开下载的扩展包并安装到 Aseprite；如果菜单命令没有立即出现，请重启
    Aseprite。
-4. 选择 **File > Import > Import PSD/PSB...**，然后选择 Photoshop 文档。
+4. 选择 **File > Import PSD/PSB...**，然后选择 Photoshop 文档。
 5. 首次使用时，允许 Aseprite 启动扩展内附的外部 converter。
+6. 打开 **Help > PSD/PSB Support Info...** 查看项目信息或打开最新发布页。
 
 macOS 构建产物当前未进行代码签名或 notarization，下载后可能受到 Gatekeeper
 限制。
 
 通过 `File > Open` 和 `File > Save As...` 直接打开、保存 PSD/PSB，预计需要
-Aseprite 1.3.18.4。在该版本可用之前，请改用 **File > Import > Import PSD/PSB...**
+Aseprite 1.3.18.4。在该版本可用之前，请改用 **File > Import PSD/PSB...**
 和 **File > Export > Export PSD/PSB...**。
 
 ## 使用文档

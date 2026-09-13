@@ -13,7 +13,8 @@
 | 每个图层或文件夹代表一帧 | [逐层或逐组动画](#hierarchy) |
 | 本扩展导出的 PSD，希望恢复 Aseprite 图层关系 | [重新导入](#roundtrip) |
 
-尚未安装？先看 [README 快速开始](../README.zh-CN.md)。
+尚未安装？先看 [README 快速开始](../README.zh-CN.md)。安装后可通过
+**Help > PSD/PSB Support Info...** 查看项目信息和最新发布页。
 
 <a id="illustration"></a>
 

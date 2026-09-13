@@ -2,9 +2,10 @@
   "name": "aseprite-psd",
   "displayName": "PSD/PSB Support",
   "description": "Import and export Photoshop PSD/PSB documents through the aseprite-psd converter.",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "author": {
-    "name": "Minerva Game Studio"
+    "name": "Minerva Game Studio",
+    "url": "https://github.com/minerva-studio/aseprite-psd"
   },
   "publisher": "minerva-studio",
   "license": "MIT OR Apache-2.0",

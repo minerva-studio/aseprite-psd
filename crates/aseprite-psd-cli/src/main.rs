@@ -11,7 +11,7 @@ use aseprite_psd_core::{
 };
 
 const CONVERT_USAGE: &str = "usage: aseprite-psd convert INPUT [-o OUTPUT] [--report PATH] [--overwrite] [--frame-source auto|static|top-level|timeline|layer-depth:N] [--preserve-photoshop-metadata] [--linked-cels off|identical] [--layer-association preserve|auto|roundtrip] [--association-strategy compact|conservative|feature] [--z-order stable|auto] [--stable-order consensus|anchor|strict] [--uncertain-layers group|flat] [--jitter-mode off|report|assist|repair] [--jitter-kind alpha|color|all] [--jitter-profile conservative|balanced] [--jitter-alpha-threshold N] [--jitter-max-speck-area N] [--jitter-max-changed-ratio N] [--jitter-max-channel-delta N]";
-const EXPORT_USAGE: &str = "usage: aseprite-psd export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite [--active-frame-index N] [--compression raw|rle|zip|zip-prediction] [--empty-layers include|omit] [--content-reuse none|linked|aggressive] [--report PATH] [--overwrite] [--roundtrip-metadata on|off]; default compression is RLE; ZIP modes are diagnostic only and are not Photoshop-compatible; omit filters no-cel, zero-opacity, and fully transparent pixel cels per frame; include preserves them";
+const EXPORT_USAGE: &str = "usage: aseprite-psd export INPUT.aseprite -o OUTPUT.psd --composite COMPOSITE.aseprite [--active-frame-index N] [--compression rle|zip] [--empty-layers include|omit] [--content-reuse none|linked|aggressive] [--report PATH] [--overwrite] [--roundtrip-metadata on|off]; default compression is RLE; ZIP is diagnostic only and is not Photoshop-compatible; omit filters no-cel, zero-opacity, and fully transparent pixel cels per frame; include preserves them";
 
 #[derive(Debug, PartialEq, Eq)]
 struct ConvertCommand {
@@ -138,10 +138,7 @@ fn run_export(arguments: &[String]) -> Result<(), CliError> {
 
 /// Warns when a diagnostic compression mode is outside the Photoshop target contract.
 fn warn_for_photoshop_incompatible_compression(compression: Option<ExportCompression>) {
-    if matches!(
-        compression,
-        Some(ExportCompression::Zip | ExportCompression::ZipPrediction)
-    ) {
+    if matches!(compression, Some(ExportCompression::Zip)) {
         eprintln!(
             "warning: ZIP PSD compression is retained for diagnostics only; it is not supported by the Photoshop compatibility target and may still open in tolerant readers such as GIMP"
         );
@@ -816,9 +813,7 @@ fn export_arguments(arguments: &[String]) -> Result<ExportCommand, CliError> {
                     .get(index)
                     .ok_or_else(|| CliError::Usage(EXPORT_USAGE.to_string()))?;
                 compression = Some(ExportCompression::parse(value).ok_or_else(|| {
-                    CliError::Usage(
-                        "--compression expects raw, rle, zip, or zip-prediction".to_string(),
-                    )
+                    CliError::Usage("--compression expects rle or zip".to_string())
                 })?);
             }
             "--overwrite" => overwrite = true,

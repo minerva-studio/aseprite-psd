@@ -12,6 +12,30 @@ local entry_chunk = assert(loadfile(app.fs.joinPath(root, "aseprite-psd.lua")))
 entry_chunk()
 assert(type(init) == "function", "entry script must define init")
 
+local registered_commands = {}
+local registered_formats = {}
+local extension_plugin = {
+  path = root,
+  version = "0.3.3",
+  preferences = {},
+}
+function extension_plugin:newCommand(command)
+  table.insert(registered_commands, command)
+end
+function extension_plugin:newFileFormat(format)
+  table.insert(registered_formats, format)
+end
+init(extension_plugin)
+
+local commands_by_id = {}
+for _, command in ipairs(registered_commands) do
+  commands_by_id[command.id] = command
+end
+assert(commands_by_id.AsepritePsdImport.group == "file_import")
+assert(commands_by_id.AsepritePsdInfo.group == "help_about")
+assert(commands_by_id.AsepritePsdInfo.title == "PSD/PSB Support Info...")
+assert(#registered_formats == 1)
+
 local Process = load_module("process.lua")
 local Dialogs = load_module("dialogs.lua")
 local DocumentIO = load_module("document_io.lua")
@@ -31,6 +55,9 @@ assert(dialogs.default_import_options().association_strategy == "conservative")
 assert(dialogs.default_import_options().use_roundtrip_metadata == true)
 assert(type(dialogs.select_roundtrip_recovery) == "function")
 assert(type(dialogs.select_export_options) == "function")
+assert(type(dialogs.show_about) == "function")
+assert(dialogs.project_url == "https://github.com/minerva-studio/aseprite-psd")
+assert(dialogs.releases_url == "https://github.com/minerva-studio/aseprite-psd/releases/latest")
 assert(type(documents.create_export_snapshots) == "function")
 assert(type(workflows.import_document) == "function")
 assert(type(workflows.load_photoshop_document) == "function")

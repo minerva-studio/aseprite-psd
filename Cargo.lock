@@ -10,8 +10,8 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "ag-psd"
-version = "0.2.0"
-source = "git+https://github.com/minerva-studio/ag-psd-rs.git?rev=a3b8324#a3b8324add6b1bed585300adbec49003a6f36966"
+version = "0.3.0"
+source = "git+https://github.com/minerva-studio/ag-psd-rs.git?rev=d7c1236#d7c1236961fc87ce58bc4414f7f8aeb0b438d18c"
 dependencies = [
  "flate2",
 ]
@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "aseprite-psd"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "aseprite-io",
  "aseprite-psd-core",
@@ -37,7 +37,7 @@ dependencies = [
 
 [[package]]
 name = "aseprite-psd-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "ag-psd",
  "aseprite-io",
@@ -48,7 +48,7 @@ dependencies = [
 
 [[package]]
 name = "aseprite-psd-rust-probe"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "ag-psd",
  "aseprite-psd-core",

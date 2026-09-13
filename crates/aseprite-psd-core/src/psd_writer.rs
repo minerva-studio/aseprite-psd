@@ -83,14 +83,10 @@ impl Default for ExportContentReuse {
 /// Compression modes supported by the PSD/PSB writer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportCompression {
-    /// Store channel bytes without compression.
-    Raw,
     /// Pack channel rows with PackBits RLE.
     Rle,
     /// ZIP-compress channel bytes without prediction for diagnostics only.
     Zip,
-    /// ZIP-compress channel bytes after horizontal prediction for diagnostics only.
-    ZipPrediction,
 }
 
 impl Default for ExportCompression {
@@ -103,30 +99,24 @@ impl ExportCompression {
     /// Returns the stable CLI token for this compression mode.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Raw => "raw",
             Self::Rle => "rle",
             Self::Zip => "zip",
-            Self::ZipPrediction => "zip-prediction",
         }
     }
 
     /// Parses the stable CLI token.
     pub fn parse(value: &str) -> Option<Self> {
         Some(match value {
-            "raw" => Self::Raw,
             "rle" => Self::Rle,
             "zip" => Self::Zip,
-            "zip-prediction" => Self::ZipPrediction,
             _ => return None,
         })
     }
 
     fn ag_psd(self) -> Compression {
         match self {
-            Self::Raw => Compression::RawData,
             Self::Rle => Compression::RleCompressed,
             Self::Zip => Compression::ZipWithoutPrediction,
-            Self::ZipPrediction => Compression::ZipWithPrediction,
         }
     }
 }
@@ -269,10 +259,11 @@ pub fn export(
         ))
     })?;
     let compression = options.compression.unwrap_or_default();
+    let compress = matches!(compression, ExportCompression::Zip);
     let write_options = WriteOptions {
         no_background: Some(true),
         psb: Some(psb),
-        compression: Some(compression.ag_psd()),
+        compress: Some(compress),
         trim_image_data: Some(false),
         ..Default::default()
     };
@@ -2665,7 +2656,8 @@ fn validate_export_contract(
         ));
     }
     if let Some(compression) = compression {
-        validate_channel_compression(layout, compression.ag_psd() as u16)?;
+        validate_layer_channel_compression(layout, compression.ag_psd() as u16)?;
+        validate_composite_compression(layout, Compression::RleCompressed as u16)?;
     }
     Ok(())
 }
@@ -2841,7 +2833,7 @@ fn validate_frame_layer_states(
 }
 
 /// Verifies that layer and composite channel headers use the requested mode.
-fn validate_channel_compression(
+fn validate_layer_channel_compression(
     layout: &LayerRecordLayout,
     expected: u16,
 ) -> Result<(), ExportError> {
@@ -2856,6 +2848,14 @@ fn validate_channel_compression(
             )));
         }
     }
+    Ok(())
+}
+
+/// Validates the compression code of the composite image channel.
+fn validate_composite_compression(
+    layout: &LayerRecordLayout,
+    expected: u16,
+) -> Result<(), ExportError> {
     if layout.composite_compression != expected {
         return Err(ExportError::OutputValidation(format!(
             "encoded composite compression differs: expected {expected}, got {}",
@@ -3466,8 +3466,10 @@ mod tests {
             "every generated non-empty layer and divider must have a complete typed track"
         );
         let default_layout = layer_record_layout(&bytes, false).expect("inspect default PSD");
-        validate_channel_compression(&default_layout, ExportCompression::Rle.ag_psd() as u16)
+        validate_layer_channel_compression(&default_layout, ExportCompression::Rle.ag_psd() as u16)
             .expect("default export should use RLE");
+        validate_composite_compression(&default_layout, Compression::RleCompressed as u16)
+            .expect("default composite should use RLE");
         assert_eq!(
             crate::roundtrip::inspect(&bytes).expect("inspect round-trip metadata"),
             crate::roundtrip::RoundTripStatus {
@@ -3803,14 +3805,9 @@ mod tests {
             3
         );
 
-        for (index, compression) in [
-            ExportCompression::Raw,
-            ExportCompression::Rle,
-            ExportCompression::Zip,
-            ExportCompression::ZipPrediction,
-        ]
-        .into_iter()
-        .enumerate()
+        for (index, compression) in [ExportCompression::Rle, ExportCompression::Zip]
+            .into_iter()
+            .enumerate()
         {
             let mode_output = directory.join(format!("compression-{index}.psd"));
             let report = export(
@@ -3827,8 +3824,10 @@ mod tests {
             let mode_bytes = fs::read(&mode_output).expect("read selected compression");
             let layout = layer_record_layout(&mode_bytes, false).expect("inspect PSD layout");
             let expected_code = compression.ag_psd() as u16;
-            validate_channel_compression(&layout, expected_code)
+            validate_layer_channel_compression(&layout, expected_code)
                 .expect("selected compression should be used for every non-empty channel");
+            validate_composite_compression(&layout, Compression::RleCompressed as u16)
+                .expect("composite should remain RLE for every selected compression");
 
             let mode_normalized =
                 crate::normalize(&mode_output).expect("normalize selected compression");
@@ -4979,17 +4978,14 @@ mod tests {
 
     #[test]
     fn export_compression_tokens_are_stable_and_distinct() {
-        let modes = [
-            ExportCompression::Raw,
-            ExportCompression::Rle,
-            ExportCompression::Zip,
-            ExportCompression::ZipPrediction,
-        ];
+        let modes = [ExportCompression::Rle, ExportCompression::Zip];
         let tokens = modes.map(ExportCompression::as_str);
-        assert_eq!(tokens, ["raw", "rle", "zip", "zip-prediction"]);
+        assert_eq!(tokens, ["rle", "zip"]);
         for mode in modes {
             assert_eq!(ExportCompression::parse(mode.as_str()), Some(mode));
         }
+        assert_eq!(ExportCompression::parse("raw"), None);
+        assert_eq!(ExportCompression::parse("zip-prediction"), None);
         assert_eq!(ExportCompression::parse("unsupported"), None);
         assert_eq!(ExportCompression::default(), ExportCompression::Rle);
     }

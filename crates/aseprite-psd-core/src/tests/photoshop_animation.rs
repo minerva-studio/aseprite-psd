@@ -303,7 +303,7 @@ fn first_missing_animation_record_starts_hidden() {
 }
 
 #[test]
-fn present_record_without_enable_inherits_for_groups_and_pixels() {
+fn present_record_without_enable_inherits_for_pixels_and_container_groups() {
     let resolve = |is_group, is_container_group| {
         let layer = AnimationLayerInput {
             id: 7,
@@ -352,7 +352,7 @@ fn present_record_without_enable_inherits_for_groups_and_pixels() {
         resolve_layer_states(&layer, &raw, &frames).expect("states should resolve")
     };
 
-    for (is_group, is_container_group) in [(false, false), (true, false), (true, true)] {
+    for (is_group, is_container_group) in [(false, false), (true, true)] {
         let states = resolve(is_group, is_container_group);
         assert!(states.frames[0].enabled);
         assert!(states.frames[1].enabled);
@@ -362,12 +362,12 @@ fn present_record_without_enable_inherits_for_groups_and_pixels() {
 }
 
 #[test]
-fn enable_inheritance_uses_catalog_order_not_last_record_storage_order() {
+fn container_group_enable_inheritance_uses_catalog_order() {
     let layer = AnimationLayerInput {
         id: 7,
         path: "0".to_string(),
         is_group: true,
-        is_container_group: false,
+        is_container_group: true,
         hidden: true,
         ancestor_ids: Vec::new(),
     };
@@ -433,7 +433,103 @@ fn enable_inheritance_uses_catalog_order_not_last_record_storage_order() {
 }
 
 #[test]
-fn six_frame_group_enable_sequences_preserve_omitted_values() {
+fn non_container_group_omitted_enable_ignores_static_visibility() {
+    let layer = AnimationLayerInput {
+        id: 7,
+        path: "0".to_string(),
+        is_group: true,
+        is_container_group: false,
+        hidden: false,
+        ancestor_ids: Vec::new(),
+    };
+    let state = |frame_id, enable| RawFrameState {
+        frame_id,
+        enable,
+        offset: None,
+        reference_point: None,
+        opacity: None,
+    };
+    let raw = RawLayer {
+        id: Some(7),
+        shmd: Some(LayerMetadata {
+            frames: vec![state(20, Some(false)), state(30, None), state(10, None)],
+            flags: None,
+        }),
+        flags: None,
+        is_bounding_divider: false,
+    };
+    let frames = [10, 20, 30]
+        .into_iter()
+        .map(|id| PhotoshopFrame {
+            id,
+            duration_ms: 100,
+            dispose: None,
+        })
+        .collect::<Vec<_>>();
+
+    let states = resolve_layer_states(&layer, &raw, &frames).expect("states should resolve");
+    assert_eq!(
+        states
+            .frames
+            .iter()
+            .map(|state| state.enabled)
+            .collect::<Vec<_>>(),
+        vec![false, false, false]
+    );
+}
+
+#[test]
+fn non_container_group_omitted_enable_does_not_inherit_prior_enable() {
+    let layer = AnimationLayerInput {
+        id: 7,
+        path: "0".to_string(),
+        is_group: true,
+        is_container_group: false,
+        hidden: true,
+        ancestor_ids: Vec::new(),
+    };
+    let state = |frame_id, enable| RawFrameState {
+        frame_id,
+        enable,
+        offset: None,
+        reference_point: None,
+        opacity: None,
+    };
+    let raw = RawLayer {
+        id: Some(7),
+        shmd: Some(LayerMetadata {
+            frames: vec![
+                state(10, Some(true)),
+                state(30, Some(false)),
+                state(20, None),
+            ],
+            flags: None,
+        }),
+        flags: None,
+        is_bounding_divider: false,
+    };
+    let frames = [10, 20, 30]
+        .into_iter()
+        .map(|id| PhotoshopFrame {
+            id,
+            duration_ms: 100,
+            dispose: None,
+        })
+        .collect::<Vec<_>>();
+
+    let states = resolve_layer_states(&layer, &raw, &frames).expect("states should resolve");
+    assert_eq!(
+        states
+            .frames
+            .iter()
+            .map(|state| state.enabled)
+            .collect::<Vec<_>>(),
+        vec![true, false, false]
+    );
+}
+
+#[test]
+fn six_frame_state_slot_groups_treat_omitted_values_as_disabled() {
     let frames = (1..=6)
         .map(|id| PhotoshopFrame {
             id,
@@ -489,7 +585,7 @@ fn six_frame_group_enable_sequences_preserve_omitted_values() {
             .iter()
             .map(|state| state.enabled)
             .collect::<Vec<_>>(),
-        vec![true, true, true, false, false, false]
+        vec![true, false, true, false, false, false]
     );
     assert_eq!(
         second
@@ -497,7 +593,7 @@ fn six_frame_group_enable_sequences_preserve_omitted_values() {
             .iter()
             .map(|state| state.enabled)
             .collect::<Vec<_>>(),
-        vec![false, false, false, true, true, true]
+        vec![false, false, false, true, false, true]
     );
     for states in [&first, &second] {
         assert!(states.frames[1].record_present && !states.frames[1].explicit_enable);
@@ -507,7 +603,7 @@ fn six_frame_group_enable_sequences_preserve_omitted_values() {
 }
 
 #[test]
-fn first_present_record_without_enable_uses_static_visibility() {
+fn first_pixel_record_without_enable_uses_static_visibility() {
     let frames = vec![PhotoshopFrame {
         id: 1,
         duration_ms: 100,
@@ -517,7 +613,7 @@ fn first_present_record_without_enable_uses_static_visibility() {
         let layer = AnimationLayerInput {
             id,
             path: id.to_string(),
-            is_group: true,
+            is_group: false,
             is_container_group: false,
             hidden,
             ancestor_ids: Vec::new(),
@@ -545,7 +641,7 @@ fn first_present_record_without_enable_uses_static_visibility() {
 }
 
 #[test]
-fn inherited_parent_group_keeps_animated_child_visible() {
+fn non_container_parent_group_does_not_inherit_omitted_enable() {
     let frames = [1, 2]
         .into_iter()
         .map(|id| PhotoshopFrame {
@@ -596,7 +692,7 @@ fn inherited_parent_group_keeps_animated_child_visible() {
 
     let visible = resolve_visible_layers(&[group, child], &[group_states, child_states], &frames);
     assert_eq!(visible[0].layer_ids, vec![2]);
-    assert_eq!(visible[1].layer_ids, vec![2]);
+    assert!(visible[1].layer_ids.is_empty());
 }
 
 #[test]

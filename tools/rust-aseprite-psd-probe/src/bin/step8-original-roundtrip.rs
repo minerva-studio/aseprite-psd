@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use ag_psd::psd::{Compression, Layer, Psd, ReadOptions, WriteOptions};
+use ag_psd::psd::{Layer, Psd, ReadOptions, WriteOptions};
 
 /// Produces the Step 8A lossless-metadata Photoshop round-trip candidate.
 fn main() -> ExitCode {
@@ -35,7 +35,7 @@ fn run(arguments: Vec<String>) -> Result<(), String> {
     let encoded = ag_psd::write_psd(
         &source,
         &WriteOptions {
-            compression: reencode_pixels.then_some(Compression::RleCompressed),
+            compress: reencode_pixels.then_some(false),
             ..Default::default()
         },
     );

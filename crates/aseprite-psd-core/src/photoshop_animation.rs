@@ -733,10 +733,11 @@ fn index_raw_layers(layers: Vec<RawLayer>) -> Result<HashMap<u32, RawLayer>, Ani
     Ok(indexed)
 }
 
-/// Resolves per-frame enable values in catalog order and optional properties.
+/// Resolves per-frame enable values in Photoshop catalog order.
 ///
-/// A present `LaSt` record without `enab` inherits the preceding catalog frame's
-/// state. A missing record deliberately retains the existing hidden fallback.
+/// Non-container groups are frame-state slots, so a missing `enab` means disabled. Pixel layers
+/// and structural container groups inherit the preceding catalog frame's state. A missing record
+/// remains hidden when the layer has animation data.
 fn resolve_layer_states(
     layer: &AnimationLayerInput,
     raw: &RawLayer,
@@ -758,7 +759,9 @@ fn resolve_layer_states(
             });
             let record_present = record.is_some();
             let explicit_enable = record.and_then(|item| item.enable).is_some();
-            if record_present {
+            if layer.is_group && !layer.is_container_group && has_animation_records {
+                previous_enabled = record.and_then(|item| item.enable).unwrap_or(false);
+            } else if record_present {
                 if let Some(enable) = record.and_then(|item| item.enable) {
                     previous_enabled = enable;
                 }

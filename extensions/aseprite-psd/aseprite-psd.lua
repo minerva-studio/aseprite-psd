@@ -61,6 +61,14 @@ function init(plugin)
       dialogs.show_roundtrip_settings(plugin)
     end,
   }
+  plugin:newCommand{
+    id="AsepritePsdInfo",
+    title="PSD/PSB Support Info...",
+    group="help_about",
+    onclick=function()
+      dialogs.show_about(plugin)
+    end,
+  }
   plugin:newFileFormat{
     name="Photoshop Document (PSD/PSB)",
     extensions={"psd", "psb"},

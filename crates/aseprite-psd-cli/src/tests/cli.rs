@@ -338,7 +338,7 @@ fn color_repair_requires_automatic_association() {
 
 #[test]
 fn export_requires_composite_and_preserves_all_paths() {
-    assert!(EXPORT_USAGE.contains("ZIP modes are diagnostic only"));
+    assert!(EXPORT_USAGE.contains("ZIP is diagnostic only"));
     assert!(EXPORT_USAGE.contains("zero-opacity"));
     assert!(EXPORT_USAGE.contains("fully transparent"));
     let command = export_arguments(&arguments(&[
@@ -414,7 +414,7 @@ fn export_requires_composite_and_preserves_all_paths() {
     .expect_err("unknown empty-layer policy should be rejected");
     assert!(error.to_string().contains("invalid --empty-layers value"));
 
-    for value in ["raw", "rle", "zip", "zip-prediction"] {
+    for value in ["rle", "zip"] {
         let parsed = export_arguments(&arguments(&[
             "source.aseprite",
             "-o",
@@ -426,6 +426,23 @@ fn export_requires_composite_and_preserves_all_paths() {
         ]))
         .expect("compression should parse");
         assert_eq!(parsed.compression.map(|mode| mode.as_str()), Some(value));
+    }
+    for value in ["raw", "zip-prediction"] {
+        let error = export_arguments(&arguments(&[
+            "source.aseprite",
+            "-o",
+            "output.psd",
+            "--composite",
+            "flattened.aseprite",
+            "--compression",
+            value,
+        ]))
+        .expect_err("removed compression mode should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("--compression expects rle or zip")
+        );
     }
     let error = export_arguments(&arguments(&[
         "source.aseprite",
