@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.3] - 2026-09-12
+## [0.3.3](https://github.com/minerva-studio/aseprite-psd/compare/v0.3.2...v0.3.3) - 2026-09-12
 
 ### Added
 
@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Correct Photoshop frame-state inheritance so default timeline imports keep one authored pose per frame without inflating tracks or layering poses.
 
-## [0.3.2] - 2026-09-05
+## [0.3.2](https://github.com/minerva-studio/aseprite-psd/compare/v0.3.1...v0.3.2) - 2026-09-05
 
 ### Added
 
@@ -39,7 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Aseprite tag names and boundaries are flattened into one deterministic Photoshop frame sequence; they are not retained as editable Photoshop tags.
 - Content reuse is experimental. Editing shared Photoshop content can affect multiple logical frames.
 
-## [0.3.1] - 2026-09-03
+## [0.3.1](https://github.com/minerva-studio/aseprite-psd/compare/v0.3.0...v0.3.1) - 2026-09-03
 
 ### Fixed
 
@@ -49,7 +49,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Known limitations
 
 - Export produces a static layered PSD/PSB document. Aseprite timelines cannot yet be recreated as Photoshop timelines.
-
-[0.3.3]: https://github.com/minerva-studio/aseprite-psd/compare/v0.3.2...v0.3.3
-[0.3.2]: https://github.com/minerva-studio/aseprite-psd/compare/v0.3.1...v0.3.2
-[0.3.1]: https://github.com/minerva-studio/aseprite-psd/compare/v0.3.0...v0.3.1
